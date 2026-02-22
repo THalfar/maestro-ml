@@ -61,10 +61,10 @@ def build_features(
         6. If custom features exist, call _add_custom_features on both.
         7. Return the modified (train, test) tuple.
     """
+    features_cfg = strategy.get("features", {}) or {}
+
     train = train.copy()
     test = test.copy()
-
-    features_cfg = strategy.get("features", {}) or {}
 
     interactions = features_cfg.get("interactions", []) or []
     if interactions:
@@ -224,6 +224,14 @@ def _add_target_encoding(
     train = train.copy()
     test = test.copy()
 
+    # REVIEW:LEAK — global_mean is computed from the full training set, which
+    # includes every validation fold's target labels. The smoothing formula
+    # `(count * mean + alpha * global_mean) / (count + alpha)` regularises toward
+    # this mean, so each validation row's encoded value is weakly influenced by
+    # its own label via global_mean. For large datasets / high alpha the effect is
+    # negligible (O(1/n)), but it is technically leakage.
+    # Fix: compute global_mean inside the fold loop from `train_df.iloc[train_idx]
+    # [target_col].mean()` and pass it to _smooth().
     global_mean = float(train[target_col].mean())
 
     def _encode_column(
@@ -233,9 +241,6 @@ def _add_target_encoding(
         test_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Apply OOF target encoding for a single (possibly temp) column."""
-        train_df = train_df.copy()
-        test_df = test_df.copy()
-
         oof = np.full(len(train_df), np.nan)
         target = train_df[target_col].values
 

@@ -17,9 +17,9 @@ from typing import Any
 import numpy as np
 import optuna
 from scipy.stats import rankdata
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import roc_auc_score, mean_squared_error
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, KFold
 
 logger = logging.getLogger("maestro")
 
@@ -147,6 +147,8 @@ def rank_average(preds_list: list[np.ndarray]) -> np.ndarray:
         2. Average all normalized rank arrays.
         3. Return the averaged ranks.
     """
+    # REVIEW:BUG — raises IndexError if preds_list is empty; no guard for this edge case.
+    # Fix: add `if not preds_list: raise ValueError("preds_list must not be empty")`.
     n = len(preds_list[0])
     normalized_ranks = []
     for preds in preds_list:
@@ -162,6 +164,7 @@ def train_meta_model(
     n_folds: int = 10,
     seed: int = 42,
     C: float = 1.0,
+    task_type: str = "binary_classification",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Train a meta-model (stacking) on OOF predictions.
 
@@ -198,35 +201,48 @@ def train_meta_model(
            c. Predict on X_test_meta → meta_test += preds / n_folds.
         7. Return (meta_oof, meta_test).
     """
+    is_regression = task_type == "regression"
+
     X_meta = np.column_stack(oof_list)  # (n_samples, n_models)
 
-    def _logit_transform(arr: np.ndarray) -> np.ndarray:
-        p = np.clip(arr, 1e-6, 1 - 1e-6)
-        return np.clip(np.log(p / (1 - p)), -5, 5)
+    if not is_regression:
+        def _logit_transform(arr: np.ndarray) -> np.ndarray:
+            p = np.clip(arr, 1e-6, 1 - 1e-6)
+            return np.clip(np.log(p / (1 - p)), -5, 5)
 
-    # Append logit transforms
-    logit_meta = np.column_stack([_logit_transform(col) for col in oof_list])
-    X_meta = np.hstack([X_meta, logit_meta])
+        logit_meta = np.column_stack([_logit_transform(col) for col in oof_list])
+        X_meta = np.hstack([X_meta, logit_meta])
 
     X_test_meta = np.column_stack(test_list)
-    logit_test = np.column_stack([_logit_transform(col) for col in test_list])
-    X_test_meta = np.hstack([X_test_meta, logit_test])
+    if not is_regression:
+        logit_test = np.column_stack([_logit_transform(col) for col in test_list])
+        X_test_meta = np.hstack([X_test_meta, logit_test])
 
     n_test = X_test_meta.shape[0]
     meta_oof = np.zeros(len(y))
     meta_test = np.zeros(n_test)
 
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    if is_regression:
+        cv_splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        splits = cv_splitter.split(X_meta)
+    else:
+        cv_splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        splits = cv_splitter.split(X_meta, y)
 
-    for train_idx, val_idx in skf.split(X_meta, y):
+    for train_idx, val_idx in splits:
         X_tr, X_val = X_meta[train_idx], X_meta[val_idx]
         y_tr = y[train_idx]
 
-        meta_model = LogisticRegression(C=C, max_iter=2000, solver="lbfgs")
-        meta_model.fit(X_tr, y_tr)
-
-        meta_oof[val_idx] = meta_model.predict_proba(X_val)[:, 1]
-        meta_test += meta_model.predict_proba(X_test_meta)[:, 1] / n_folds
+        if is_regression:
+            meta_model = Ridge(alpha=1.0 / C)
+            meta_model.fit(X_tr, y_tr)
+            meta_oof[val_idx] = meta_model.predict(X_val)
+            meta_test += meta_model.predict(X_test_meta) / n_folds
+        else:
+            meta_model = LogisticRegression(C=C, max_iter=2000, solver="lbfgs")
+            meta_model.fit(X_tr, y_tr)
+            meta_oof[val_idx] = meta_model.predict_proba(X_val)[:, 1]
+            meta_test += meta_model.predict_proba(X_test_meta)[:, 1] / n_folds
 
     return meta_oof, meta_test
 
@@ -257,6 +273,9 @@ def pick_best_strategy(
         2. Select the strategy with the best score.
         3. Return its test predictions, name, and score.
     """
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+
     best_name = None
     best_score = -np.inf
     best_test_preds = None
