@@ -33,8 +33,10 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -> float:
     """Compute the cross-validation metric for a given task type."""
-    if task_type in ("binary_classification", "multiclass"):
+    if task_type == "binary_classification":
         return float(roc_auc_score(y_true, y_pred))
+    elif task_type == "multiclass":
+        return float(roc_auc_score(y_true, y_pred, multi_class="ovr"))
     else:
         return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
@@ -229,7 +231,7 @@ def _create_objective(
     X = train[feature_cols].values
     y = train[target_col].values
 
-    training_cfg = registry._configs[model_name].training
+    training_cfg = registry.get_training_config(model_name)
 
     def objective(trial: optuna.Trial) -> float:
         # Sample hyperparameters
@@ -256,17 +258,16 @@ def _create_objective(
         if eval_metric_val and eval_metric_param:
             hparams[eval_metric_param] = eval_metric_val
 
-        model = registry.get_model(
-            model_name, hparams=hparams, task_type=task_type,
-            gpu=gpu, results_dir=results_dir
-        )
-
         needs_eval_set = training_cfg.get("needs_eval_set", False)
         early_stopping_rounds = training_cfg.get("early_stopping_rounds")
         early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
-        is_lgbm = "lightgbm" in model_name.lower()
+        is_lgbm = training_cfg.get("uses_callbacks_for_early_stopping", False)
 
-        oof = np.zeros(len(X))
+        if task_type == "multiclass":
+            n_classes = len(np.unique(y))
+            oof = np.zeros((len(X), n_classes))
+        else:
+            oof = np.zeros(len(X))
 
         try:
             splits = list(cv.split(X, y))
@@ -276,6 +277,13 @@ def _create_objective(
         for fold_idx, (train_idx, val_idx) in enumerate(splits):
             X_train, X_val = X[train_idx], X[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
+
+            # Fresh model per fold — each fold gets an independent RandomState,
+            # matching the behaviour of train_with_config for reproducibility.
+            model = registry.get_model(
+                model_name, hparams=hparams, task_type=task_type,
+                gpu=gpu, results_dir=results_dir
+            )
 
             if needs_eval_set:
                 fit_params: dict[str, Any] = {"eval_set": [(X_val, y_val)]}
@@ -294,10 +302,10 @@ def _create_objective(
             else:
                 model.fit(X_train, y_train)
 
-            if task_type in ("binary_classification",):
+            if task_type == "binary_classification":
                 fold_preds = model.predict_proba(X_val)[:, 1]
             elif task_type == "multiclass":
-                fold_preds = model.predict_proba(X_val)[:, 1]
+                fold_preds = model.predict_proba(X_val)  # full (n_val, n_classes) matrix
             else:
                 fold_preds = model.predict(X_val)
 
@@ -449,18 +457,18 @@ def train_with_config(
     y_train = train[target_col].values
     X_test = test[feature_cols].values
 
-    training_cfg = registry._configs[model_name].training
+    training_cfg = registry.get_training_config(model_name)
     needs_eval_set = training_cfg.get("needs_eval_set", False)
     early_stopping_rounds = training_cfg.get("early_stopping_rounds")
     early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
-    is_lgbm = "lightgbm" in model_name.lower()
+    is_lgbm = training_cfg.get("uses_callbacks_for_early_stopping", False)
 
     # Eval metric for constructor
     eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
     eval_metric_param = training_cfg.get("eval_metric_param")
 
-    # Seed param name: catboost uses random_seed, others use random_state
-    seed_param = "random_seed" if model_name == "catboost" else "random_state"
+    # seed_param is declared per-model in the YAML training section.
+    seed_param = training_cfg.get("seed_param", "random_state")
 
     oof_preds_list: list[np.ndarray] = []
     test_preds_list: list[np.ndarray] = []
@@ -472,13 +480,20 @@ def train_with_config(
 
     n_folds = len(splits)
 
+    if task_type == "multiclass":
+        n_classes = len(np.unique(y_train))
+
     for seed in seeds:
-        hparams_seeded = {**hparams, seed_param: seed}
+        hparams_seeded = {**hparams, seed_param: seed} if seed_param else dict(hparams)
         if eval_metric_val and eval_metric_param:
             hparams_seeded[eval_metric_param] = eval_metric_val
 
-        oof_preds = np.zeros(len(X_train))
-        test_preds = np.zeros(len(X_test))
+        if task_type == "multiclass":
+            oof_preds = np.zeros((len(X_train), n_classes))
+            test_preds = np.zeros((len(X_test), n_classes))
+        else:
+            oof_preds = np.zeros(len(X_train))
+            test_preds = np.zeros(len(X_test))
 
         for train_idx, val_idx in splits:
             X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
@@ -506,9 +521,12 @@ def train_with_config(
             else:
                 model.fit(X_fold_train, y_fold_train)
 
-            if task_type in ("binary_classification", "multiclass"):
+            if task_type == "binary_classification":
                 val_preds = model.predict_proba(X_fold_val)[:, 1]
                 tst_preds = model.predict_proba(X_test)[:, 1]
+            elif task_type == "multiclass":
+                val_preds = model.predict_proba(X_fold_val)  # (n_val, n_classes)
+                tst_preds = model.predict_proba(X_test)       # (n_test, n_classes)
             else:
                 val_preds = model.predict(X_fold_val)
                 tst_preds = model.predict(X_test)

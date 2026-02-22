@@ -224,16 +224,6 @@ def _add_target_encoding(
     train = train.copy()
     test = test.copy()
 
-    # REVIEW:LEAK — global_mean is computed from the full training set, which
-    # includes every validation fold's target labels. The smoothing formula
-    # `(count * mean + alpha * global_mean) / (count + alpha)` regularises toward
-    # this mean, so each validation row's encoded value is weakly influenced by
-    # its own label via global_mean. For large datasets / high alpha the effect is
-    # negligible (O(1/n)), but it is technically leakage.
-    # Fix: compute global_mean inside the fold loop from `train_df.iloc[train_idx]
-    # [target_col].mean()` and pass it to _smooth().
-    global_mean = float(train[target_col].mean())
-
     def _encode_column(
         col_name: str,
         out_name: str,
@@ -251,27 +241,30 @@ def _add_target_encoding(
             splits = list(cv_folds.split(train_df))
 
         for train_idx, val_idx in splits:
-            # Stats from training fold
+            # Stats and mean from training fold only — no label leakage into val rows.
             fold_train = train_df.iloc[train_idx]
+            fold_mean = float(fold_train[target_col].mean())
             stats = (
                 fold_train.groupby(col_name)[target_col]
                 .agg(["count", "mean"])
             )
-            # Smoothed encoding
-            def _smooth(count: float, mean: float) -> float:
-                return (count * mean + alpha * global_mean) / (count + alpha)
+
+            def _smooth(count: float, mean: float, gm: float = fold_mean) -> float:
+                return (count * mean + alpha * gm) / (count + alpha)
 
             val_col = train_df.iloc[val_idx][col_name]
             encoded_val = val_col.map(
-                lambda v: _smooth(
-                    stats.loc[v, "count"] if v in stats.index else 0,
-                    stats.loc[v, "mean"] if v in stats.index else global_mean,
+                lambda v, _s=stats, _fm=fold_mean: _smooth(
+                    _s.loc[v, "count"] if v in _s.index else 0,
+                    _s.loc[v, "mean"] if v in _s.index else _fm,
+                    _fm,
                 )
             )
             oof[val_idx] = encoded_val.values
 
+        full_global_mean = float(train_df[target_col].mean())
         train_df[out_name] = oof
-        train_df[out_name] = train_df[out_name].fillna(global_mean)
+        train_df[out_name] = train_df[out_name].fillna(full_global_mean)
 
         # Test: use full train stats
         full_stats = (
@@ -284,11 +277,11 @@ def _add_target_encoding(
                 cnt = full_stats.loc[v, "count"]
                 mn = full_stats.loc[v, "mean"]
             else:
-                cnt, mn = 0, global_mean
-            return (cnt * mn + alpha * global_mean) / (cnt + alpha)
+                cnt, mn = 0, full_global_mean
+            return (cnt * mn + alpha * full_global_mean) / (cnt + alpha)
 
         test_df[out_name] = test_df[col_name].map(_smooth_full)
-        test_df[out_name] = test_df[out_name].fillna(global_mean)
+        test_df[out_name] = test_df[out_name].fillna(full_global_mean)
 
         return train_df, test_df
 

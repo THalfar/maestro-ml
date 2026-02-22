@@ -147,8 +147,8 @@ def rank_average(preds_list: list[np.ndarray]) -> np.ndarray:
         2. Average all normalized rank arrays.
         3. Return the averaged ranks.
     """
-    # REVIEW:BUG — raises IndexError if preds_list is empty; no guard for this edge case.
-    # Fix: add `if not preds_list: raise ValueError("preds_list must not be empty")`.
+    if not preds_list:
+        raise ValueError("preds_list must not be empty")
     n = len(preds_list[0])
     normalized_ranks = []
     for preds in preds_list:

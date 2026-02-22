@@ -140,12 +140,11 @@ class ModelRegistry:
         # Build params dict
         fixed = config.fixed_params
 
-        # Handle task-type-specific fixed_params (e.g., ridge.yaml)
-        if fixed and isinstance(fixed, dict):
-            first_val = next(iter(fixed.values()), None)
-            if isinstance(first_val, dict):
-                # Keys are task_types
-                fixed = fixed.get(task_type, {}) or {}
+        # Handle task-type-specific fixed_params (e.g., ridge.yaml).
+        # Detection: all top-level keys are known task_type strings.
+        _TASK_TYPES = {"binary_classification", "multiclass", "regression"}
+        if fixed and isinstance(fixed, dict) and set(fixed.keys()) <= _TASK_TYPES:
+            fixed = fixed.get(task_type, {}) or {}
 
         params: dict[str, Any] = {}
         params.update(fixed or {})
@@ -237,6 +236,19 @@ class ModelRegistry:
             "n_top_trials": optuna_cfg.n_top_trials,
             "n_seeds": optuna_cfg.n_seeds,
         }
+
+    def get_training_config(self, name: str) -> dict:
+        """Get the training configuration dict for a model.
+
+        Args:
+            name: Registered model name.
+
+        Returns:
+            Training config dict (needs_eval_set, early_stopping_rounds, etc.)
+        """
+        if name not in self._configs:
+            raise KeyError(f"Model '{name}' not registered.")
+        return self._configs[name].training
 
     def list_models(self) -> list[str]:
         """Return a sorted list of all registered model names.

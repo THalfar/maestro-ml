@@ -70,6 +70,8 @@ training:
   early_stopping: true
   early_stopping_param: early_stopping_rounds
   early_stopping_rounds: 50
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_seed
   eval_metric_param: eval_metric
   eval_metric:
     binary_classification:

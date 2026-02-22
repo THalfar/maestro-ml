@@ -56,6 +56,10 @@ def compute_correlation_matrix(oof_list: list[np.ndarray]) -> np.ndarray:
     """
     mat = np.column_stack(oof_list)  # (n_samples, n_models)
     corr = np.corrcoef(mat.T)       # (n_models, n_models)
+    # Zero-variance OOF arrays (degenerate model) produce NaN in corrcoef.
+    # Treat undefined correlation as uncorrelated (0.0) and restore diagonal to 1.0.
+    corr = np.nan_to_num(corr, nan=0.0)
+    np.fill_diagonal(corr, 1.0)
     return corr
 
 
@@ -230,7 +234,7 @@ def run_nsga2_ensemble(
         6. Return (test_preds, info_dict).
     """
     n_models = len(oof_list)
-    worst_metric = -np.inf if metric != "neg_rmse" else np.inf
+    worst_metric = -np.inf
 
     def objective(trial: optuna.Trial) -> tuple[float, float]:
         # For each model: include flag + weight

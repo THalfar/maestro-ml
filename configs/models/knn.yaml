@@ -39,6 +39,8 @@ training:
   early_stopping: false
   early_stopping_param: null
   early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: null                          # KNN is deterministic; no seed parameter
   eval_metric_param: null
   needs_eval_set: false
 

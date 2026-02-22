@@ -62,8 +62,10 @@ fixed_params:
 
 training:
   early_stopping: true
-  early_stopping_param: early_stopping_rounds       # LightGBM uses callbacks
+  early_stopping_param: early_stopping_rounds
   early_stopping_rounds: 50
+  uses_callbacks_for_early_stopping: true   # LightGBM requires lgb.early_stopping callback
+  seed_param: random_state
   eval_metric_param: metric
   eval_metric:
     binary_classification: binary_logloss
