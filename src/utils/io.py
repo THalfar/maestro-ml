@@ -7,6 +7,7 @@ every other module depends on it for loading YAML configs.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -188,7 +189,11 @@ def load_yaml(path: str | Path) -> dict:
         3. Read and parse the YAML content using yaml.safe_load.
         4. Return the resulting dictionary.
     """
-    raise NotImplementedError
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"YAML file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def load_pipeline_config(path: str | Path) -> PipelineConfig:
@@ -218,7 +223,77 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         10. Parse the 'output' section into an OutputConfig dataclass.
         11. Return the assembled PipelineConfig.
     """
-    raise NotImplementedError
+    raw = load_yaml(path)
+
+    data = raw.get("data", {})
+    cv_raw = raw.get("cv", {})
+    strategy_raw = raw.get("strategy", {})
+    features_raw = raw.get("features", {}) or {}
+    ensemble_raw = raw.get("ensemble", {})
+    optuna_raw = raw.get("optuna", {})
+    runtime_raw = raw.get("runtime", {})
+    output_raw = raw.get("output", {})
+
+    cv = CVConfig(
+        n_folds=cv_raw.get("n_folds", 10),
+        seed=cv_raw.get("seed", 42),
+        stratified=cv_raw.get("stratified", True),
+    )
+
+    strategy = StrategyConfig(
+        mode=strategy_raw.get("mode", "manual"),
+        api=strategy_raw.get("api", {}) or {},
+        manual=strategy_raw.get("manual", {}) or {},
+    )
+
+    features = FeatureConfig(
+        interactions=features_raw.get("interactions", []) or [],
+        ratios=features_raw.get("ratios", []) or [],
+        target_encoding=features_raw.get("target_encoding", {}) or {},
+        custom=features_raw.get("custom", []) or [],
+    )
+
+    ensemble = EnsembleConfig(
+        strategy=ensemble_raw.get("strategy", "auto"),
+        blend_trials=ensemble_raw.get("blend_trials", 500),
+        meta_trials=ensemble_raw.get("meta_trials", 100),
+        nsga2_trials=ensemble_raw.get("nsga2_trials", 300),
+        diversity_weight=ensemble_raw.get("diversity_weight", 0.3),
+    )
+
+    optuna = OptunaGlobalConfig(
+        global_seed=optuna_raw.get("global_seed", 42),
+        global_timeout=optuna_raw.get("global_timeout", None),
+    )
+
+    runtime = RuntimeConfig(
+        gpu_check=runtime_raw.get("gpu_check", True),
+        gpu_fallback=runtime_raw.get("gpu_fallback", True),
+        n_jobs=runtime_raw.get("n_jobs", -1),
+        verbose=runtime_raw.get("verbose", 1),
+    )
+
+    output = OutputConfig(
+        submission_path=output_raw.get("submission_path", "results/submission.csv"),
+        results_dir=output_raw.get("results_dir", "results/"),
+        save_oof=output_raw.get("save_oof", True),
+    )
+
+    return PipelineConfig(
+        train_path=data.get("train_path", ""),
+        test_path=data.get("test_path", ""),
+        target_column=data.get("target_column", ""),
+        id_column=data.get("id_column", ""),
+        task_type=data.get("task_type", "binary_classification"),
+        cv=cv,
+        strategy=strategy,
+        models=raw.get("models", []) or [],
+        features=features,
+        ensemble=ensemble,
+        optuna=optuna,
+        runtime=runtime,
+        output=output,
+    )
 
 
 def load_model_config(path: str | Path) -> ModelConfig:
@@ -241,7 +316,29 @@ def load_model_config(path: str | Path) -> ModelConfig:
         3. Parse the 'optuna' section into an OptunaModelConfig dataclass.
         4. Return the assembled ModelConfig.
     """
-    raise NotImplementedError
+    raw = load_yaml(path)
+
+    optuna_raw = raw.get("optuna", {})
+    optuna = OptunaModelConfig(
+        n_trials=optuna_raw.get("n_trials", 150),
+        qmc_warmup_ratio=optuna_raw.get("qmc_warmup_ratio", 0.3),
+        timeout=optuna_raw.get("timeout", None),
+        pruner=optuna_raw.get("pruner", {"type": "median", "n_warmup_steps": 3, "n_startup_trials": 10}),
+        n_top_trials=optuna_raw.get("n_top_trials", 5),
+        n_seeds=optuna_raw.get("n_seeds", 3),
+    )
+
+    return ModelConfig(
+        name=raw.get("name", ""),
+        class_path=raw.get("class_path", {}),
+        task_types=raw.get("task_types", []),
+        gpu=raw.get("gpu", {}),
+        hyperparameters=raw.get("hyperparameters", {}),
+        fixed_params=raw.get("fixed_params", {}),
+        training=raw.get("training", {}),
+        feature_requirements=raw.get("feature_requirements", {}),
+        optuna=optuna,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +366,15 @@ def save_submission(
         3. Write to CSV with index=False.
         4. Log the submission path and shape.
     """
-    raise NotImplementedError
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    id_col_name = ids.name if hasattr(ids, "name") and ids.name is not None else "id"
+    df = pd.DataFrame({id_col_name: ids, target_col: preds})
+    df.to_csv(path, index=False)
+
+    logger = logging.getLogger("maestro")
+    logger.info(f"Submission saved: {path} | shape={df.shape}")
 
 
 def save_eda_report(report: dict, path: str | Path) -> None:
@@ -286,7 +391,28 @@ def save_eda_report(report: dict, path: str | Path) -> None:
         3. Write the report as formatted JSON with indent=2.
         4. Log the save path.
     """
-    raise NotImplementedError
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _convert(obj: Any) -> Any:
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_convert(x) for x in obj]
+        return obj
+
+    clean_report = _convert(report)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean_report, f, indent=2)
+
+    logger = logging.getLogger("maestro")
+    logger.info(f"EDA report saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -310,4 +436,20 @@ def setup_logging(verbose: int = 1) -> logging.Logger:
            (timestamp, level, message).
         5. Return the logger.
     """
-    raise NotImplementedError
+    level_map = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
+    level = level_map.get(verbose, logging.INFO)
+
+    logger = logging.getLogger("maestro")
+    logger.setLevel(level)
+
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger

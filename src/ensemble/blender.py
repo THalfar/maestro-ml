@@ -11,11 +11,33 @@ All strategies work with OOF predictions to evaluate without leakage.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
+import optuna
+from scipy.stats import rankdata
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.model_selection import StratifiedKFold
+
+logger = logging.getLogger("maestro")
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def _score(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
+    """Compute metric score (always returns higher-is-better value)."""
+    if metric == "roc_auc":
+        return float(roc_auc_score(y_true, y_pred))
+    elif metric == "neg_rmse":
+        return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    else:
+        # Default: try roc_auc
+        try:
+            return float(roc_auc_score(y_true, y_pred))
+        except Exception:
+            return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
 def optimize_blend_weights(
@@ -54,7 +76,31 @@ def optimize_blend_weights(
         4. Extract best weights and normalize.
         5. Return the weight list.
     """
-    raise NotImplementedError
+    n_models = len(oof_list)
+    oof_arr = np.column_stack(oof_list)  # shape (n_samples, n_models)
+
+    def objective(trial: optuna.Trial) -> float:
+        raw_weights = np.array(
+            [trial.suggest_float(f"w_{i}", 0.0, 1.0) for i in range(n_models)]
+        )
+        total = raw_weights.sum()
+        if total == 0:
+            return -np.inf
+        weights = raw_weights / total
+        blend = oof_arr @ weights
+        return _score(y, blend, metric)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    raw_weights = np.array([best_params[f"w_{i}"] for i in range(n_models)])
+    total = raw_weights.sum()
+    weights = (raw_weights / total).tolist() if total > 0 else [1.0 / n_models] * n_models
+    return weights
 
 
 def apply_blend(
@@ -75,7 +121,11 @@ def apply_blend(
         2. Compute weighted sum: np.sum(w * p for w, p in zip).
         3. Return the blended array.
     """
-    raise NotImplementedError
+    assert len(preds_list) == len(weights), (
+        f"preds_list ({len(preds_list)}) and weights ({len(weights)}) must have same length"
+    )
+    blended = sum(w * p for w, p in zip(weights, preds_list))
+    return np.array(blended)
 
 
 def rank_average(preds_list: list[np.ndarray]) -> np.ndarray:
@@ -97,7 +147,12 @@ def rank_average(preds_list: list[np.ndarray]) -> np.ndarray:
         2. Average all normalized rank arrays.
         3. Return the averaged ranks.
     """
-    raise NotImplementedError
+    n = len(preds_list[0])
+    normalized_ranks = []
+    for preds in preds_list:
+        ranks = rankdata(preds)
+        normalized_ranks.append(ranks / (n + 1))
+    return np.mean(normalized_ranks, axis=0)
 
 
 def train_meta_model(
@@ -143,7 +198,37 @@ def train_meta_model(
            c. Predict on X_test_meta → meta_test += preds / n_folds.
         7. Return (meta_oof, meta_test).
     """
-    raise NotImplementedError
+    X_meta = np.column_stack(oof_list)  # (n_samples, n_models)
+
+    def _logit_transform(arr: np.ndarray) -> np.ndarray:
+        p = np.clip(arr, 1e-6, 1 - 1e-6)
+        return np.clip(np.log(p / (1 - p)), -5, 5)
+
+    # Append logit transforms
+    logit_meta = np.column_stack([_logit_transform(col) for col in oof_list])
+    X_meta = np.hstack([X_meta, logit_meta])
+
+    X_test_meta = np.column_stack(test_list)
+    logit_test = np.column_stack([_logit_transform(col) for col in test_list])
+    X_test_meta = np.hstack([X_test_meta, logit_test])
+
+    n_test = X_test_meta.shape[0]
+    meta_oof = np.zeros(len(y))
+    meta_test = np.zeros(n_test)
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+    for train_idx, val_idx in skf.split(X_meta, y):
+        X_tr, X_val = X_meta[train_idx], X_meta[val_idx]
+        y_tr = y[train_idx]
+
+        meta_model = LogisticRegression(C=C, max_iter=2000, solver="lbfgs")
+        meta_model.fit(X_tr, y_tr)
+
+        meta_oof[val_idx] = meta_model.predict_proba(X_val)[:, 1]
+        meta_test += meta_model.predict_proba(X_test_meta)[:, 1] / n_folds
+
+    return meta_oof, meta_test
 
 
 def pick_best_strategy(
@@ -172,4 +257,17 @@ def pick_best_strategy(
         2. Select the strategy with the best score.
         3. Return its test predictions, name, and score.
     """
-    raise NotImplementedError
+    best_name = None
+    best_score = -np.inf
+    best_test_preds = None
+
+    for name, (oof_preds, test_preds) in candidates.items():
+        score = _score(y, oof_preds, metric)
+        logger.info(f"Ensemble strategy '{name}': {metric}={score:.6f}")
+
+        if score > best_score:
+            best_score = score
+            best_name = name
+            best_test_preds = test_preds
+
+    return best_test_preds, best_name, best_score

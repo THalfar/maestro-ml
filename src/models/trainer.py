@@ -11,16 +11,48 @@ pruning configuration, and search space (from model YAML + LLM overrides).
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 import optuna
 import pandas as pd
+from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.model_selection import StratifiedKFold, KFold
 
 from src.models.registry import ModelRegistry
 from src.utils.io import PipelineConfig
+
+logger = logging.getLogger("maestro")
+
+# Suppress Optuna's verbose logging
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -> float:
+    """Compute the cross-validation metric for a given task type."""
+    if task_type in ("binary_classification", "multiclass"):
+        return float(roc_auc_score(y_true, y_pred))
+    else:
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def _get_eval_metric_value(training: dict, task_type: str, gpu: bool) -> str | None:
+    """Extract the eval metric value from training config for a given task/device."""
+    em = training.get("eval_metric")
+    if not em:
+        return None
+    # Level 1: by task_type
+    if isinstance(em, dict):
+        task_em = em.get(task_type, em)
+        if isinstance(task_em, str):
+            return task_em
+        if isinstance(task_em, dict):
+            # Has gpu/cpu variants
+            return task_em.get("gpu" if gpu else "cpu", next(iter(task_em.values()), None))
+    return str(em)
 
 
 def run_optuna_study(
@@ -69,7 +101,70 @@ def run_optuna_study(
         8. Log the best trial value and parameters.
         9. Return the study.
     """
-    raise NotImplementedError
+    optuna_cfg = registry.get_optuna_config(model_name)
+
+    # Search space with optional LLM overrides
+    overrides_all = strategy.get("overrides", {}) or {}
+    model_overrides = overrides_all.get(model_name, None)
+    search_space = registry.get_search_space(model_name, overrides=model_overrides)
+
+    # CV splitter
+    cv_cfg = pipeline_config.cv
+    task_type = pipeline_config.task_type
+    if cv_cfg.stratified and task_type != "regression":
+        cv = StratifiedKFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
+    else:
+        cv = KFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
+
+    results_dir = Path(pipeline_config.output.results_dir)
+
+    objective = _create_objective(
+        model_name=model_name,
+        train=train,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        cv=cv,
+        search_space=search_space,
+        registry=registry,
+        task_type=task_type,
+        gpu=gpu,
+        results_dir=results_dir,
+    )
+
+    # Configure pruner
+    pruner_cfg = optuna_cfg.get("pruner", {}) or {}
+    pruner_type = pruner_cfg.get("type", "median")
+    if pruner_type == "median":
+        pruner = optuna.pruners.MedianPruner(
+            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 3),
+            n_startup_trials=pruner_cfg.get("n_startup_trials", 10),
+        )
+    elif pruner_type == "hyperband":
+        pruner = optuna.pruners.HyperbandPruner()
+    else:
+        pruner = optuna.pruners.NopPruner()
+
+    # Study direction
+    direction = "minimize" if task_type == "regression" else "maximize"
+
+    study = optuna.create_study(direction=direction, pruner=pruner)
+
+    _run_two_phase_study(
+        study=study,
+        objective=objective,
+        n_trials=optuna_cfg["n_trials"],
+        qmc_warmup_ratio=optuna_cfg["qmc_warmup_ratio"],
+        timeout=optuna_cfg.get("timeout"),
+        global_seed=pipeline_config.optuna.global_seed,
+    )
+
+    best = study.best_trial
+    logger.info(
+        f"[{model_name}] Best trial #{best.number}: "
+        f"value={best.value:.6f}, params={best.params}"
+    )
+
+    return study
 
 
 def _create_objective(
@@ -131,7 +226,94 @@ def _create_objective(
            g. Return the overall CV metric.
         2. Return the objective function.
     """
-    raise NotImplementedError
+    X = train[feature_cols].values
+    y = train[target_col].values
+
+    training_cfg = registry._configs[model_name].training
+
+    def objective(trial: optuna.Trial) -> float:
+        # Sample hyperparameters
+        hparams: dict[str, Any] = {}
+        for param_name, spec in search_space.items():
+            param_type = spec.get("type", "float")
+            use_log = spec.get("log", False)
+            if param_type == "int":
+                hparams[param_name] = trial.suggest_int(
+                    param_name, spec["low"], spec["high"], log=use_log
+                )
+            elif param_type == "float":
+                hparams[param_name] = trial.suggest_float(
+                    param_name, spec["low"], spec["high"], log=use_log
+                )
+            elif param_type == "categorical":
+                hparams[param_name] = trial.suggest_categorical(
+                    param_name, spec["choices"]
+                )
+
+        # Add eval_metric to constructor params where needed
+        eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
+        eval_metric_param = training_cfg.get("eval_metric_param")
+        if eval_metric_val and eval_metric_param:
+            hparams[eval_metric_param] = eval_metric_val
+
+        model = registry.get_model(
+            model_name, hparams=hparams, task_type=task_type,
+            gpu=gpu, results_dir=results_dir
+        )
+
+        needs_eval_set = training_cfg.get("needs_eval_set", False)
+        early_stopping_rounds = training_cfg.get("early_stopping_rounds")
+        early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
+        is_lgbm = "lightgbm" in model_name.lower()
+
+        oof = np.zeros(len(X))
+
+        try:
+            splits = list(cv.split(X, y))
+        except Exception:
+            splits = list(cv.split(X))
+
+        for fold_idx, (train_idx, val_idx) in enumerate(splits):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            if needs_eval_set:
+                fit_params: dict[str, Any] = {"eval_set": [(X_val, y_val)]}
+                if is_lgbm:
+                    import lightgbm as lgb
+                    fit_params["callbacks"] = [
+                        lgb.early_stopping(
+                            stopping_rounds=early_stopping_rounds or 50,
+                            verbose=False,
+                        ),
+                        lgb.log_evaluation(-1),
+                    ]
+                elif early_stopping_rounds and early_stopping_param:
+                    fit_params[early_stopping_param] = early_stopping_rounds
+                model.fit(X_train, y_train, **fit_params)
+            else:
+                model.fit(X_train, y_train)
+
+            if task_type in ("binary_classification",):
+                fold_preds = model.predict_proba(X_val)[:, 1]
+            elif task_type == "multiclass":
+                fold_preds = model.predict_proba(X_val)[:, 1]
+            else:
+                fold_preds = model.predict(X_val)
+
+            oof[val_idx] = fold_preds
+
+            fold_metric = _compute_cv_metric(y_val, fold_preds, task_type)
+            trial.report(fold_metric, fold_idx)
+
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        overall_metric = _compute_cv_metric(y, oof, task_type)
+        trial.set_user_attr("oof_preds", oof.tolist())
+        return overall_metric
+
+    return objective
 
 
 def _run_two_phase_study(
@@ -170,7 +352,44 @@ def _run_two_phase_study(
            Run study.optimize(objective, n_trials=n_tpe, timeout=remaining).
         5. Log phase completion summaries.
     """
-    raise NotImplementedError
+    n_qmc = max(1, int(n_trials * qmc_warmup_ratio))
+    n_tpe = max(1, n_trials - n_qmc)
+
+    start_time = time.time()
+
+    # Phase 1: QMC
+    logger.info(f"Phase 1 (QMC): {n_qmc} trials")
+    study.sampler = optuna.samplers.QMCSampler(seed=global_seed)
+    study.optimize(
+        objective,
+        n_trials=n_qmc,
+        timeout=timeout,
+        show_progress_bar=False,
+    )
+    qmc_elapsed = time.time() - start_time
+    logger.info(
+        f"Phase 1 done: {len(study.trials)} trials completed in {qmc_elapsed:.1f}s"
+    )
+
+    # Phase 2: TPE
+    remaining_timeout = None
+    if timeout is not None:
+        remaining_timeout = max(1, timeout - int(qmc_elapsed))
+
+    logger.info(f"Phase 2 (TPE): {n_tpe} trials")
+    study.sampler = optuna.samplers.TPESampler(
+        seed=global_seed, n_startup_trials=0
+    )
+    study.optimize(
+        objective,
+        n_trials=n_tpe,
+        timeout=remaining_timeout,
+        show_progress_bar=False,
+    )
+    total_elapsed = time.time() - start_time
+    logger.info(
+        f"Phase 2 done: {len(study.trials)} total trials in {total_elapsed:.1f}s"
+    )
 
 
 def train_with_config(
@@ -226,7 +445,81 @@ def train_with_config(
            f. Append test_preds to test_preds_list.
         3. Return (oof_preds_list, test_preds_list, y_train).
     """
-    raise NotImplementedError
+    X_train = train[feature_cols].values
+    y_train = train[target_col].values
+    X_test = test[feature_cols].values
+
+    training_cfg = registry._configs[model_name].training
+    needs_eval_set = training_cfg.get("needs_eval_set", False)
+    early_stopping_rounds = training_cfg.get("early_stopping_rounds")
+    early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
+    is_lgbm = "lightgbm" in model_name.lower()
+
+    # Eval metric for constructor
+    eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
+    eval_metric_param = training_cfg.get("eval_metric_param")
+
+    # Seed param name: catboost uses random_seed, others use random_state
+    seed_param = "random_seed" if model_name == "catboost" else "random_state"
+
+    oof_preds_list: list[np.ndarray] = []
+    test_preds_list: list[np.ndarray] = []
+
+    try:
+        splits = list(cv.split(X_train, y_train))
+    except Exception:
+        splits = list(cv.split(X_train))
+
+    n_folds = len(splits)
+
+    for seed in seeds:
+        hparams_seeded = {**hparams, seed_param: seed}
+        if eval_metric_val and eval_metric_param:
+            hparams_seeded[eval_metric_param] = eval_metric_val
+
+        oof_preds = np.zeros(len(X_train))
+        test_preds = np.zeros(len(X_test))
+
+        for train_idx, val_idx in splits:
+            X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+            y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+
+            model = registry.get_model(
+                model_name, hparams=hparams_seeded,
+                task_type=task_type, gpu=gpu, results_dir=results_dir
+            )
+
+            if needs_eval_set:
+                fit_params: dict[str, Any] = {"eval_set": [(X_fold_val, y_fold_val)]}
+                if is_lgbm:
+                    import lightgbm as lgb
+                    fit_params["callbacks"] = [
+                        lgb.early_stopping(
+                            stopping_rounds=early_stopping_rounds or 50,
+                            verbose=False,
+                        ),
+                        lgb.log_evaluation(-1),
+                    ]
+                elif early_stopping_rounds and early_stopping_param:
+                    fit_params[early_stopping_param] = early_stopping_rounds
+                model.fit(X_fold_train, y_fold_train, **fit_params)
+            else:
+                model.fit(X_fold_train, y_fold_train)
+
+            if task_type in ("binary_classification", "multiclass"):
+                val_preds = model.predict_proba(X_fold_val)[:, 1]
+                tst_preds = model.predict_proba(X_test)[:, 1]
+            else:
+                val_preds = model.predict(X_fold_val)
+                tst_preds = model.predict(X_test)
+
+            oof_preds[val_idx] = val_preds
+            test_preds += tst_preds / n_folds
+
+        oof_preds_list.append(oof_preds)
+        test_preds_list.append(test_preds)
+
+    return oof_preds_list, test_preds_list, y_train
 
 
 def get_top_configs(
@@ -252,7 +545,23 @@ def get_top_configs(
         4. For each, extract params, value, and number into a dict.
         5. Return the list.
     """
-    raise NotImplementedError
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+    ]
+
+    descending = (study.direction == optuna.study.StudyDirection.MAXIMIZE)
+    sorted_trials = sorted(completed, key=lambda t: t.value, reverse=descending)
+    top = sorted_trials[:n_top]
+
+    return [
+        {
+            "params": dict(t.params),
+            "value": t.value,
+            "trial_number": t.number,
+        }
+        for t in top
+    ]
 
 
 def run_all_studies(
@@ -298,4 +607,77 @@ def run_all_studies(
            f. Store results in the output dict.
         3. Return the complete results dict.
     """
-    raise NotImplementedError
+    cv_cfg = pipeline_config.cv
+    task_type = pipeline_config.task_type
+
+    if cv_cfg.stratified and task_type != "regression":
+        cv = StratifiedKFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
+    else:
+        cv = KFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
+
+    results: dict[str, dict[str, Any]] = {}
+    global_seed = pipeline_config.optuna.global_seed
+    results_dir = Path(pipeline_config.output.results_dir)
+
+    for model_name in pipeline_config.models:
+        logger.info(f"Starting study for model: {model_name}")
+        gpu = gpu_status.get(model_name, False)
+
+        try:
+            study = run_optuna_study(
+                model_name=model_name,
+                train=train,
+                feature_cols=feature_cols,
+                target_col=pipeline_config.target_column,
+                registry=registry,
+                pipeline_config=pipeline_config,
+                strategy=strategy,
+                gpu=gpu,
+            )
+
+            optuna_cfg = registry.get_optuna_config(model_name)
+            n_top = optuna_cfg["n_top_trials"]
+            n_seeds = optuna_cfg["n_seeds"]
+            seeds = [global_seed + i for i in range(n_seeds)]
+
+            top_configs = get_top_configs(study, n_top=n_top)
+
+            all_oof: list[np.ndarray] = []
+            all_test: list[np.ndarray] = []
+            labels: np.ndarray | None = None
+
+            for cfg in top_configs:
+                oof_list, test_list, y = train_with_config(
+                    model_name=model_name,
+                    hparams=cfg["params"],
+                    feature_cols=feature_cols,
+                    train=train,
+                    test=test,
+                    target_col=pipeline_config.target_column,
+                    cv=cv,
+                    registry=registry,
+                    task_type=task_type,
+                    gpu=gpu,
+                    seeds=seeds,
+                    results_dir=results_dir,
+                )
+                all_oof.extend(oof_list)
+                all_test.extend(test_list)
+                if labels is None:
+                    labels = y
+
+            results[model_name] = {
+                "study": study,
+                "top_configs": top_configs,
+                "oof_preds": all_oof,
+                "test_preds": all_test,
+                "labels": labels,
+            }
+            logger.info(
+                f"[{model_name}] Done: {len(all_oof)} prediction arrays collected."
+            )
+
+        except Exception as exc:
+            logger.error(f"Model '{model_name}' failed: {exc}", exc_info=True)
+
+    return results

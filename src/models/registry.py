@@ -10,11 +10,18 @@ This is the bridge between YAML configs and Python model objects.
 
 from __future__ import annotations
 
+import copy
+import importlib
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from src.utils.io import ModelConfig
+import numpy as np
+
+from src.utils.io import ModelConfig, load_model_config
+
+logger = logging.getLogger("maestro")
 
 
 class ModelRegistry:
@@ -44,7 +51,14 @@ class ModelRegistry:
             3. If configs_dir exists, iterate over all .yaml files and
                call self.register for each one.
         """
-        raise NotImplementedError
+        self._configs: dict[str, ModelConfig] = {}
+        self._gpu_status: dict[str, bool] = {}
+
+        configs_dir = Path(configs_dir)
+        if configs_dir.exists():
+            for yaml_path in sorted(configs_dir.glob("*.yaml")):
+                name = yaml_path.stem  # filename without extension
+                self.register(name, yaml_path)
 
     def register(self, name: str, config_path: str | Path) -> None:
         """Register a model by loading its YAML configuration.
@@ -58,7 +72,9 @@ class ModelRegistry:
             2. Store the ModelConfig in self._configs[name].
             3. Log the registration.
         """
-        raise NotImplementedError
+        config = load_model_config(config_path)
+        self._configs[name] = config
+        logger.debug(f"Registered model: {name} ({config.name})")
 
     def get_model(
         self,
@@ -98,7 +114,60 @@ class ModelRegistry:
                d. For CatBoost: set train_dir to results_dir/catboost_info.
             5. Instantiate and return the model class with the params.
         """
-        raise NotImplementedError
+        if name not in self._configs:
+            raise KeyError(f"Model '{name}' not registered. Available: {self.list_models()}")
+
+        config = self._configs[name]
+
+        # Select class_path for task_type
+        class_path = config.class_path.get(task_type)
+        if class_path is None:
+            # Fallback to first available
+            class_path = next(iter(config.class_path.values()))
+            logger.warning(
+                f"Model '{name}' has no class_path for '{task_type}', "
+                f"using '{class_path}'"
+            )
+
+        # Dynamically import the class
+        module_path, class_name = class_path.rsplit(".", 1)
+        try:
+            module = importlib.import_module(module_path)
+            model_class = getattr(module, class_name)
+        except (ImportError, AttributeError) as exc:
+            raise ImportError(f"Could not import '{class_path}': {exc}") from exc
+
+        # Build params dict
+        fixed = config.fixed_params
+
+        # Handle task-type-specific fixed_params (e.g., ridge.yaml)
+        if fixed and isinstance(fixed, dict):
+            first_val = next(iter(fixed.values()), None)
+            if isinstance(first_val, dict):
+                # Keys are task_types
+                fixed = fixed.get(task_type, {}) or {}
+
+        params: dict[str, Any] = {}
+        params.update(fixed or {})
+        params.update(hparams)
+
+        # GPU / CPU params
+        gpu_cfg = config.gpu or {}
+        if gpu:
+            params.update(gpu_cfg.get("params", {}) or {})
+        else:
+            params.update(gpu_cfg.get("fallback", {}) or {})
+
+        # CatBoost: set train_dir
+        if "catboost" in class_path.lower():
+            if results_dir is not None:
+                catboost_dir = Path(results_dir) / "catboost_info"
+            else:
+                catboost_dir = Path(tempfile.mkdtemp()) / "catboost_info"
+            catboost_dir.mkdir(parents=True, exist_ok=True)
+            params["train_dir"] = str(catboost_dir)
+
+        return model_class(**params)
 
     def get_search_space(
         self,
@@ -129,7 +198,18 @@ class ModelRegistry:
                corresponding parameter spec (override low/high/choices).
             4. Return the merged search space.
         """
-        raise NotImplementedError
+        if name not in self._configs:
+            raise KeyError(f"Model '{name}' not registered.")
+
+        config = self._configs[name]
+        space = copy.deepcopy(config.hyperparameters)
+
+        if overrides:
+            for param_name, override_spec in overrides.items():
+                if param_name in space:
+                    space[param_name].update(override_spec)
+
+        return space
 
     def get_optuna_config(self, name: str) -> dict[str, Any]:
         """Get the per-model Optuna study configuration.
@@ -145,7 +225,18 @@ class ModelRegistry:
             1. Look up the ModelConfig from self._configs[name].
             2. Return the optuna config as a dict.
         """
-        raise NotImplementedError
+        if name not in self._configs:
+            raise KeyError(f"Model '{name}' not registered.")
+
+        optuna_cfg = self._configs[name].optuna
+        return {
+            "n_trials": optuna_cfg.n_trials,
+            "qmc_warmup_ratio": optuna_cfg.qmc_warmup_ratio,
+            "timeout": optuna_cfg.timeout,
+            "pruner": optuna_cfg.pruner,
+            "n_top_trials": optuna_cfg.n_top_trials,
+            "n_seeds": optuna_cfg.n_seeds,
+        }
 
     def list_models(self) -> list[str]:
         """Return a sorted list of all registered model names.
@@ -153,7 +244,7 @@ class ModelRegistry:
         Returns:
             Sorted list of model name strings.
         """
-        raise NotImplementedError
+        return sorted(self._configs.keys())
 
     def check_gpu(self, name: str, task_type: str = "binary_classification") -> bool:
         """Test whether GPU acceleration works for a model via micro-trial.
@@ -181,7 +272,34 @@ class ModelRegistry:
             6. If any exception occurs, log the error, cache False,
                and return False.
         """
-        raise NotImplementedError
+        cache_key = f"{name}_{task_type}"
+        if cache_key in self._gpu_status:
+            return self._gpu_status[cache_key]
+
+        if name not in self._configs:
+            self._gpu_status[cache_key] = False
+            return False
+
+        config = self._configs[name]
+        if not config.gpu.get("supported", False):
+            self._gpu_status[cache_key] = False
+            return False
+
+        # Tiny synthetic dataset
+        rng = np.random.default_rng(0)
+        X = rng.random((20, 3)).astype(np.float32)
+        y = (rng.random(20) > 0.5).astype(np.int32)
+
+        try:
+            model = self.get_model(name, hparams={}, task_type=task_type, gpu=True)
+            model.fit(X, y)
+            logger.info(f"GPU check passed for '{name}'")
+            self._gpu_status[cache_key] = True
+            return True
+        except Exception as exc:
+            logger.warning(f"GPU check failed for '{name}': {exc}. Using CPU fallback.")
+            self._gpu_status[cache_key] = False
+            return False
 
     def get_feature_requirements(self, name: str) -> dict[str, bool]:
         """Get the feature requirements for a model.
@@ -197,4 +315,7 @@ class ModelRegistry:
             1. Look up the ModelConfig from self._configs[name].
             2. Return the feature_requirements dict.
         """
-        raise NotImplementedError
+        if name not in self._configs:
+            raise KeyError(f"Model '{name}' not registered.")
+
+        return dict(self._configs[name].feature_requirements)

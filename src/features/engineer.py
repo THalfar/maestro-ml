@@ -12,11 +12,14 @@ modify the input DataFrames in-place.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold, KFold
+
+logger = logging.getLogger("maestro")
 
 
 def build_features(
@@ -58,7 +61,43 @@ def build_features(
         6. If custom features exist, call _add_custom_features on both.
         7. Return the modified (train, test) tuple.
     """
-    raise NotImplementedError
+    train = train.copy()
+    test = test.copy()
+
+    features_cfg = strategy.get("features", {}) or {}
+
+    interactions = features_cfg.get("interactions", []) or []
+    if interactions:
+        train = _add_interactions(train, interactions)
+        test = _add_interactions(test, interactions)
+
+    ratios = features_cfg.get("ratios", []) or []
+    if ratios:
+        train = _add_ratios(train, ratios)
+        test = _add_ratios(test, ratios)
+
+    te_cfg = features_cfg.get("target_encoding", {}) or {}
+    if te_cfg and cv_folds is not None:
+        te_columns = te_cfg.get("columns", []) or []
+        te_pairs = te_cfg.get("pairs", []) or []
+        te_alpha = float(te_cfg.get("alpha", 15.0))
+        if te_columns or te_pairs:
+            train, test = _add_target_encoding(
+                train=train,
+                test=test,
+                columns=te_columns,
+                pairs=te_pairs,
+                cv_folds=cv_folds,
+                target_col=target_col,
+                alpha=te_alpha,
+            )
+
+    custom = features_cfg.get("custom", []) or []
+    if custom:
+        train = _add_custom_features(train, custom)
+        test = _add_custom_features(test, custom)
+
+    return train, test
 
 
 def _add_interactions(
@@ -82,7 +121,17 @@ def _add_interactions(
            b. Create new column: df[f'{col_a}__x__{col_b}'] = df[col_a] * df[col_b]
         3. Return the modified DataFrame.
     """
-    raise NotImplementedError
+    df = df.copy()
+    for pair in pairs:
+        col_a, col_b = pair[0], pair[1]
+        if col_a not in df.columns:
+            logger.warning(f"Interaction: column '{col_a}' not found, skipping.")
+            continue
+        if col_b not in df.columns:
+            logger.warning(f"Interaction: column '{col_b}' not found, skipping.")
+            continue
+        df[f"{col_a}__x__{col_b}"] = df[col_a] * df[col_b]
+    return df
 
 
 def _add_ratios(
@@ -108,7 +157,17 @@ def _add_ratios(
               df[f'{num}__div__{den}'] = df[num] / (df[den] + 1e-8)
         3. Return the modified DataFrame.
     """
-    raise NotImplementedError
+    df = df.copy()
+    for pair in ratios:
+        num, den = pair[0], pair[1]
+        if num not in df.columns:
+            logger.warning(f"Ratio: column '{num}' not found, skipping.")
+            continue
+        if den not in df.columns:
+            logger.warning(f"Ratio: column '{den}' not found, skipping.")
+            continue
+        df[f"{num}__div__{den}"] = df[num] / (df[den] + 1e-8)
+    return df
 
 
 def _add_target_encoding(
@@ -162,7 +221,97 @@ def _add_target_encoding(
            c. Drop the temporary concatenated column.
         5. Return (train_encoded, test_encoded).
     """
-    raise NotImplementedError
+    train = train.copy()
+    test = test.copy()
+
+    global_mean = float(train[target_col].mean())
+
+    def _encode_column(
+        col_name: str,
+        out_name: str,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Apply OOF target encoding for a single (possibly temp) column."""
+        train_df = train_df.copy()
+        test_df = test_df.copy()
+
+        oof = np.full(len(train_df), np.nan)
+        target = train_df[target_col].values
+
+        # Determine split arguments
+        try:
+            splits = list(cv_folds.split(train_df, target))
+        except Exception:
+            splits = list(cv_folds.split(train_df))
+
+        for train_idx, val_idx in splits:
+            # Stats from training fold
+            fold_train = train_df.iloc[train_idx]
+            stats = (
+                fold_train.groupby(col_name)[target_col]
+                .agg(["count", "mean"])
+            )
+            # Smoothed encoding
+            def _smooth(count: float, mean: float) -> float:
+                return (count * mean + alpha * global_mean) / (count + alpha)
+
+            val_col = train_df.iloc[val_idx][col_name]
+            encoded_val = val_col.map(
+                lambda v: _smooth(
+                    stats.loc[v, "count"] if v in stats.index else 0,
+                    stats.loc[v, "mean"] if v in stats.index else global_mean,
+                )
+            )
+            oof[val_idx] = encoded_val.values
+
+        train_df[out_name] = oof
+        train_df[out_name] = train_df[out_name].fillna(global_mean)
+
+        # Test: use full train stats
+        full_stats = (
+            train_df.groupby(col_name)[target_col]
+            .agg(["count", "mean"])
+        )
+
+        def _smooth_full(v: Any) -> float:
+            if v in full_stats.index:
+                cnt = full_stats.loc[v, "count"]
+                mn = full_stats.loc[v, "mean"]
+            else:
+                cnt, mn = 0, global_mean
+            return (cnt * mn + alpha * global_mean) / (cnt + alpha)
+
+        test_df[out_name] = test_df[col_name].map(_smooth_full)
+        test_df[out_name] = test_df[out_name].fillna(global_mean)
+
+        return train_df, test_df
+
+    # Single columns
+    for col in columns:
+        if col not in train.columns:
+            logger.warning(f"Target encoding: column '{col}' not found, skipping.")
+            continue
+        out_name = f"{col}_te"
+        train, test = _encode_column(col, out_name, train, test)
+
+    # Pair columns
+    for pair in pairs:
+        col_a, col_b = pair[0], pair[1]
+        if col_a not in train.columns or col_b not in train.columns:
+            logger.warning(f"Target encoding: pair {pair} columns not found, skipping.")
+            continue
+        temp_col = f"__te_tmp_{col_a}_{col_b}__"
+        train[temp_col] = train[col_a].astype(str) + "_" + train[col_b].astype(str)
+        test[temp_col] = test[col_a].astype(str) + "_" + test[col_b].astype(str)
+
+        out_name = f"{col_a}_{col_b}_te"
+        train, test = _encode_column(temp_col, out_name, train, test)
+
+        train = train.drop(columns=[temp_col])
+        test = test.drop(columns=[temp_col])
+
+    return train, test
 
 
 def _add_custom_features(
@@ -190,7 +339,17 @@ def _add_custom_features(
               skip the feature).
         3. Return the modified DataFrame.
     """
-    raise NotImplementedError
+    df = df.copy()
+    for item in formulas:
+        name = item.get("name", "")
+        formula = item.get("formula", "")
+        if not name or not formula:
+            continue
+        try:
+            df[name] = df.eval(formula)
+        except Exception as exc:
+            logger.warning(f"Custom feature '{name}' failed: {exc}")
+    return df
 
 
 def get_feature_columns(
@@ -222,4 +381,28 @@ def get_feature_columns(
         6. Add custom feature names from strategy['features']['custom'].
         7. Return the sorted list.
     """
-    raise NotImplementedError
+    exclude_set = set(exclude or [])
+    all_cols = [c for c in original_columns if c not in exclude_set]
+
+    features_cfg = strategy.get("features", {}) or {}
+
+    for pair in (features_cfg.get("interactions", []) or []):
+        col_a, col_b = pair[0], pair[1]
+        all_cols.append(f"{col_a}__x__{col_b}")
+
+    for pair in (features_cfg.get("ratios", []) or []):
+        num, den = pair[0], pair[1]
+        all_cols.append(f"{num}__div__{den}")
+
+    te_cfg = features_cfg.get("target_encoding", {}) or {}
+    for col in (te_cfg.get("columns", []) or []):
+        all_cols.append(f"{col}_te")
+    for pair in (te_cfg.get("pairs", []) or []):
+        all_cols.append(f"{pair[0]}_{pair[1]}_te")
+
+    for item in (features_cfg.get("custom", []) or []):
+        name = item.get("name", "")
+        if name:
+            all_cols.append(name)
+
+    return sorted(set(all_cols) - exclude_set)
