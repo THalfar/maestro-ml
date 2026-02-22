@@ -155,10 +155,11 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # Step 3: Layer 1 — EDA
     # -------------------------------------------------------------------------
     logger.info("Layer 1: Running EDA...")
-    eda_report = run_eda(
+    eda_report, train, test = run_eda(
         train_path=pipeline_config.train_path,
         test_path=pipeline_config.test_path,
         target_col=pipeline_config.target_column,
+        id_col=pipeline_config.id_column or None,
     )
     eda_path = results_dir / "eda_report.json"
     save_eda_report(eda_report, eda_path)
@@ -207,9 +208,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # -------------------------------------------------------------------------
     # Step 5: Feature engineering
     # -------------------------------------------------------------------------
-    logger.info("Loading data and building features...")
-    train = pd.read_csv(pipeline_config.train_path)
-    test = pd.read_csv(pipeline_config.test_path)
+    logger.info("Building features...")
 
     # Create CV splitter (same as model training)
     cv_cfg = pipeline_config.cv
@@ -309,7 +308,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
     elif ensemble_strategy == "meta":
         final_oof, final_test_preds = train_meta_model(
             all_oof, all_test, y_true,
-            n_folds=cv_cfg.n_folds, seed=seed
+            n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type
         )
 
     elif ensemble_strategy == "nsga2":
@@ -337,7 +336,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
         try:
             meta_oof, meta_test = train_meta_model(
                 all_oof, all_test, y_true,
-                n_folds=cv_cfg.n_folds, seed=seed
+                n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type
             )
             candidates["meta"] = (meta_oof, meta_test)
         except Exception as exc:
@@ -366,12 +365,14 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # Compute ensemble score
     if task_type != "regression":
         ensemble_score = roc_auc_score(y_true, final_oof)
+        display_metric = metric
     else:
         ensemble_score = float(np.sqrt(mean_squared_error(y_true, final_oof)))
+        display_metric = "rmse"
 
     logger.info(
         f"Ensemble: strategy='{chosen_strategy}', "
-        f"{metric}={ensemble_score:.6f}, "
+        f"{display_metric}={ensemble_score:.6f}, "
         f"n_predictions={len(all_oof)}"
     )
 
@@ -392,7 +393,10 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # -------------------------------------------------------------------------
     # Step 8: Output
     # -------------------------------------------------------------------------
-    test_ids = test[pipeline_config.id_column]
+    if pipeline_config.id_column:
+        test_ids = test[pipeline_config.id_column]
+    else:
+        test_ids = test.index.to_series()
     save_submission(
         ids=test_ids,
         preds=final_test_preds,
@@ -452,8 +456,8 @@ if __name__ == "__main__":
     args = _parse_args()
 
     if args.strategy:
-        # Apply strategy mode override via a patched temp config file
-        raw = yaml.safe_load(open(args.config, encoding="utf-8"))
+        with open(args.config, encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
         raw.setdefault("strategy", {})["mode"] = args.strategy
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".yaml", delete=False, encoding="utf-8"

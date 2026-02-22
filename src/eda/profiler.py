@@ -22,7 +22,8 @@ def run_eda(
     train_path: str | Path,
     test_path: str | Path,
     target_col: str,
-) -> dict:
+    id_col: str | None = None,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """Run the complete EDA pipeline and produce a structured report.
 
     This is the main entry point for Layer 1. It reads the raw CSVs,
@@ -33,9 +34,11 @@ def run_eda(
         train_path: Path to the training CSV file.
         test_path: Path to the test CSV file.
         target_col: Name of the target variable column.
+        id_col: Optional name of the ID column to exclude from analysis.
 
     Returns:
-        Dictionary matching the eda_schema.yaml structure with keys:
+        Tuple of (report, train_df, test_df) where report is a dictionary
+        matching the eda_schema.yaml structure with keys:
         - dataset_info: shapes, memory usage
         - target_analysis: distribution, class balance
         - columns: per-column analysis dict
@@ -43,6 +46,8 @@ def run_eda(
         - feature_clusters: groups of correlated features
         - weak_features: features with low target correlation
         - recommendations: list of LLM-readable suggestion strings
+        train_df and test_df are the loaded DataFrames (returned so callers
+        can reuse them without re-reading from disk).
 
     Steps:
         1. Read train and test CSVs with pd.read_csv.
@@ -76,7 +81,7 @@ def run_eda(
         "test_shape": list(test.shape),
         "train_memory_mb": round(float(train_mem), 3),
         "test_memory_mb": round(float(test_mem), 3),
-        "n_features": train.shape[1] - 1,  # excluding target
+        "n_features": train.shape[1] - 1 - (1 if id_col and id_col in train.columns else 0),
     }
 
     # Target analysis
@@ -91,15 +96,21 @@ def run_eda(
         "missing_pct": round(float(target_series.isna().mean() * 100), 3),
     }
 
-    # Feature columns (exclude target)
-    feature_cols = [c for c in train.columns if c != target_col]
-    feature_df = train[feature_cols].copy()
+    # Feature columns (exclude target and id)
+    feature_cols = [
+        c for c in train.columns
+        if c != target_col and (id_col is None or c != id_col)
+    ]
+    feature_df = train[feature_cols]
 
     # Per-column analysis
     columns_analysis = _detect_column_types(feature_df)
 
-    # Correlations
-    corr_result = _compute_correlations(train, target_col)
+    # Correlations (pass feature_df + target to exclude id_col)
+    corr_result = _compute_correlations(
+        pd.concat([feature_df, train[[target_col]]], axis=1),
+        target_col,
+    )
     target_correlations = corr_result["target_correlations"]
     correlation_matrix = corr_result["correlation_matrix"]
 
@@ -118,7 +129,7 @@ def run_eda(
         columns_analysis, target_correlations, feature_clusters, weak_features, train
     )
 
-    return {
+    report = {
         "dataset_info": dataset_info,
         "target_analysis": target_analysis,
         "columns": columns_analysis,
@@ -127,6 +138,7 @@ def run_eda(
         "weak_features": weak_features,
         "recommendations": recommendations,
     }
+    return report, train, test
 
 
 def _generate_recommendations(
@@ -325,7 +337,10 @@ def _detect_column_types(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
         }
 
         is_numeric = pd.api.types.is_numeric_dtype(series)
-        is_object_or_cat = series.dtype == object or hasattr(series, "cat")
+        is_object_or_cat = (
+            pd.api.types.is_string_dtype(series)
+            or isinstance(series.dtype, pd.CategoricalDtype)
+        )
 
         if is_numeric:
             non_null = series.dropna()

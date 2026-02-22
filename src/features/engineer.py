@@ -68,13 +68,13 @@ def build_features(
 
     interactions = features_cfg.get("interactions", []) or []
     if interactions:
-        train = _add_interactions(train, interactions)
-        test = _add_interactions(test, interactions)
+        train = _add_interactions(train, interactions, _copy=False)
+        test = _add_interactions(test, interactions, _copy=False)
 
     ratios = features_cfg.get("ratios", []) or []
     if ratios:
-        train = _add_ratios(train, ratios)
-        test = _add_ratios(test, ratios)
+        train = _add_ratios(train, ratios, _copy=False)
+        test = _add_ratios(test, ratios, _copy=False)
 
     te_cfg = features_cfg.get("target_encoding", {}) or {}
     if te_cfg and cv_folds is not None:
@@ -90,12 +90,13 @@ def build_features(
                 cv_folds=cv_folds,
                 target_col=target_col,
                 alpha=te_alpha,
+                _copy=False,
             )
 
     custom = features_cfg.get("custom", []) or []
     if custom:
-        train = _add_custom_features(train, custom)
-        test = _add_custom_features(test, custom)
+        train = _add_custom_features(train, custom, _copy=False)
+        test = _add_custom_features(test, custom, _copy=False)
 
     return train, test
 
@@ -103,6 +104,7 @@ def build_features(
 def _add_interactions(
     df: pd.DataFrame,
     pairs: list[list[str]],
+    _copy: bool = True,
 ) -> pd.DataFrame:
     """Add interaction features (column products) to the DataFrame.
 
@@ -121,7 +123,8 @@ def _add_interactions(
            b. Create new column: df[f'{col_a}__x__{col_b}'] = df[col_a] * df[col_b]
         3. Return the modified DataFrame.
     """
-    df = df.copy()
+    if _copy:
+        df = df.copy()
     for pair in pairs:
         col_a, col_b = pair[0], pair[1]
         if col_a not in df.columns:
@@ -137,6 +140,7 @@ def _add_interactions(
 def _add_ratios(
     df: pd.DataFrame,
     ratios: list[list[str]],
+    _copy: bool = True,
 ) -> pd.DataFrame:
     """Add ratio features (column divisions) to the DataFrame.
 
@@ -157,7 +161,8 @@ def _add_ratios(
               df[f'{num}__div__{den}'] = df[num] / (df[den] + 1e-8)
         3. Return the modified DataFrame.
     """
-    df = df.copy()
+    if _copy:
+        df = df.copy()
     for pair in ratios:
         num, den = pair[0], pair[1]
         if num not in df.columns:
@@ -178,6 +183,7 @@ def _add_target_encoding(
     cv_folds: StratifiedKFold | KFold,
     target_col: str,
     alpha: float = 15.0,
+    _copy: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Add target-encoded features using cross-validation to prevent leakage.
 
@@ -221,8 +227,9 @@ def _add_target_encoding(
            c. Drop the temporary concatenated column.
         5. Return (train_encoded, test_encoded).
     """
-    train = train.copy()
-    test = test.copy()
+    if _copy:
+        train = train.copy()
+        test = test.copy()
 
     def _encode_column(
         col_name: str,
@@ -315,6 +322,7 @@ def _add_target_encoding(
 def _add_custom_features(
     df: pd.DataFrame,
     formulas: list[dict[str, str]],
+    _copy: bool = True,
 ) -> pd.DataFrame:
     """Add custom features defined by pandas eval expressions.
 
@@ -337,7 +345,8 @@ def _add_custom_features(
               skip the feature).
         3. Return the modified DataFrame.
     """
-    df = df.copy()
+    if _copy:
+        df = df.copy()
     for item in formulas:
         name = item.get("name", "")
         formula = item.get("formula", "")
