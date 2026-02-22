@@ -1,0 +1,55 @@
+# =============================================================================
+# EDA Report Schema — maestro-ml
+# =============================================================================
+# Defines the structure of the JSON report produced by src/eda/profiler.py.
+# This report is consumed by the LLM strategist (Layer 2) to make
+# informed decisions about feature engineering and model selection.
+# =============================================================================
+
+dataset_info:
+  train_shape: [rows, cols]   # e.g., [918, 12]
+  test_shape: [rows, cols]    # e.g., [612, 11]
+  memory_mb: float            # Total memory usage of training set in MB
+
+target_analysis:
+  column: str                 # Target column name (e.g., "HeartDisease")
+  dtype: str                  # Pandas dtype (e.g., "int64", "float64")
+  distribution: dict          # value -> count (e.g., {0: 410, 1: 508})
+  class_balance: dict         # value -> percentage (e.g., {0: 44.7, 1: 55.3})
+
+columns:                      # Per-column analysis (dict keyed by column name)
+  column_name:
+    dtype: str                # Original pandas dtype
+    detected_type: str        # One of: numeric_continuous | binary |
+                              #   low_cardinality_categorical | ordinal |
+                              #   high_cardinality_categorical
+    missing_pct: float        # Percentage of missing values (0.0-100.0)
+    cardinality: int          # Number of unique values
+    target_correlation: float # Pearson or point-biserial correlation with target
+    top_values: dict          # Top 10 values by frequency: {value: count}
+    stats: dict               # For numeric columns: {mean, std, min, max, median}
+                              # For non-numeric: null
+
+correlation_matrix:           # Full pairwise correlation matrix (numeric cols only)
+  columns: [list of names]    # Ordered list of numeric column names
+  values: [[nested floats]]   # 2D list matching column order
+
+feature_clusters:             # Groups of features with |correlation| >= threshold
+  - features: [list]          # Column names in this cluster
+    mean_internal_corr: float # Average pairwise |correlation| within cluster
+
+weak_features:                # Features with |target_correlation| < threshold
+  - column: str               # Column name
+    target_correlation: float # Actual correlation value
+    recommendation: str       # "consider_dropping" | "try_interactions"
+                              # "try_interactions" if correlated with strong features
+
+recommendations:              # LLM-readable suggestions (list of strings)
+  - "Thallium has strongest target correlation (0.61). Create target-encoded
+     pairs with other strong features."
+  - "BP shows near-zero target correlation (-0.01). Consider excluding from
+     feature engineering."
+  - "Cholesterol and RestingBP cluster together (r=0.52). Keep one or create
+     ratio feature."
+  - "5 binary features detected. Consider interaction terms between top
+     correlated binary features and continuous predictors."

@@ -1,0 +1,97 @@
+# =============================================================================
+# CatBoost Configuration — maestro-ml
+# =============================================================================
+# Gradient boosting with native categorical support and ordered boosting.
+# Strong default performer, typically the first model to try.
+# GPU Note: eval_metric must be Logloss on GPU (AUC not supported).
+# =============================================================================
+
+name: CatBoost
+class_path:
+  binary_classification: catboost.CatBoostClassifier
+  regression: catboost.CatBoostRegressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: true
+  params:
+    task_type: GPU
+  fallback:
+    task_type: CPU
+  install_notes: >
+    CatBoost ships with CUDA support by default via pip install catboost.
+    No special build required. Requires NVIDIA GPU with CUDA toolkit.
+
+hyperparameters:
+  depth:
+    type: int
+    low: 3
+    high: 10
+  learning_rate:
+    type: float
+    low: 0.005
+    high: 0.3
+    log: true
+  iterations:
+    type: int
+    low: 300
+    high: 3000
+  l2_leaf_reg:
+    type: float
+    low: 1.0e-8
+    high: 10.0
+    log: true
+  bagging_temperature:
+    type: float
+    low: 0.0
+    high: 10.0
+  random_strength:
+    type: float
+    low: 1.0e-8
+    high: 10.0
+    log: true
+  border_count:
+    type: int
+    low: 32
+    high: 255
+  min_data_in_leaf:
+    type: int
+    low: 1
+    high: 100
+
+fixed_params:
+  verbose: 0
+  allow_writing_files: false
+  # train_dir is set at runtime to results_dir/catboost_info
+
+training:
+  early_stopping: true
+  early_stopping_param: early_stopping_rounds
+  early_stopping_rounds: 50
+  eval_metric_param: eval_metric
+  eval_metric:
+    binary_classification:
+      cpu: AUC
+      gpu: Logloss           # AUC not supported on GPU
+    regression:
+      cpu: RMSE
+      gpu: RMSE
+  needs_eval_set: true
+
+feature_requirements:
+  needs_scaling: false
+  handles_categorical: true
+  handles_missing: true
+
+optuna:
+  n_trials: 200
+  qmc_warmup_ratio: 0.3
+  timeout: null
+  pruner:
+    type: median
+    n_warmup_steps: 3
+    n_startup_trials: 10
+  n_top_trials: 5
+  n_seeds: 3

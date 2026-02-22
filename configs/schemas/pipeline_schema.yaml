@@ -1,0 +1,74 @@
+# =============================================================================
+# Pipeline Configuration Schema — maestro-ml
+# =============================================================================
+# Master configuration file that controls the entire pipeline.
+# Each competition gets its own pipeline.yaml based on this schema.
+# See configs/templates/ for ready-to-use examples.
+# =============================================================================
+
+data:
+  train_path: str             # Path to training CSV (relative or absolute)
+  test_path: str              # Path to test CSV
+  target_column: str          # Target variable name (e.g., "target", "label")
+  id_column: str              # Row identifier column (e.g., "id", "Id")
+  task_type: str              # binary_classification | multiclass | regression
+
+cv:
+  n_folds: int                # Number of CV folds (default: 10)
+  seed: int                   # Random seed for reproducibility (default: 42)
+  stratified: bool            # Stratified splits (default: true for classification)
+
+strategy:
+  mode: str                   # "api" | "manual"
+  api:
+    provider: str             # "anthropic" | "openai"
+    model: str                # e.g., "claude-sonnet-4-5-20250514"
+    env_key: str              # Environment variable name holding the API key
+    max_tokens: int           # Max response tokens (default: 4096)
+  manual:
+    eda_output_path: str      # Where to save formatted EDA for copy-paste
+    strategy_input_path: str  # Where user saves LLM response YAML
+
+models:                       # List of model names to include in the pipeline
+  - catboost                  # Each name references configs/models/{name}.yaml
+  - xgboost
+  - lightgbm
+  - ridge
+  - knn
+  - random_forest
+  - extra_trees
+
+features:
+  interactions:               # Column pairs to multiply together
+    - [col_a, col_b]          # Creates col_a__x__col_b = col_a * col_b
+  ratios:                     # [numerator, denominator] pairs
+    - [col_a, col_b]          # Creates col_a__div__col_b = col_a / (col_b + 1e-8)
+  target_encoding:
+    columns: [col1, col2]     # Single-column target encoding
+    pairs: [[col1, col2]]     # Pair target encoding (concatenated columns)
+    alpha: 15                 # Smoothing parameter (higher = more regularization)
+  custom:                     # Domain-specific features via pandas eval
+    - name: "feature_name"    # Name of the new column
+      formula: "col_a * col_b / 1000"  # Pandas eval expression
+
+ensemble:
+  strategy: str               # "blend" | "rank" | "meta" | "nsga2" | "auto"
+  blend_trials: int           # Optuna trials for weight optimization (default: 500)
+  meta_trials: int            # Optuna trials for meta-model C param (default: 100)
+  nsga2_trials: int           # NSGA-II trials for diversity optimization (default: 300)
+  diversity_weight: float     # 0.0-1.0, importance of diversity vs metric (default: 0.3)
+
+optuna:
+  global_seed: int            # Master seed for all Optuna studies (default: 42)
+  global_timeout: int | null  # Override per-model timeouts (null = use per-model)
+
+runtime:
+  gpu_check: bool             # Test GPU availability at startup (default: true)
+  gpu_fallback: bool          # Auto-fallback to CPU if GPU fails (default: true)
+  n_jobs: int                 # CPU parallelism for sklearn models (default: -1)
+  verbose: int                # Logging level: 0=quiet, 1=progress, 2=debug
+
+output:
+  submission_path: str        # Where to save final submission CSV
+  results_dir: str            # Directory for study CSVs, logs, OOF predictions
+  save_oof: bool              # Save OOF predictions to disk (default: true)

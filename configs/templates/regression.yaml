@@ -1,0 +1,68 @@
+# =============================================================================
+# Regression Pipeline Template — maestro-ml
+# =============================================================================
+# Ready-to-use configuration for regression competitions.
+# Copy this file to your competition directory and adjust paths/columns.
+# =============================================================================
+
+data:
+  train_path: "data/train.csv"
+  test_path: "data/test.csv"
+  target_column: "target"
+  id_column: "id"
+  task_type: "regression"
+
+cv:
+  n_folds: 10
+  seed: 42
+  stratified: false                 # No stratification for regression
+
+strategy:
+  mode: "manual"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "results/eda_report.txt"
+    strategy_input_path: "strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - ridge
+  - random_forest
+  - extra_trees
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "auto"
+  blend_trials: 500
+  meta_trials: 100
+  nsga2_trials: 300
+  diversity_weight: 0.3
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 1
+
+output:
+  submission_path: "results/submission.csv"
+  results_dir: "results/"
+  save_oof: true

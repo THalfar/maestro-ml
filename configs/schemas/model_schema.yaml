@@ -1,0 +1,55 @@
+# =============================================================================
+# Model Configuration Schema — maestro-ml
+# =============================================================================
+# Each file in configs/models/ must follow this schema.
+# Defines the model class, hyperparameter search space, GPU settings,
+# training behavior, feature requirements, and Optuna study configuration.
+# =============================================================================
+
+name: str                     # Display name (e.g., "CatBoost", "XGBoost")
+class_path: str               # Python import path (e.g., "catboost.CatBoostClassifier")
+task_types:                   # Which task types this model supports
+  - binary_classification
+  - multiclass
+  - regression
+
+gpu:
+  supported: bool             # Whether this model has GPU acceleration
+  params: dict                # Constructor params to enable GPU (e.g., task_type: GPU)
+  fallback: dict              # CPU params if GPU test fails (e.g., task_type: CPU)
+  install_notes: str          # Human-readable notes on getting GPU working
+
+hyperparameters:              # Optuna search space definition
+  param_name:                 # Name passed to model constructor
+    type: str                 # int | float | categorical
+    low: number               # Min value (for int/float types)
+    high: number              # Max value (for int/float types)
+    log: bool                 # Use log-uniform sampling (default: false)
+    default: any              # Default value if not tuned
+    choices: list             # For categorical type only
+
+fixed_params: dict            # Always passed to constructor, not tuned
+                              # e.g., verbose: 0, random_state: 42
+
+training:
+  early_stopping: bool        # Whether to use early stopping
+  early_stopping_param: str   # Constructor param name (e.g., "early_stopping_rounds")
+  early_stopping_rounds: int  # Number of rounds without improvement
+  eval_metric_param: str      # Constructor param name for eval metric
+  needs_eval_set: bool        # Whether fit() requires eval_set argument
+
+feature_requirements:
+  needs_scaling: bool         # Apply StandardScaler before fit (default: false)
+  handles_categorical: bool   # Native categorical feature support (default: false)
+  handles_missing: bool       # Native missing value handling (default: false)
+
+optuna:
+  n_trials: int               # Trials for this model's study (default: 150)
+  qmc_warmup_ratio: float     # Fraction of trials using QMC sampler (default: 0.3)
+  timeout: int | null         # Max seconds for this study (null = no limit)
+  pruner:
+    type: str                 # "median" | "hyperband" | "none"
+    n_warmup_steps: int       # CV folds completed before pruning starts (default: 3)
+    n_startup_trials: int     # Trials completed before pruning activates (default: 10)
+  n_top_trials: int           # Top configurations to keep for ensemble (default: 5)
+  n_seeds: int                # Seeds per top config for stability (default: 3)

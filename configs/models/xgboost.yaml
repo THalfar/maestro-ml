@@ -1,0 +1,88 @@
+# =============================================================================
+# XGBoost Configuration — maestro-ml
+# =============================================================================
+# Gradient boosting with histogram-based splits. v2.0+ uses device param
+# instead of deprecated tree_method/gpu_hist.
+# =============================================================================
+
+name: XGBoost
+class_path:
+  binary_classification: xgboost.XGBClassifier
+  regression: xgboost.XGBRegressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: true
+  params:
+    tree_method: hist
+    device: cuda
+  fallback:
+    tree_method: hist
+    device: cpu
+  install_notes: >
+    pip install xgboost with CUDA toolkit installed. XGBoost v2.0+ uses
+    device="cuda" parameter. Older versions use tree_method="gpu_hist".
+
+hyperparameters:
+  max_depth:
+    type: int
+    low: 3
+    high: 10
+  learning_rate:
+    type: float
+    low: 0.005
+    high: 0.3
+    log: true
+  n_estimators:
+    type: int
+    low: 300
+    high: 3000
+  reg_lambda:
+    type: float
+    low: 1.0e-8
+    high: 10.0
+    log: true
+  subsample:
+    type: float
+    low: 0.5
+    high: 1.0
+  colsample_bytree:
+    type: float
+    low: 0.5
+    high: 1.0
+  min_child_weight:
+    type: int
+    low: 1
+    high: 100
+
+fixed_params:
+  verbosity: 0
+  random_state: 42
+
+training:
+  early_stopping: true
+  early_stopping_param: early_stopping_rounds
+  early_stopping_rounds: 50
+  eval_metric_param: eval_metric
+  eval_metric:
+    binary_classification: logloss
+    regression: rmse
+  needs_eval_set: true
+
+feature_requirements:
+  needs_scaling: false
+  handles_categorical: false
+  handles_missing: true
+
+optuna:
+  n_trials: 200
+  qmc_warmup_ratio: 0.3
+  timeout: null
+  pruner:
+    type: median
+    n_warmup_steps: 3
+    n_startup_trials: 10
+  n_top_trials: 5
+  n_seeds: 3

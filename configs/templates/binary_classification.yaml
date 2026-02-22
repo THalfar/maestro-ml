@@ -1,0 +1,74 @@
+# =============================================================================
+# Binary Classification Pipeline Template — maestro-ml
+# =============================================================================
+# Ready-to-use configuration for binary classification competitions.
+# Copy this file to your competition directory and adjust paths/columns.
+#
+# Example: Kaggle Playground Series S6E2 (Heart Disease Prediction)
+#   cp configs/templates/binary_classification.yaml competitions/ps-s6e2/pipeline.yaml
+#   # Edit train_path, test_path, target_column, id_column
+#   python run.py --config competitions/ps-s6e2/pipeline.yaml
+# =============================================================================
+
+data:
+  train_path: "data/train.csv"
+  test_path: "data/test.csv"
+  target_column: "target"
+  id_column: "id"
+  task_type: "binary_classification"
+
+cv:
+  n_folds: 10
+  seed: 42
+  stratified: true
+
+strategy:
+  mode: "manual"                    # Start with manual mode for testing
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "results/eda_report.txt"
+    strategy_input_path: "strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - ridge
+  - knn
+  - random_forest
+  - extra_trees
+
+features:
+  interactions: []                  # LLM strategy will populate these
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "auto"                  # Try all strategies, pick best
+  blend_trials: 500
+  meta_trials: 100
+  nsga2_trials: 300
+  diversity_weight: 0.3
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 1
+
+output:
+  submission_path: "results/submission.csv"
+  results_dir: "results/"
+  save_oof: true

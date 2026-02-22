@@ -1,0 +1,64 @@
+# =============================================================================
+# Extra Trees Configuration — maestro-ml
+# =============================================================================
+# Extremely Randomized Trees. Higher variance than Random Forest due to
+# random split thresholds. This variance is USEFUL for ensemble diversity:
+# Extra Trees predictions correlate less with gradient boosting models,
+# increasing effective ensemble size.
+# =============================================================================
+
+name: Extra Trees
+class_path:
+  binary_classification: sklearn.ensemble.ExtraTreesClassifier
+  regression: sklearn.ensemble.ExtraTreesRegressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  n_estimators:
+    type: int
+    low: 100
+    high: 1000
+  max_depth:
+    type: int
+    low: 3
+    high: 20
+  min_samples_leaf:
+    type: int
+    low: 1
+    high: 50
+  max_features:
+    type: categorical
+    choices: [sqrt, log2, 0.5, 0.7, 1.0]
+
+fixed_params:
+  n_jobs: -1
+  random_state: 42
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: false
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 50
+  qmc_warmup_ratio: 0.3
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 3
+  n_seeds: 3

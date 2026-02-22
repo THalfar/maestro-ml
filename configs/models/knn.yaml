@@ -1,0 +1,57 @@
+# =============================================================================
+# K-Nearest Neighbors Configuration — maestro-ml
+# =============================================================================
+# Instance-based learner. Provides strong ensemble diversity because its
+# decision boundaries are fundamentally different from tree-based models.
+# Requires feature scaling.
+# =============================================================================
+
+name: KNN
+class_path:
+  binary_classification: sklearn.neighbors.KNeighborsClassifier
+  regression: sklearn.neighbors.KNeighborsRegressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  n_neighbors:
+    type: int
+    low: 3
+    high: 50
+  weights:
+    type: categorical
+    choices: [uniform, distance]
+  metric:
+    type: categorical
+    choices: [euclidean, manhattan, cosine]
+
+fixed_params:
+  n_jobs: -1
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: true
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 30
+  qmc_warmup_ratio: 0.3
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 1
+  n_seeds: 1

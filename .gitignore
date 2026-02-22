@@ -1,3 +1,16 @@
+# Data files
+data/
+catboost_info/
+
+# Results (generated at runtime)
+results/
+
+# Strategy files (generated per competition)
+strategy_output.yaml
+
+# prompts
+prompts/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
