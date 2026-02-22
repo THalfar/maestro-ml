@@ -4,9 +4,11 @@ catboost_info/
 
 # Results (generated at runtime)
 results/
+competitions/*/results/
 
 # Strategy files (generated per competition)
 strategy_output.yaml
+competitions/*/strategy_output.yaml
 
 # prompts
 prompts/

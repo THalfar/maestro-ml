@@ -1,0 +1,71 @@
+# =============================================================================
+# Kaggle Playground Series S6E2 — Heart Disease Prediction
+# =============================================================================
+# Binary classification: predict HeartDisease (0/1)
+# Features: Age, Sex, Chest pain type, BP, Cholesterol, FBS over 120,
+#   EKG results, Max HR, Exercise angina, ST depression, Slope of ST,
+#   Number of vessels fluro, Thallium
+# =============================================================================
+
+data:
+  train_path: "data/ps-s6e2/train.csv"
+  test_path: "data/ps-s6e2/test.csv"
+  target_column: "Heart Disease"
+  id_column: "id"
+  task_type: "binary_classification"
+
+cv:
+  n_folds: 10
+  seed: 42
+  stratified: true
+
+strategy:
+  mode: "manual"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "competitions/ps-s6e2/results/eda_report.txt"
+    strategy_input_path: "competitions/ps-s6e2/strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - ridge
+  - knn
+  - random_forest
+  - extra_trees
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "auto"
+  blend_trials: 500
+  meta_trials: 100
+  nsga2_trials: 300
+  diversity_weight: 0.3
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 1
+
+output:
+  submission_path: "competitions/ps-s6e2/results/submission.csv"
+  results_dir: "competitions/ps-s6e2/results/"
+  save_oof: true
