@@ -23,6 +23,7 @@ def run_eda(
     test_path: str | Path,
     target_col: str,
     id_col: str | None = None,
+    target_mapping: dict[str, int] | None = None,
 ) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """Run the complete EDA pipeline and produce a structured report.
 
@@ -72,6 +73,10 @@ def run_eda(
     """
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
+
+    # Apply target mapping (e.g., {"Presence": 1, "Absence": 0})
+    if target_mapping and target_col in train.columns:
+        train[target_col] = train[target_col].map(target_mapping)
 
     # Dataset info
     train_mem = train.memory_usage(deep=True).sum() / 1024 / 1024
@@ -141,6 +146,7 @@ def run_eda(
     return report, train, test
 
 
+# REVIEW:STYLE — `train` parameter is accepted but never used in function body; remove it or use it
 def _generate_recommendations(
     columns_analysis: dict,
     target_correlations: dict,

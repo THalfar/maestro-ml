@@ -66,6 +66,7 @@ def run_optuna_study(
     pipeline_config: PipelineConfig,
     strategy: dict,
     gpu: bool = False,
+    timeout_override: int | None = None,
 ) -> optuna.Study:
     """Run a complete Optuna study for a single model.
 
@@ -151,19 +152,26 @@ def run_optuna_study(
 
     study = optuna.create_study(direction=direction, pruner=pruner)
 
+    # Pipeline-level timeout override takes precedence over model YAML timeout
+    effective_timeout = timeout_override if timeout_override is not None else optuna_cfg.get("timeout")
+    if effective_timeout:
+        logger.info(f"[{model_name}] Timeout: {effective_timeout}s ({effective_timeout / 3600:.1f}h)")
+
     _run_two_phase_study(
         study=study,
         objective=objective,
         n_trials=optuna_cfg["n_trials"],
         qmc_warmup_ratio=optuna_cfg["qmc_warmup_ratio"],
-        timeout=optuna_cfg.get("timeout"),
+        timeout=effective_timeout,
         global_seed=pipeline_config.optuna.global_seed,
+        verbose=pipeline_config.runtime.verbose,
     )
 
     best = study.best_trial
+    display_params = _reassemble_int_lists(dict(best.params))
     logger.info(
         f"[{model_name}] Best trial #{best.number}: "
-        f"value={best.value:.6f}, params={best.params}"
+        f"value={best.value:.6f}, params={display_params}"
     )
 
     return study
@@ -228,7 +236,7 @@ def _create_objective(
            g. Return the overall CV metric.
         2. Return the objective function.
     """
-    X = train[feature_cols].values
+    X = train[feature_cols]
     y = train[target_col].values
 
     training_cfg = registry.get_training_config(model_name)
@@ -239,18 +247,43 @@ def _create_objective(
         for param_name, spec in search_space.items():
             param_type = spec.get("type", "float")
             use_log = spec.get("log", False)
-            if param_type == "int":
+            if param_type == "fixed":
+                hparams[param_name] = spec["value"]
+            elif param_type == "int":
                 hparams[param_name] = trial.suggest_int(
-                    param_name, spec["low"], spec["high"], log=use_log
+                    param_name, int(spec["low"]), int(spec["high"]), log=use_log
                 )
             elif param_type == "float":
                 hparams[param_name] = trial.suggest_float(
-                    param_name, spec["low"], spec["high"], log=use_log
+                    param_name, float(spec["low"]), float(spec["high"]), log=use_log
                 )
             elif param_type == "categorical":
-                hparams[param_name] = trial.suggest_categorical(
-                    param_name, spec["choices"]
-                )
+                raw_choices = spec["choices"]
+                # Optuna categorical only supports None/bool/int/float/str.
+                # For list/tuple choices (e.g. RealMLP hidden_sizes),
+                # convert to JSON strings for Optuna, then decode back.
+                has_complex = any(isinstance(c, (list, tuple)) for c in raw_choices)
+                if has_complex:
+                    import json
+                    str_choices = [json.dumps(c) for c in raw_choices]
+                    picked = trial.suggest_categorical(param_name, str_choices)
+                    hparams[param_name] = json.loads(picked)
+                else:
+                    hparams[param_name] = trial.suggest_categorical(
+                        param_name, raw_choices
+                    )
+            elif param_type == "int_list":
+                # Suggest N independent int params, combine into a list.
+                # YAML: hidden_sizes: {type: int_list, n: 2, low: 8, high: 128}
+                n_elements = int(spec["n"])
+                low = int(spec["low"])
+                high = int(spec["high"])
+                hparams[param_name] = [
+                    trial.suggest_int(
+                        f"{param_name}_{i}", low, high, log=use_log
+                    )
+                    for i in range(n_elements)
+                ]
 
         # Add eval_metric to constructor params where needed
         eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
@@ -260,8 +293,8 @@ def _create_objective(
 
         needs_eval_set = training_cfg.get("needs_eval_set", False)
         early_stopping_rounds = training_cfg.get("early_stopping_rounds")
-        early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
         is_lgbm = training_cfg.get("uses_callbacks_for_early_stopping", False)
+        es_in_constructor = training_cfg.get("early_stopping_in_constructor", False)
 
         if task_type == "multiclass":
             n_classes = len(np.unique(y))
@@ -275,20 +308,29 @@ def _create_objective(
             splits = list(cv.split(X))
 
         for fold_idx, (train_idx, val_idx) in enumerate(splits):
-            X_train, X_val = X[train_idx], X[val_idx]
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
+
+            # Early stopping via constructor (XGBoost v2.0+)
+            model_hparams = dict(hparams)
+            if es_in_constructor and early_stopping_rounds:
+                model_hparams["early_stopping_rounds"] = early_stopping_rounds
 
             # Fresh model per fold — each fold gets an independent RandomState,
             # matching the behaviour of train_with_config for reproducibility.
             model = registry.get_model(
-                model_name, hparams=hparams, task_type=task_type,
+                model_name, hparams=model_hparams, task_type=task_type,
                 gpu=gpu, results_dir=results_dir
             )
 
             if needs_eval_set:
-                fit_params: dict[str, Any] = {"eval_set": [(X_val, y_val)]}
+                fit_params: dict[str, Any] = {
+                    "eval_set": [(X_val, y_val)],
+                    "verbose": False,  # suppress per-iteration eval output
+                }
                 if is_lgbm:
                     import lightgbm as lgb
+                    del fit_params["verbose"]  # LightGBM uses callbacks instead
                     fit_params["callbacks"] = [
                         lgb.early_stopping(
                             stopping_rounds=early_stopping_rounds or 50,
@@ -296,8 +338,8 @@ def _create_objective(
                         ),
                         lgb.log_evaluation(-1),
                     ]
-                elif early_stopping_rounds and early_stopping_param:
-                    fit_params[early_stopping_param] = early_stopping_rounds
+                elif early_stopping_rounds and not es_in_constructor:
+                    fit_params["early_stopping_rounds"] = early_stopping_rounds
                 model.fit(X_train, y_train, **fit_params)
             else:
                 model.fit(X_train, y_train)
@@ -331,6 +373,7 @@ def _run_two_phase_study(
     qmc_warmup_ratio: float,
     timeout: int | None = None,
     global_seed: int = 42,
+    verbose: int = 1,
 ) -> None:
     """Run a two-phase Optuna study: QMC warmup then TPE.
 
@@ -365,13 +408,44 @@ def _run_two_phase_study(
 
     start_time = time.time()
 
-    # Phase 1: QMC
+    # Progress callback
+    log_interval = max(1, n_trials // 8)  # ~8 progress updates per study (verbose=1)
+
+    def _progress_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        n_done = len(study.trials)
+        best_val = study.best_value if study.best_trial else float("nan")
+        elapsed = time.time() - start_time
+        if verbose >= 2:
+            # Show every trial with its own score
+            if trial.value is not None:
+                trial_val = f"{trial.value:.6f}"
+            else:
+                trial_val = "pruned"
+            logger.info(
+                f"  Trial {n_done}/{n_trials} | "
+                f"score={trial_val} | "
+                f"best={best_val:.6f} | "
+                f"{elapsed:.0f}s"
+            )
+        elif n_done % log_interval == 0 or n_done == n_qmc:
+            logger.info(
+                f"  Trial {n_done}/{n_trials} | "
+                f"best={best_val:.6f} | "
+                f"elapsed={elapsed:.0f}s"
+            )
+
+    # Phase 1: QMC — categorical params fall back to RandomSampler automatically
     logger.info(f"Phase 1 (QMC): {n_qmc} trials")
-    study.sampler = optuna.samplers.QMCSampler(seed=global_seed)
+    study.sampler = optuna.samplers.QMCSampler(
+        seed=global_seed,
+        independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
+        warn_independent_sampling=False,
+    )
     study.optimize(
         objective,
         n_trials=n_qmc,
         timeout=timeout,
+        callbacks=[_progress_callback],
         show_progress_bar=False,
     )
     qmc_elapsed = time.time() - start_time
@@ -392,6 +466,7 @@ def _run_two_phase_study(
         objective,
         n_trials=n_tpe,
         timeout=remaining_timeout,
+        callbacks=[_progress_callback],
         show_progress_bar=False,
     )
     total_elapsed = time.time() - start_time
@@ -453,15 +528,15 @@ def train_with_config(
            f. Append test_preds to test_preds_list.
         3. Return (oof_preds_list, test_preds_list, y_train).
     """
-    X_train = train[feature_cols].values
+    X_train = train[feature_cols]
     y_train = train[target_col].values
-    X_test = test[feature_cols].values
+    X_test = test[feature_cols]
 
     training_cfg = registry.get_training_config(model_name)
     needs_eval_set = training_cfg.get("needs_eval_set", False)
     early_stopping_rounds = training_cfg.get("early_stopping_rounds")
-    early_stopping_param = training_cfg.get("early_stopping_param", "early_stopping_rounds")
     is_lgbm = training_cfg.get("uses_callbacks_for_early_stopping", False)
+    es_in_constructor = training_cfg.get("early_stopping_in_constructor", False)
 
     # Eval metric for constructor
     eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
@@ -483,10 +558,12 @@ def train_with_config(
     if task_type == "multiclass":
         n_classes = len(np.unique(y_train))
 
-    for seed in seeds:
+    for seed_idx, seed in enumerate(seeds):
         hparams_seeded = {**hparams, seed_param: seed} if seed_param else dict(hparams)
         if eval_metric_val and eval_metric_param:
             hparams_seeded[eval_metric_param] = eval_metric_val
+        if es_in_constructor and early_stopping_rounds:
+            hparams_seeded["early_stopping_rounds"] = early_stopping_rounds
 
         if task_type == "multiclass":
             oof_preds = np.zeros((len(X_train), n_classes))
@@ -495,8 +572,10 @@ def train_with_config(
             oof_preds = np.zeros(len(X_train))
             test_preds = np.zeros(len(X_test))
 
-        for train_idx, val_idx in splits:
-            X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+        seed_start = time.time()
+        for fold_idx, (train_idx, val_idx) in enumerate(splits):
+            fold_start = time.time()
+            X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
 
             model = registry.get_model(
@@ -505,9 +584,13 @@ def train_with_config(
             )
 
             if needs_eval_set:
-                fit_params: dict[str, Any] = {"eval_set": [(X_fold_val, y_fold_val)]}
+                fit_params: dict[str, Any] = {
+                    "eval_set": [(X_fold_val, y_fold_val)],
+                    "verbose": False,  # suppress per-iteration eval output
+                }
                 if is_lgbm:
                     import lightgbm as lgb
+                    del fit_params["verbose"]  # LightGBM uses callbacks instead
                     fit_params["callbacks"] = [
                         lgb.early_stopping(
                             stopping_rounds=early_stopping_rounds or 50,
@@ -515,8 +598,8 @@ def train_with_config(
                         ),
                         lgb.log_evaluation(-1),
                     ]
-                elif early_stopping_rounds and early_stopping_param:
-                    fit_params[early_stopping_param] = early_stopping_rounds
+                elif early_stopping_rounds and not es_in_constructor:
+                    fit_params["early_stopping_rounds"] = early_stopping_rounds
                 model.fit(X_fold_train, y_fold_train, **fit_params)
             else:
                 model.fit(X_fold_train, y_fold_train)
@@ -534,10 +617,53 @@ def train_with_config(
             oof_preds[val_idx] = val_preds
             test_preds += tst_preds / n_folds
 
+            fold_metric = _compute_cv_metric(y_fold_val, val_preds, task_type)
+            logger.debug(
+                f"    Fold {fold_idx + 1}/{n_folds}: "
+                f"score={fold_metric:.6f} ({time.time() - fold_start:.1f}s)"
+            )
+
+        seed_elapsed = time.time() - seed_start
+        oof_metric = _compute_cv_metric(y_train, oof_preds, task_type)
+        logger.debug(
+            f"  Seed {seed} (#{seed_idx + 1}/{len(seeds)}): "
+            f"CV={oof_metric:.6f} in {seed_elapsed:.1f}s"
+        )
         oof_preds_list.append(oof_preds)
         test_preds_list.append(test_preds)
 
     return oof_preds_list, test_preds_list, y_train
+
+
+def _reassemble_int_lists(params: dict[str, Any]) -> dict[str, Any]:
+    """Reassemble int_list params (e.g. hidden_sizes_0, hidden_sizes_1) back into lists.
+
+    Optuna stores them as separate keys. This function detects the pattern
+    ``<name>_0, <name>_1, ...`` and combines them into ``<name>: [v0, v1, ...]``.
+    """
+    import re
+    # Find all keys matching the pattern <name>_<digit>
+    list_keys: dict[str, dict[int, Any]] = {}
+    plain_keys: dict[str, Any] = {}
+    for k, v in params.items():
+        m = re.match(r"^(.+)_(\d+)$", k)
+        if m:
+            name, idx = m.group(1), int(m.group(2))
+            list_keys.setdefault(name, {})[idx] = v
+        else:
+            plain_keys[k] = v
+
+    # Only reassemble if ALL indices 0..N-1 are present (avoid false positives)
+    result = dict(plain_keys)
+    for name, idx_map in list_keys.items():
+        n = len(idx_map)
+        if all(i in idx_map for i in range(n)):
+            result[name] = [idx_map[i] for i in range(n)]
+        else:
+            # Not a complete sequence, keep as separate keys
+            for idx, val in idx_map.items():
+                result[f"{name}_{idx}"] = val
+    return result
 
 
 def get_top_configs(
@@ -574,7 +700,7 @@ def get_top_configs(
 
     return [
         {
-            "params": dict(t.params),
+            "params": _reassemble_int_lists(dict(t.params)),
             "value": t.value,
             "trial_number": t.number,
         }
@@ -637,9 +763,18 @@ def run_all_studies(
     global_seed = pipeline_config.optuna.global_seed
     results_dir = Path(pipeline_config.output.results_dir)
 
-    for model_name in pipeline_config.models:
-        logger.info(f"Starting study for model: {model_name}")
+    n_models = len(pipeline_config.models)
+    all_models_start = time.time()
+
+    for model_idx, model_name in enumerate(pipeline_config.models, 1):
+        model_start = time.time()
+        logger.info(
+            f"[{model_idx}/{n_models}] Starting model: {model_name}"
+        )
         gpu = gpu_status.get(model_name, False)
+
+        # Resolve per-model timeout from pipeline config
+        model_timeout = pipeline_config.optuna.model_timeouts.get(model_name)
 
         try:
             study = run_optuna_study(
@@ -651,6 +786,28 @@ def run_all_studies(
                 pipeline_config=pipeline_config,
                 strategy=strategy,
                 gpu=gpu,
+                timeout_override=model_timeout,
+            )
+            optuna_elapsed = time.time() - model_start
+
+            # Study statistics
+            n_completed = sum(
+                1 for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            )
+            n_pruned = sum(
+                1 for t in study.trials
+                if t.state == optuna.trial.TrialState.PRUNED
+            )
+            n_failed = len(study.trials) - n_completed - n_pruned
+            avg_trial_time = optuna_elapsed / max(len(study.trials), 1)
+            logger.info(
+                f"[{model_name}] Optuna done in {optuna_elapsed:.0f}s "
+                f"({optuna_elapsed / 60:.1f}min) | "
+                f"{len(study.trials)} trials "
+                f"({n_completed} ok, {n_pruned} pruned, {n_failed} failed) | "
+                f"avg {avg_trial_time:.1f}s/trial | "
+                f"best={study.best_value:.6f}"
             )
 
             optuna_cfg = registry.get_optuna_config(model_name)
@@ -664,7 +821,19 @@ def run_all_studies(
             all_test: list[np.ndarray] = []
             labels: np.ndarray | None = None
 
-            for cfg in top_configs:
+            retrain_start = time.time()
+            total_retrain_fits = len(top_configs) * n_seeds * cv_cfg.n_folds
+            logger.info(
+                f"[{model_name}] Retraining top {len(top_configs)} configs "
+                f"x {n_seeds} seeds x {cv_cfg.n_folds} folds = "
+                f"{total_retrain_fits} fits"
+            )
+
+            for cfg_idx, cfg in enumerate(top_configs, 1):
+                logger.debug(
+                    f"[{model_name}] Retrain config {cfg_idx}/{len(top_configs)} "
+                    f"(score={cfg['value']:.6f})"
+                )
                 oof_list, test_list, y = train_with_config(
                     model_name=model_name,
                     hparams=cfg["params"],
@@ -684,18 +853,43 @@ def run_all_studies(
                 if labels is None:
                     labels = y
 
+            retrain_elapsed = time.time() - retrain_start
+            model_elapsed = time.time() - model_start
+
             results[model_name] = {
                 "study": study,
                 "top_configs": top_configs,
                 "oof_preds": all_oof,
                 "test_preds": all_test,
                 "labels": labels,
+                "elapsed": model_elapsed,
+                "optuna_elapsed": optuna_elapsed,
+                "retrain_elapsed": retrain_elapsed,
+                "n_trials": len(study.trials),
+                "avg_trial_time": avg_trial_time,
             }
             logger.info(
-                f"[{model_name}] Done: {len(all_oof)} prediction arrays collected."
+                f"[{model_idx}/{n_models}] {model_name} done: "
+                f"{len(all_oof)} arrays | "
+                f"optuna={optuna_elapsed:.0f}s retrain={retrain_elapsed:.0f}s "
+                f"total={model_elapsed:.0f}s ({model_elapsed / 60:.1f}min)"
             )
 
         except Exception as exc:
             logger.error(f"Model '{model_name}' failed: {exc}", exc_info=True)
+
+    total_training = time.time() - all_models_start
+    total_m, total_s = divmod(int(total_training), 60)
+    total_h, total_m = divmod(total_m, 60)
+    if total_h > 0:
+        fmt = f"{total_h}h {total_m:02d}m {total_s:02d}s"
+    elif total_m > 0:
+        fmt = f"{total_m}m {total_s:02d}s"
+    else:
+        fmt = f"{total_training:.1f}s"
+    logger.info(
+        f"All model training complete: {len(results)}/{n_models} models "
+        f"in {fmt}"
+    )
 
     return results

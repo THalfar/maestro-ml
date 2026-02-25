@@ -1,6 +1,6 @@
 # Maestro ML
 
-**An LLM-orchestrated AutoML framework that builds diversity-aware ensembles for tabular data.**
+**LLM-orchestrated AutoML framework that builds diversity-aware ensembles for tabular data competitions.**
 
 Maestro orchestrates an ensemble of ML models like a conductor leads an orchestra — each model plays differently, but together they create something none could alone.
 
@@ -29,87 +29,100 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 
 ---
 
-## Why Maestro?
+## Features
 
-**LLM-guided search.** An LLM analyzes your data profile and narrows the hyperparameter search space before optimization begins. Instead of blind grid search, Maestro starts with informed exploration — the LLM identifies which features matter, which interactions to create, and which parameter ranges to focus on.
+- **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
+- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously. Correlation matrix eigenvalues compute effective ensemble size, preventing the common failure mode where ensembles collapse into near-identical models.
+- **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
+- **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
+- **GPU auto-detection** — Per-model micro-trial detects CUDA availability at startup, with automatic CPU fallback.
 
-**Diversity-aware ensembles.** NSGA-II optimizes both accuracy AND model diversity simultaneously. Uses correlation matrix eigenvalues to compute effective ensemble size — preventing the common failure mode where an ensemble collapses into near-identical models.
+---
 
-**YAML-driven.** Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable, auditable, and reproducible. No magic numbers buried in code.
+## Installation
 
-**Competition-tested.** Built for Kaggle Playground Series competitions. Validated on real leaderboard data by a practitioner, not a framework author.
+```bash
+git clone https://github.com/yourusername/maestro-ml.git
+cd maestro-ml
+pip install -r requirements.txt
+```
+
+**Requirements:** Python 3.10+
+
+| Category | Packages |
+|----------|----------|
+| ML | catboost, xgboost, lightgbm, scikit-learn |
+| Neural Nets | pytabkit (RealMLP, PyTorch) |
+| Optimization | optuna |
+| Data | pandas, numpy, scipy |
+| LLM | anthropic, openai, python-dotenv |
+| Config | pyyaml |
+| Testing | pytest |
 
 ---
 
 ## Quick Start
 
+### Option A: Human-in-the-loop (recommended first run)
+
 ```bash
-# Clone and install
-git clone https://github.com/yourusername/maestro-ml.git
-cd maestro-ml
-pip install -r requirements.txt
-
-# Automated mode (requires API key in .env)
-python run.py --config configs/templates/binary_classification.yaml
-
-# Human-in-the-loop mode (no API key needed)
 python run.py --config configs/templates/binary_classification.yaml --strategy manual
-# → Prints EDA report to console
-# → Copy-paste into Claude or ChatGPT
-# → Save the LLM's YAML response as strategy_output.yaml
-# → Press Enter — pipeline continues automatically
 ```
 
----
+This will:
+1. Run EDA on your data and print a formatted report to the console
+2. Pause and point you to `prompts/strategy_prompt.md` — copy the full prompt into Claude/ChatGPT, replacing the placeholder with the EDA report
+3. Save the LLM's YAML response to `strategy_output.yaml` (see `competitions/ps-s6e2/strategy_output.yaml` for a complete example)
+4. Press Enter — the pipeline runs feature engineering, Optuna, and ensemble automatically
 
-## How It Works
+### Option B: Fully automated (requires API key)
 
-### Layer 1: EDA Profiler
+```bash
+# Set your API key
+export ANTHROPIC_API_KEY="sk-ant-..."
 
-The profiler analyzes your raw CSVs and produces a structured JSON report. It computes target correlations, detects column types (binary, ordinal, categorical, continuous), identifies clusters of correlated features, flags weak predictors, and generates concrete recommendations. Pure pandas and numpy — deterministic, no randomness.
+# Run with API mode
+python run.py --config configs/templates/binary_classification.yaml
+```
 
-### Layer 2: LLM Strategist
-
-The EDA report is sent to an LLM (Claude or ChatGPT) along with the available model schemas. The LLM reads the data profile and produces a strategy: which feature interactions to create, which columns to target-encode, which models to include, and how to narrow each model's hyperparameter search space. In manual mode, you control this conversation directly.
-
-### Layer 3: Optuna Engine + Ensemble
-
-The engine executes the LLM's strategy. Features are engineered dynamically from YAML specifications. Each model gets its own Optuna study with QMC warmup (space-filling exploration) followed by TPE (Bayesian optimization). Top configurations are retrained with multiple seeds for stability. Finally, NSGA-II selects the ensemble composition by optimizing both metric performance and model diversity.
-
----
-
-## Supported Models
-
-| Model | GPU | Notes |
-|-------|-----|-------|
-| CatBoost | CUDA | Native categorical support, ordered boosting |
-| XGBoost | CUDA | `device="cuda"` (v2.0+) |
-| LightGBM | CUDA/OpenCL | Requires special build for GPU |
-| Ridge | CPU | Fast linear baseline |
-| KNN | CPU | Instance-based diversity |
-| Random Forest | CPU | Sklearn bagging, low variance |
-| Extra Trees | CPU | Higher variance than RF = useful for diversity |
+The LLM generates the strategy automatically and the pipeline runs end-to-end.
 
 ---
 
-## Configuration Example
+## Running a Kaggle Competition
+
+Here's a walkthrough using [Playground Series S6E2](https://www.kaggle.com/competitions/playground-series-s6e2) (Heart Disease Prediction) as an example.
+
+### 1. Set up the competition directory
+
+```bash
+# Download competition data from Kaggle
+kaggle competitions download -c playground-series-s6e2
+unzip playground-series-s6e2.zip -d data/ps-s6e2/
+
+# Copy the template and customize it
+cp configs/templates/binary_classification.yaml competitions/ps-s6e2/pipeline.yaml
+```
+
+### 2. Edit the pipeline config
+
+Edit `competitions/ps-s6e2/pipeline.yaml` to match your competition:
 
 ```yaml
-# pipeline.yaml — minimal configuration
 data:
-  train_path: "data/train.csv"
-  test_path: "data/test.csv"
-  target_column: "HeartDisease"
+  train_path: "data/ps-s6e2/train.csv"
+  test_path: "data/ps-s6e2/test.csv"
+  target_column: "Heart Disease"
   id_column: "id"
   task_type: "binary_classification"
-
-cv:
-  n_folds: 10
-  seed: 42
-  stratified: true
+  target_mapping:        # map string labels → numeric
+    Presence: 1
+    Absence: 0
 
 strategy:
   mode: "manual"
+  manual:
+    strategy_input_path: "competitions/ps-s6e2/strategy_output.yaml"
 
 models:
   - catboost
@@ -117,17 +130,103 @@ models:
   - lightgbm
   - ridge
   - knn
-
-ensemble:
-  strategy: "auto"
-  diversity_weight: 0.3
+  - random_forest
+  - extra_trees
 
 output:
-  submission_path: "results/submission.csv"
-  results_dir: "results/"
+  submission_path: "competitions/ps-s6e2/results/submission.csv"
+  results_dir: "competitions/ps-s6e2/results/"
 ```
 
-Each model's hyperparameter ranges, GPU settings, and Optuna configuration are defined in `configs/models/{name}.yaml`. The pipeline reads everything from YAML — no hardcoded values.
+### 3. Run the pipeline
+
+```bash
+python run.py --config competitions/ps-s6e2/pipeline.yaml
+```
+
+The pipeline will:
+1. **EDA** — Profile the dataset, print a formatted report
+2. **Strategy** — Pause for you to generate a strategy YAML via LLM (manual mode). Use `prompts/strategy_prompt.md` as the LLM prompt template
+3. **Features** — Create interaction, ratio, and target-encoded features from the strategy
+4. **Optuna** — Run per-model hyperparameter optimization (QMC warmup + TPE)
+5. **Ensemble** — Try blend, rank average, meta-model, and NSGA-II; pick the best
+6. **Output** — Save `submission.csv` and OOF predictions with full timing breakdown
+
+### 4. Submit
+
+```bash
+kaggle competitions submit -c playground-series-s6e2 \
+  -f competitions/ps-s6e2/results/submission.csv \
+  -m "Maestro ML ensemble"
+```
+
+---
+
+## How It Works
+
+### Layer 1: EDA Profiler (`src/eda/profiler.py`)
+
+Analyzes raw CSVs and produces a structured JSON report:
+- Per-column statistics (type detection, missing %, cardinality, distribution)
+- Target correlations sorted by importance
+- Feature clusters (groups of highly correlated features)
+- Weak feature identification
+- Concrete LLM-readable recommendations
+
+Pure pandas/numpy. Deterministic, no randomness.
+
+### Layer 2: LLM Strategist (`src/strategy/llm_strategist.py`)
+
+Takes the EDA report and produces a strategy YAML that controls Layer 3:
+- **Feature engineering plan** — which interactions, ratios, target encodings to create
+- **Model selection** — which models to include
+- **Search space overrides** — narrowed hyperparameter ranges per model
+- **Reasoning** — explanation of the LLM's choices
+
+The LLM's job is to *narrow* the search space, not to do ML.
+
+### Layer 3: Engine
+
+**Feature Engineering** (`src/features/engineer.py`)
+- Interaction features (column products)
+- Ratio features (column divisions with epsilon)
+- OOF target encoding with smoothing (no leakage — uses same CV folds as training)
+- Custom features via pandas eval expressions
+
+**Optuna Training** (`src/models/trainer.py`)
+- Per-model independent studies
+- Phase 1: QMC warmup (space-filling exploration)
+- Phase 2: TPE (Bayesian optimization)
+- Top configs retrained with multiple seeds for stability
+- OOF predictions stored for ensemble
+
+**Ensemble** (`src/ensemble/blender.py`, `src/ensemble/diversity.py`)
+- Optimized weighted blend (Optuna)
+- Rank averaging
+- Meta-model stacking (LogisticRegression/Ridge with logit features)
+- NSGA-II diversity-aware selection
+- Auto mode: tries all strategies, picks the best on OOF score
+
+---
+
+## Supported Models
+
+| Model | GPU | Early Stopping | Notes |
+|-------|-----|----------------|-------|
+| CatBoost | CUDA | eval_set | Native categoricals, ordered boosting |
+| XGBoost | CUDA | eval_set | `device="cuda"` (v2.0+) |
+| LightGBM | Special build | callbacks | CPU-only by default |
+| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, label smoothing |
+| Ridge / LogReg | CPU | — | Fast linear baseline |
+| Elastic Net | CPU | — | L1+L2 linear regression |
+| KNN | CPU | — | Instance-based, adds diversity |
+| Random Forest | CPU | — | Bagging, low variance |
+| Extra Trees | CPU | — | Higher variance than RF, useful for diversity |
+| AdaBoost | CPU | — | Boosted shallow trees |
+| Gaussian NB | CPU | — | Probabilistic, fast, diverse predictions |
+| SVM | CPU | — | RBF/polynomial kernel |
+
+Each model is configured in `configs/models/{name}.yaml` with its hyperparameter ranges, GPU settings, fixed parameters, and Optuna study config.
 
 ---
 
@@ -135,38 +234,136 @@ Each model's hyperparameter ranges, GPU settings, and Optuna configuration are d
 
 ```
 maestro-ml/
+├── run.py                    # Pipeline entry point
 ├── configs/
-│   ├── schemas/          # YAML schema documentation
-│   ├── models/           # Per-model configuration (7 models)
-│   └── templates/        # Ready-to-use pipeline configs
+│   ├── models/               # Per-model YAML configs (12 models)
+│   │   ├── catboost.yaml
+│   │   ├── xgboost.yaml
+│   │   ├── lightgbm.yaml
+│   │   ├── realmlp.yaml
+│   │   ├── ridge.yaml
+│   │   ├── elastic_net.yaml
+│   │   ├── knn.yaml
+│   │   ├── random_forest.yaml
+│   │   ├── extra_trees.yaml
+│   │   ├── adaboost.yaml
+│   │   ├── gaussian_nb.yaml
+│   │   └── svm.yaml
+│   ├── schemas/              # YAML schema documentation
+│   └── templates/            # Ready-to-use pipeline templates
+│       ├── binary_classification.yaml
+│       └── regression.yaml
 ├── src/
-│   ├── eda/              # Layer 1: Dataset profiling
-│   ├── strategy/         # Layer 2: LLM strategy generation
-│   ├── features/         # Feature engineering from YAML
-│   ├── models/           # Model registry + Optuna training
-│   ├── ensemble/         # Blending + diversity optimization
-│   └── utils/            # YAML loading, I/O, logging
-├── competitions/         # Competition-specific data and configs
-├── run.py                # Pipeline entry point
-└── requirements.txt
+│   ├── utils/io.py           # YAML loading, dataclasses, logging
+│   ├── eda/profiler.py       # Layer 1: dataset profiling
+│   ├── strategy/llm_strategist.py  # Layer 2: LLM integration
+│   ├── features/engineer.py  # Feature engineering from YAML
+│   ├── models/
+│   │   ├── registry.py       # Model factory + search space
+│   │   └── trainer.py        # Optuna studies + CV training
+│   └── ensemble/
+│       ├── blender.py        # Weight optimization + stacking
+│       └── diversity.py      # NSGA-II + effective ensemble size
+├── prompts/
+│   └── strategy_prompt.md    # LLM prompt template for manual mode
+├── competitions/             # Competition-specific configs
+│   └── ps-s6e2/              # Kaggle PS S6E2 Heart Disease
+│       ├── pipeline.yaml
+│       └── strategy_output.yaml  # Example strategy (ready to use)
+├── tests/                    # 173 tests
+├── requirements.txt
+└── CLAUDE.md                 # AI-assisted development instructions
+```
+
+---
+
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+```
+173 passed in ~2s
+```
+
+Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training, ensemble blending, diversity metrics, LLM strategy parsing, and end-to-end pipeline integration.
+
+---
+
+## Configuration Reference
+
+### Pipeline YAML
+
+| Section | Key Fields | Description |
+|---------|-----------|-------------|
+| `data` | `train_path`, `test_path`, `target_column`, `id_column`, `task_type`, `target_mapping` | Dataset paths and metadata. `target_mapping` converts string targets to numeric (e.g., `{Presence: 1, Absence: 0}`) |
+| `cv` | `n_folds`, `seed`, `stratified` | Cross-validation settings |
+| `strategy` | `mode` (`api`/`manual`), `api.provider`, `api.model` | LLM strategy mode |
+| `models` | List of model names | Which models to train |
+| `features` | `interactions`, `ratios`, `target_encoding`, `custom` | Feature engineering (populated by LLM) |
+| `ensemble` | `strategy` (`auto`/`blend`/`rank`/`meta`/`nsga2`), `diversity_weight` | Ensemble selection |
+| `optuna` | `global_seed`, `global_timeout` | Global Optuna settings |
+| `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
+| `output` | `submission_path`, `results_dir`, `save_oof` | Output paths |
+
+### Model YAML
+
+Each model config in `configs/models/` defines:
+- `class_path` — Python import path per task type
+- `hyperparameters` — Optuna search space (type, low, high, log, choices)
+- `fixed_params` — Always-on parameters (can be task-type-keyed)
+- `gpu` — GPU params and CPU fallback
+- `training` — Early stopping, eval metric, seed parameter name
+- `optuna` — Per-model trial budget, QMC ratio, pruner settings
+
+---
+
+## CLI Usage
+
+```
+python run.py --config <path-to-pipeline.yaml> [--strategy manual|api]
+```
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--config` | Yes | Path to pipeline YAML configuration |
+| `--strategy` | No | Override strategy mode from config (`manual` or `api`) |
+
+**Examples:**
+
+```bash
+# Manual mode — you control the LLM conversation
+python run.py --config competitions/ps-s6e2/pipeline.yaml --strategy manual
+
+# API mode — LLM generates strategy automatically
+python run.py --config competitions/ps-s6e2/pipeline.yaml --strategy api
+
+# Use mode from config file
+python run.py --config competitions/ps-s6e2/pipeline.yaml
 ```
 
 ---
 
 ## Roadmap
 
-- [x] Project architecture and YAML schemas
-- [x] GPU auto-detection with fallback
-- [ ] Automated EDA profiler
-- [ ] LLM strategy generation (Claude API + manual mode)
-- [ ] Dynamic feature engineering from YAML
-- [ ] CatBoost / XGBoost / LightGBM Optuna integration
-- [ ] Sklearn model support (Ridge, KNN, RF, Extra Trees)
-- [ ] Diversity-aware ensemble selection (NSGA-II)
-- [ ] QMC warmup for Optuna studies
-- [ ] Meta-model stacking with logit expansion
-- [ ] Kaggle Playground Series validation
+- [x] Three-layer pipeline architecture
+- [x] YAML-driven model and pipeline configuration
+- [x] EDA profiler with LLM-readable output
+- [x] LLM strategy generation (Claude/OpenAI API + manual mode)
+- [x] Dynamic feature engineering (interactions, ratios, target encoding, custom)
+- [x] OOF target encoding with CV fold isolation (no leakage)
+- [x] Per-model Optuna studies with QMC warmup + TPE
+- [x] GPU auto-detection with per-model micro-trials
+- [x] Multi-seed retraining for stability
+- [x] Four ensemble strategies (blend, rank, meta-model, NSGA-II)
+- [x] Diversity-aware selection via correlation matrix eigenvalues
+- [x] End-to-end pipeline orchestrator
+- [x] 173 tests with full coverage
+- [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
+- [ ] Feature importance analysis and selection
+- [ ] Automated post-hoc analysis report
 
 ---
 
@@ -176,20 +373,20 @@ maestro-ml/
 - **[scikit-learn](https://scikit-learn.org/)** — Linear models, KNN, Random Forest, Extra Trees
 - **[Optuna](https://optuna.org/)** — Bayesian hyperparameter optimization with QMC and NSGA-II
 - **[Anthropic Claude API](https://docs.anthropic.com/)** — LLM-powered strategy generation
-- **[pandas](https://pandas.pydata.org/)** / **[NumPy](https://numpy.org/)** — Data manipulation
-- **[SciPy](https://scipy.org/)** — Statistical computations
+- **[pandas](https://pandas.pydata.org/)** / **[NumPy](https://numpy.org/)** / **[SciPy](https://scipy.org/)** — Data and scientific computing
 
 ---
 
 ## Contributing
 
-Contributions are welcome. If you'd like to add a new model type, improve the ensemble logic, or extend the EDA profiler:
+Contributions are welcome. To add a new model type, improve the ensemble logic, or extend the EDA profiler:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/your-feature`)
 3. Add your model's YAML config to `configs/models/`
 4. Implement following the existing docstring specifications
-5. Submit a pull request
+5. Run `pytest tests/ -v` to verify all tests pass
+6. Submit a pull request
 
 ---
 

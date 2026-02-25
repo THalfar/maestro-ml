@@ -1,0 +1,66 @@
+# =============================================================================
+# SVM (Support Vector Machine) Configuration — maestro-ml
+# =============================================================================
+# Kernel-based model with fundamentally different decision boundaries
+# compared to tree-based methods. RBF kernel captures non-linear patterns.
+# Slow on large datasets — keep training set reasonable (subsample if needed).
+# Requires feature scaling. Provides strong ensemble diversity.
+# =============================================================================
+
+name: SVM
+class_path:
+  binary_classification: sklearn.svm.SVC
+  regression: sklearn.svm.SVR
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  C:
+    type: float
+    low: 0.01
+    high: 100.0
+    log: true
+  kernel:
+    type: categorical
+    choices: [rbf, poly]
+  gamma:
+    type: categorical
+    choices: [scale, auto]
+
+fixed_params:
+  binary_classification:
+    probability: true
+    cache_size: 1000
+    random_state: 42
+  regression:
+    cache_size: 1000
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: null                          # SVR has no random_state; keep null
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: true
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 40
+  qmc_warmup_ratio: 0.3
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 1
+  n_seeds: 1

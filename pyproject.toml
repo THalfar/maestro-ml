@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::DeprecationWarning:pytorch_lightning",
+    "ignore::DeprecationWarning:torch.jit",
+    "ignore:GPU available but not used:UserWarning:pytorch_lightning",
+    "ignore:.*LeafSpec.*:DeprecationWarning",
+    "ignore:.*torch.jit.script.*:DeprecationWarning",
+    "ignore::optuna.exceptions.ExperimentalWarning",
+]

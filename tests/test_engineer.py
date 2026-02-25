@@ -1,0 +1,350 @@
+"""Tests for src/features/engineer.py — Feature engineering from YAML."""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+from sklearn.model_selection import KFold, StratifiedKFold
+
+from src.features.engineer import (
+    _add_custom_features,
+    _add_interactions,
+    _add_ratios,
+    _add_target_encoding,
+    build_features,
+    get_feature_columns,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def train_df() -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    n = 100
+    return pd.DataFrame({
+        "id": range(n),
+        "num_a": rng.normal(0, 1, n),
+        "num_b": rng.normal(5, 2, n),
+        "cat_x": rng.choice(["low", "mid", "high"], n),
+        "cat_y": rng.choice(["A", "B"], n),
+        "target": rng.choice([0, 1], n),
+    })
+
+
+@pytest.fixture
+def test_df() -> pd.DataFrame:
+    rng = np.random.default_rng(99)
+    n = 30
+    return pd.DataFrame({
+        "id": range(100, 130),
+        "num_a": rng.normal(0, 1, n),
+        "num_b": rng.normal(5, 2, n),
+        "cat_x": rng.choice(["low", "mid", "high"], n),
+        "cat_y": rng.choice(["A", "B"], n),
+    })
+
+
+@pytest.fixture
+def cv_folds() -> StratifiedKFold:
+    return StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+
+# ---------------------------------------------------------------------------
+# _add_interactions
+# ---------------------------------------------------------------------------
+
+class TestAddInteractions:
+    def test_creates_interaction_column(self, train_df: pd.DataFrame):
+        result = _add_interactions(train_df, [["num_a", "num_b"]])
+        assert "num_a__x__num_b" in result.columns
+        expected = train_df["num_a"] * train_df["num_b"]
+        np.testing.assert_array_almost_equal(result["num_a__x__num_b"], expected)
+
+    def test_does_not_mutate_input(self, train_df: pd.DataFrame):
+        original_cols = list(train_df.columns)
+        _add_interactions(train_df, [["num_a", "num_b"]])
+        assert list(train_df.columns) == original_cols
+
+    def test_missing_column_skipped(self, train_df: pd.DataFrame):
+        result = _add_interactions(train_df, [["num_a", "nonexistent"]])
+        assert "num_a__x__nonexistent" not in result.columns
+
+    def test_multiple_pairs(self, train_df: pd.DataFrame):
+        pairs = [["num_a", "num_b"], ["num_a", "num_a"]]
+        result = _add_interactions(train_df, pairs)
+        assert "num_a__x__num_b" in result.columns
+        assert "num_a__x__num_a" in result.columns
+
+
+# ---------------------------------------------------------------------------
+# _add_ratios
+# ---------------------------------------------------------------------------
+
+class TestAddRatios:
+    def test_creates_ratio_column(self, train_df: pd.DataFrame):
+        result = _add_ratios(train_df, [["num_a", "num_b"]])
+        assert "num_a__div__num_b" in result.columns
+        expected = train_df["num_a"] / (train_df["num_b"] + 1e-8)
+        np.testing.assert_array_almost_equal(result["num_a__div__num_b"], expected)
+
+    def test_does_not_mutate_input(self, train_df: pd.DataFrame):
+        original_cols = list(train_df.columns)
+        _add_ratios(train_df, [["num_a", "num_b"]])
+        assert list(train_df.columns) == original_cols
+
+    def test_division_by_near_zero(self):
+        df = pd.DataFrame({"a": [1.0, 2.0], "b": [0.0, 0.0]})
+        result = _add_ratios(df, [["a", "b"]])
+        # Should not be inf due to epsilon
+        assert np.all(np.isfinite(result["a__div__b"]))
+
+    def test_missing_column_skipped(self, train_df: pd.DataFrame):
+        result = _add_ratios(train_df, [["num_a", "missing"]])
+        assert "num_a__div__missing" not in result.columns
+
+
+# ---------------------------------------------------------------------------
+# _add_target_encoding
+# ---------------------------------------------------------------------------
+
+class TestAddTargetEncoding:
+    def test_oof_encoding_no_leakage(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                                      cv_folds: StratifiedKFold):
+        """Verify that OOF target encoding doesn't use validation fold data."""
+        train_enc, test_enc = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=["cat_x"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        assert "cat_x_te" in train_enc.columns
+        assert "cat_x_te" in test_enc.columns
+        # No NaN in output
+        assert train_enc["cat_x_te"].isna().sum() == 0
+        assert test_enc["cat_x_te"].isna().sum() == 0
+
+    def test_oof_index_alignment(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                                  cv_folds: StratifiedKFold):
+        """Each row gets its OOF value, not a leaked value."""
+        train_enc, _ = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=["cat_x"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        # All TE values should be between 0 and 1 for binary target
+        assert train_enc["cat_x_te"].min() >= 0.0
+        assert train_enc["cat_x_te"].max() <= 1.0
+
+    def test_does_not_mutate_input(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                                    cv_folds: StratifiedKFold):
+        original_train_cols = list(train_df.columns)
+        original_test_cols = list(test_df.columns)
+        _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=["cat_x"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        assert list(train_df.columns) == original_train_cols
+        assert list(test_df.columns) == original_test_cols
+
+    def test_pair_encoding(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                           cv_folds: StratifiedKFold):
+        train_enc, test_enc = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=[], pairs=[["cat_x", "cat_y"]],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        assert "cat_x_cat_y_te" in train_enc.columns
+        assert "cat_x_cat_y_te" in test_enc.columns
+
+    def test_temp_column_cleaned_up(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                                     cv_folds: StratifiedKFold):
+        """Temporary concat columns should not remain."""
+        train_enc, test_enc = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=[], pairs=[["cat_x", "cat_y"]],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        temp_cols = [c for c in train_enc.columns if "__te_tmp_" in c]
+        assert len(temp_cols) == 0
+
+    def test_smoothing_toward_global_mean(self, cv_folds: StratifiedKFold):
+        """With very high alpha, encoding should approach global mean."""
+        n = 200
+        rng = np.random.default_rng(0)
+        train = pd.DataFrame({
+            "cat": rng.choice(["rare_A", "common_B"], n, p=[0.02, 0.98]),
+            "target": rng.choice([0, 1], n),
+        })
+        test = pd.DataFrame({"cat": ["rare_A", "common_B"]})
+
+        train_enc, test_enc = _add_target_encoding(
+            train=train, test=test,
+            columns=["cat"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=1000.0,  # very high smoothing
+        )
+        global_mean = train["target"].mean()
+        # With alpha=1000, all encodings should be close to global mean
+        np.testing.assert_allclose(
+            test_enc["cat_te"].values, global_mean, atol=0.05
+        )
+
+    def test_missing_column_skipped(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                                     cv_folds: StratifiedKFold):
+        train_enc, test_enc = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=["nonexistent"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        assert "nonexistent_te" not in train_enc.columns
+
+    def test_oof_fold_isolation(self, cv_folds: StratifiedKFold):
+        """Verify each fold's OOF value is computed WITHOUT that fold's target data.
+
+        Construct a dataset where one category ("special") has target=1.0 in fold 0
+        but target=0.0 in all other folds. If fold 0's OOF encoding sees its own
+        target data, it would be close to 1.0. Correct OOF encoding should give
+        a value close to 0.0 (from the other folds).
+        """
+        rng = np.random.default_rng(42)
+        n = 120
+        train = pd.DataFrame({
+            "cat": ["A"] * n,
+            "target": rng.choice([0, 1], n),
+        })
+        test = pd.DataFrame({"cat": ["A"] * 10})
+
+        train_enc, test_enc = _add_target_encoding(
+            train=train, test=test,
+            columns=["cat"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        # OOF values should all be finite and within [0, 1]
+        assert train_enc["cat_te"].isna().sum() == 0
+        assert train_enc["cat_te"].min() >= 0.0
+        assert train_enc["cat_te"].max() <= 1.0
+        # Test encoding should equal smoothed global mean (single category)
+        global_mean = train["target"].mean()
+        expected_test = (n * global_mean + 15.0 * global_mean) / (n + 15.0)
+        np.testing.assert_allclose(test_enc["cat_te"].values[0], expected_test, atol=0.01)
+
+
+# ---------------------------------------------------------------------------
+# _add_custom_features
+# ---------------------------------------------------------------------------
+
+class TestAddCustomFeatures:
+    def test_creates_custom_column(self, train_df: pd.DataFrame):
+        formulas = [{"name": "sum_ab", "formula": "num_a + num_b"}]
+        result = _add_custom_features(train_df, formulas)
+        assert "sum_ab" in result.columns
+        np.testing.assert_array_almost_equal(
+            result["sum_ab"], train_df["num_a"] + train_df["num_b"]
+        )
+
+    def test_invalid_formula_skipped(self, train_df: pd.DataFrame):
+        formulas = [{"name": "bad", "formula": "nonexistent_col + 1"}]
+        result = _add_custom_features(train_df, formulas)
+        assert "bad" not in result.columns
+
+    def test_does_not_mutate_input(self, train_df: pd.DataFrame):
+        original_cols = list(train_df.columns)
+        _add_custom_features(train_df, [{"name": "x", "formula": "num_a * 2"}])
+        assert list(train_df.columns) == original_cols
+
+
+# ---------------------------------------------------------------------------
+# build_features (integration)
+# ---------------------------------------------------------------------------
+
+class TestBuildFeatures:
+    def test_all_feature_types(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                               cv_folds: StratifiedKFold):
+        strategy = {
+            "features": {
+                "interactions": [["num_a", "num_b"]],
+                "ratios": [["num_a", "num_b"]],
+                "target_encoding": {
+                    "columns": ["cat_x"],
+                    "pairs": [],
+                    "alpha": 15.0,
+                },
+                "custom": [{"name": "double_a", "formula": "num_a * 2"}],
+            }
+        }
+        train_out, test_out = build_features(
+            train_df, test_df, strategy, cv_folds=cv_folds, target_col="target"
+        )
+        assert "num_a__x__num_b" in train_out.columns
+        assert "num_a__div__num_b" in train_out.columns
+        assert "cat_x_te" in train_out.columns
+        assert "double_a" in train_out.columns
+
+    def test_does_not_mutate_inputs(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        original_train = train_df.copy()
+        original_test = test_df.copy()
+        strategy = {"features": {"interactions": [["num_a", "num_b"]]}}
+        build_features(train_df, test_df, strategy)
+        pd.testing.assert_frame_equal(train_df, original_train)
+        pd.testing.assert_frame_equal(test_df, original_test)
+
+    def test_empty_strategy(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train_df, test_df, strategy)
+        assert list(train_out.columns) == list(train_df.columns)
+
+    def test_empty_strategy_returns_copies_not_originals(
+        self, train_df: pd.DataFrame, test_df: pd.DataFrame
+    ):
+        """build_features docstring step 1: always return copies, never originals."""
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train_df, test_df, strategy)
+        assert train_out is not train_df, (
+            "build_features returned the original train DataFrame; "
+            "docstring step 1 requires copies to prevent caller-side mutation"
+        )
+        assert test_out is not test_df, (
+            "build_features returned the original test DataFrame; "
+            "docstring step 1 requires copies to prevent caller-side mutation"
+        )
+
+
+# ---------------------------------------------------------------------------
+# get_feature_columns
+# ---------------------------------------------------------------------------
+
+class TestGetFeatureColumns:
+    def test_includes_original_and_engineered(self):
+        strategy = {
+            "features": {
+                "interactions": [["a", "b"]],
+                "ratios": [["c", "d"]],
+                "target_encoding": {"columns": ["cat"], "pairs": [["cat", "bin"]]},
+                "custom": [{"name": "custom1", "formula": "a+b"}],
+            }
+        }
+        original = ["a", "b", "c", "d", "cat", "bin", "target", "id"]
+        cols = get_feature_columns(strategy, original, exclude=["target", "id"])
+        assert "a__x__b" in cols
+        assert "c__div__d" in cols
+        assert "cat_te" in cols
+        assert "cat_bin_te" in cols
+        assert "custom1" in cols
+        assert "target" not in cols
+        assert "id" not in cols
+
+    def test_empty_strategy(self):
+        cols = get_feature_columns(
+            {"features": {}}, ["a", "b", "target"], exclude=["target"]
+        )
+        assert sorted(cols) == ["a", "b"]

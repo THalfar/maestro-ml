@@ -1,0 +1,78 @@
+# =============================================================================
+# RealMLP (Tuned Defaults) Configuration — maestro-ml
+# =============================================================================
+# Modern MLP optimized for tabular data via pytabkit. Significantly stronger
+# than sklearn's MLPClassifier thanks to tuned architecture defaults, proper
+# initialization, and built-in preprocessing. Handles scaling and categorical
+# features internally. Uses PyTorch under the hood with GPU auto-detection.
+# =============================================================================
+
+name: RealMLP
+class_path:
+  binary_classification: pytabkit.RealMLP_TD_Classifier
+  regression: pytabkit.RealMLP_TD_Regressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: true
+  params:
+    device: cuda
+  fallback:
+    device: cpu
+  install_notes: >
+    Requires PyTorch with CUDA support. pytabkit auto-detects GPU.
+    Install: pip install pytabkit torch --index-url https://download.pytorch.org/whl/cu121
+
+hyperparameters:
+  hidden_sizes:
+    type: int_list
+    n: 2
+    low: 8
+    high: 128
+  lr:
+    type: float
+    low: 0.001
+    high: 0.1
+    log: true
+  batch_size:
+    type: categorical
+    choices: [64, 128, 256, 512]
+  use_ls:
+    type: categorical
+    choices: [true, false]
+
+fixed_params:
+  n_epochs: 20                                   # max epochs (early stopping usually stops sooner)
+  n_cv: 1                                        # internal 80/20 val split for early stopping
+  n_refit: 0                                     # no internal refitting
+  use_early_stopping: true                       # stop if val metric plateaus
+  early_stopping_additive_patience: 5           # +15 epochs patience after best
+  verbosity: 0                                   # suppress training output
+  random_state: 42
+
+training:
+  early_stopping: false                          # RealMLP handles early stopping internally
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_state
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: false                           # RealMLP preprocesses internally
+  handles_categorical: true                      # auto-detects from DataFrame dtype
+  handles_missing: false
+
+optuna:
+  n_trials: 1000                                  # GPU-accelerated, can afford more trials
+  qmc_warmup_ratio: 0.05
+  timeout: null
+  pruner:
+    type: median                                 # prune bad trials after a few folds
+    n_warmup_steps: 1                            # evaluate at least 2 folds before pruning
+    n_startup_trials: 20                          # let first 5 trials finish fully
+  n_top_trials: 20
+  n_seeds: 1                                     # neural nets benefit from seed averaging

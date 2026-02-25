@@ -121,6 +121,7 @@ def apply_blend(
         2. Compute weighted sum: np.sum(w * p for w, p in zip).
         3. Return the blended array.
     """
+    # REVIEW:STYLE — assert is stripped by `python -O`; use `if … raise ValueError(…)` for runtime validation
     assert len(preds_list) == len(weights), (
         f"preds_list ({len(preds_list)}) and weights ({len(weights)}) must have same length"
     )

@@ -1,0 +1,53 @@
+# =============================================================================
+# Gaussian Naive Bayes Configuration — maestro-ml
+# =============================================================================
+# Probabilistic classifier assuming feature independence. Fundamentally
+# different from tree-based and linear models — errors do not correlate
+# with other model families, making it excellent for ensemble diversity.
+# Weak on its own but adds uncorrelated signal to blended predictions.
+# Classification only (no regression equivalent).
+# =============================================================================
+
+name: Gaussian NB
+class_path:
+  binary_classification: sklearn.naive_bayes.GaussianNB
+task_types:
+  - binary_classification
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  var_smoothing:
+    type: float
+    low: 1.0e-12
+    high: 1.0e-3
+    log: true
+
+fixed_params: {}
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: null                          # GaussianNB is deterministic
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: true
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 20
+  qmc_warmup_ratio: 0.1
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 1
+  n_seeds: 1

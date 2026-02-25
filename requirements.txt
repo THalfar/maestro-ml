@@ -3,6 +3,7 @@ catboost>=1.2
 xgboost>=2.0
 lightgbm>=4.0
 scikit-learn>=1.3
+pytabkit>=1.7
 
 # Optimization
 optuna>=3.4

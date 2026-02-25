@@ -173,136 +173,43 @@ def greedy_diverse_select(
     return selected
 
 
-def run_nsga2_ensemble(
+def select_from_pareto(
+    pareto_trials: list,
     oof_list: list[np.ndarray],
     test_list: list[np.ndarray],
     y: np.ndarray,
-    n_trials: int = 300,
-    metric: str = "roc_auc",
-    diversity_weight: float = 0.3,
-    seed: int = 42,
+    n_models: int,
+    diversity_weight: float,
+    metric: str,
+    labels: list[str] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Run NSGA-II multi-objective optimization for ensemble selection.
+    """Select the best ensemble from a NSGA-II Pareto front.
 
-    Simultaneously optimizes:
-    - Objective 1: Primary metric (AUC-ROC, RMSE, etc.)
-    - Objective 2: Effective ensemble size (diversity)
+    Given completed Pareto front trials, selects the best solution using
+    weighted scoring: (1-dw)*normalized_metric + dw*normalized_diversity.
 
-    Each trial selects a subset of models and their blend weights.
+    This allows producing multiple submissions from a single NSGA-II run
+    by calling this function with different diversity_weight values.
 
     Args:
-        oof_list: List of OOF prediction arrays from all base models.
-        test_list: List of test prediction arrays from all base models.
+        pareto_trials: List of Optuna FrozenTrial from study.best_trials.
+        oof_list: All OOF prediction arrays.
+        test_list: All test prediction arrays.
         y: True target values.
-        n_trials: Number of NSGA-II trials.
-        metric: Primary metric name.
-        diversity_weight: Weight for diversity in final selection
-                          (0.0 = pure metric, 1.0 = pure diversity).
-        seed: Random seed.
+        n_models: Total number of prediction arrays.
+        diversity_weight: Weight for diversity (0=pure metric, 1=pure diversity).
+        metric: Metric name.
+        labels: Model labels for logging.
 
     Returns:
-        Tuple of (best_test_preds, info_dict):
-        - best_test_preds: Test predictions from the best ensemble.
-        - info_dict: Dictionary containing:
-          - selected_models: indices of selected models
-          - weights: blend weights
-          - metric_score: primary metric value
-          - effective_size: effective ensemble size
-          - pareto_front: list of (metric, diversity) tuples
-
-    Steps:
-        1. Create an Optuna study with NSGAIISampler and two directions:
-           - 'maximize' for the primary metric
-           - 'maximize' for effective ensemble size
-        2. Define the objective:
-           a. For each model, suggest a boolean (include/exclude) and
-              a weight (0.0-1.0).
-           b. Filter to included models. If none included, return
-              worst possible values.
-           c. Normalize weights of included models to sum to 1.0.
-           d. Compute blended OOF predictions.
-           e. Compute the primary metric.
-           f. Compute the correlation matrix of included models' OOFs.
-           g. Compute effective ensemble size.
-           h. Return (metric_score, effective_size).
-        3. Run study.optimize for n_trials.
-        4. Select the best trial from the Pareto front using a weighted
-           score: diversity_weight * normalized_diversity +
-                  (1 - diversity_weight) * normalized_metric.
-        5. Reconstruct the test predictions using the best trial's
-           model selection and weights.
-        6. Return (test_preds, info_dict).
+        Tuple of (test_preds, info_dict).
     """
-    n_models = len(oof_list)
-    worst_metric = -np.inf
-
-    def objective(trial: optuna.Trial) -> tuple[float, float]:
-        # For each model: include flag + weight
-        included = []
-        weights = []
-        for i in range(n_models):
-            include = trial.suggest_categorical(f"include_{i}", [True, False])
-            weight = trial.suggest_float(f"weight_{i}", 0.0, 1.0)
-            if include:
-                included.append(i)
-                weights.append(weight)
-
-        if not included:
-            return (worst_metric, 1.0)
-
-        # Normalize weights
-        total_w = sum(weights)
-        if total_w == 0:
-            norm_weights = [1.0 / len(included)] * len(included)
-        else:
-            norm_weights = [w / total_w for w in weights]
-
-        # Blend OOF
-        selected_oofs = [oof_list[i] for i in included]
-        blended_oof = sum(w * p for w, p in zip(norm_weights, selected_oofs))
-
-        # Metric
-        try:
-            metric_score = _score_metric(y, blended_oof, metric)
-        except Exception:
-            return (worst_metric, 1.0)
-
-        # Diversity
-        if len(included) == 1:
-            n_eff = 1.0
-        else:
-            corr = compute_correlation_matrix(selected_oofs)
-            n_eff = effective_ensemble_size(corr)
-
-        return (metric_score, n_eff)
-
-    study = optuna.create_study(
-        directions=["maximize", "maximize"],
-        sampler=optuna.samplers.NSGAIISampler(seed=seed),
-    )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-    # Extract Pareto front trials
-    pareto_trials = study.best_trials
-    if not pareto_trials:
-        # Fallback: use all models with equal weights
-        n_models_use = n_models
-        selected_indices = list(range(n_models_use))
-        equal_weights = [1.0 / n_models_use] * n_models_use
-        test_preds = sum(w * p for w, p in zip(equal_weights, test_list))
-        return np.array(test_preds), {
-            "selected_models": selected_indices,
-            "weights": equal_weights,
-            "metric_score": 0.0,
-            "effective_size": 1.0,
-            "pareto_front": [],
-        }
+    _labels = labels or [f"model[{i}]" for i in range(n_models)]
 
     # Normalize Pareto front values for selection
     metric_values = np.array([t.values[0] for t in pareto_trials])
     diversity_values = np.array([t.values[1] for t in pareto_trials])
 
-    # Normalize to [0, 1]
     def _normalize(arr: np.ndarray) -> np.ndarray:
         rng = arr.max() - arr.min()
         if rng == 0:
@@ -359,10 +266,266 @@ def run_nsga2_ensemble(
         "pareto_front": pareto_front,
     }
 
+    # --- Detailed report ---
+    logger.info("=" * 60)
+    logger.info(f"NSGA-II ENSEMBLE RESULT (dw={diversity_weight:.2f})")
+    logger.info("-" * 60)
     logger.info(
-        f"NSGA-II ensemble: {len(best_included)} models selected, "
-        f"{metric}={final_metric:.6f}, N_eff={final_eff_size:.2f}"
+        f"  Selected {len(best_included)}/{n_models} models | "
+        f"{metric}={final_metric:.6f} | N_eff={final_eff_size:.2f}"
     )
+
+    # Per-model weights (sorted by weight descending)
+    model_weight_pairs = sorted(
+        zip(best_included, norm_w), key=lambda x: x[1], reverse=True
+    )
+    for idx, w in model_weight_pairs:
+        try:
+            solo_score = _score_metric(y, oof_list[idx], metric)
+        except Exception:
+            solo_score = float("nan")
+        logger.info(f"    {_labels[idx]:<25s}  weight={w:.4f}  solo_{metric}={solo_score:.6f}")
+
+    # Pareto front summary
+    if pareto_trials:
+        pf_metrics = [t.values[0] for t in pareto_trials]
+        pf_diversity = [t.values[1] for t in pareto_trials]
+        logger.info("-" * 60)
+        logger.info(
+            f"  Pareto front: {len(pareto_trials)} solutions | "
+            f"{metric}=[{min(pf_metrics):.6f}, {max(pf_metrics):.6f}] | "
+            f"N_eff=[{min(pf_diversity):.2f}, {max(pf_diversity):.2f}]"
+        )
+
+        best_metric_trial = max(pareto_trials, key=lambda t: t.values[0])
+        best_div_trial = max(pareto_trials, key=lambda t: t.values[1])
+        logger.info(
+            f"  Best {metric} on Pareto: {best_metric_trial.values[0]:.6f} "
+            f"(N_eff={best_metric_trial.values[1]:.2f})"
+        )
+        logger.info(
+            f"  Best diversity on Pareto: N_eff={best_div_trial.values[1]:.2f} "
+            f"({metric}={best_div_trial.values[0]:.6f})"
+        )
+
+    # Selected ensemble correlation matrix
+    if len(best_included) > 1:
+        sel_corr = compute_correlation_matrix(selected_oofs)
+        sel_labels = [_labels[i] for i in best_included]
+        logger.info("-" * 60)
+        logger.info(f"  Selected ensemble pairwise correlations:")
+        sel_pairs = []
+        for i in range(len(best_included)):
+            for j in range(i + 1, len(best_included)):
+                sel_pairs.append((sel_labels[i], sel_labels[j], sel_corr[i, j]))
+        sel_pairs.sort(key=lambda x: x[2], reverse=True)
+        for a, b, r in sel_pairs:
+            logger.info(f"    {a} <-> {b}: {r:.4f}")
+        avg_corr = np.mean([r for _, _, r in sel_pairs])
+        logger.info(f"  Avg pairwise correlation: {avg_corr:.4f}")
+    logger.info("=" * 60)
+
+    return test_preds, info_dict
+
+
+def run_nsga2_ensemble(
+    oof_list: list[np.ndarray],
+    test_list: list[np.ndarray],
+    y: np.ndarray,
+    n_trials: int = 300,
+    metric: str = "roc_auc",
+    diversity_weight: float = 0.3,
+    seed: int = 42,
+    labels: list[str] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Run NSGA-II multi-objective optimization for ensemble selection.
+
+    Simultaneously optimizes:
+    - Objective 1: Primary metric (AUC-ROC, RMSE, etc.)
+    - Objective 2: Effective ensemble size (diversity)
+
+    Each trial selects a subset of models and their blend weights.
+    The diversity_weight is only used for Pareto front selection, not
+    during optimization. Use select_from_pareto() to re-select from
+    the same Pareto front with different weights.
+
+    Args:
+        oof_list: List of OOF prediction arrays from all base models.
+        test_list: List of test prediction arrays from all base models.
+        y: True target values.
+        n_trials: Number of NSGA-II trials.
+        metric: Primary metric name.
+        diversity_weight: Weight for diversity in final selection
+                          (0.0 = pure metric, 1.0 = pure diversity).
+        seed: Random seed.
+        labels: Model labels for logging.
+
+    Returns:
+        Tuple of (best_test_preds, info_dict):
+        - best_test_preds: Test predictions from the best ensemble.
+        - info_dict: Dictionary containing:
+          - selected_models: indices of selected models
+          - weights: blend weights
+          - metric_score: primary metric value
+          - effective_size: effective ensemble size
+          - pareto_front: list of (metric, diversity) tuples
+          - pareto_trials: Optuna FrozenTrial list (for reuse with
+            select_from_pareto)
+
+    Steps:
+        1. Create an Optuna study with NSGAIISampler and two directions:
+           - 'maximize' for the primary metric
+           - 'maximize' for effective ensemble size
+        2. Define the objective:
+           a. For each model, suggest a boolean (include/exclude) and
+              a weight (0.0-1.0).
+           b. Filter to included models. If none included, return
+              worst possible values.
+           c. Normalize weights of included models to sum to 1.0.
+           d. Compute blended OOF predictions.
+           e. Compute the primary metric.
+           f. Compute the correlation matrix of included models' OOFs.
+           g. Compute effective ensemble size.
+           h. Return (metric_score, effective_size).
+        3. Run study.optimize for n_trials.
+        4. Call select_from_pareto to pick the best solution.
+        5. Return (test_preds, info_dict) with pareto_trials included.
+    """
+    n_models = len(oof_list)
+    _labels = labels or [f"model[{i}]" for i in range(n_models)]
+    worst_metric = -np.inf
+
+    def objective(trial: optuna.Trial) -> tuple[float, float]:
+        # For each model: include flag + weight
+        included = []
+        weights = []
+        for i in range(n_models):
+            include = trial.suggest_categorical(f"include_{i}", [True, False])
+            weight = trial.suggest_float(f"weight_{i}", 0.0, 1.0)
+            if include:
+                included.append(i)
+                weights.append(weight)
+
+        if not included:
+            return (worst_metric, 1.0)
+
+        # Normalize weights
+        total_w = sum(weights)
+        if total_w == 0:
+            norm_weights = [1.0 / len(included)] * len(included)
+        else:
+            norm_weights = [w / total_w for w in weights]
+
+        # Blend OOF
+        selected_oofs = [oof_list[i] for i in included]
+        blended_oof = sum(w * p for w, p in zip(norm_weights, selected_oofs))
+
+        # Metric
+        try:
+            metric_score = _score_metric(y, blended_oof, metric)
+        except Exception:
+            return (worst_metric, 1.0)
+
+        # Diversity
+        if len(included) == 1:
+            n_eff = 1.0
+        else:
+            corr = compute_correlation_matrix(selected_oofs)
+            n_eff = effective_ensemble_size(corr)
+
+        return (metric_score, n_eff)
+
+    import time as _time
+    nsga2_start = _time.time()
+
+    # --- Input diagnostics ---
+    logger.info("=" * 60)
+    logger.info("NSGA-II ENSEMBLE INPUT")
+    logger.info("-" * 60)
+    logger.info(f"  {n_models} prediction arrays, {len(oof_list[0])} samples each")
+    logger.info(f"  diversity_weight={diversity_weight}, n_trials={n_trials}")
+
+    # Per-model solo scores
+    solo_scores = []
+    for i in range(n_models):
+        try:
+            s = _score_metric(y, oof_list[i], metric)
+        except Exception:
+            s = float("nan")
+        solo_scores.append(s)
+    sorted_by_score = sorted(
+        enumerate(solo_scores), key=lambda x: x[1], reverse=True
+    )
+    logger.info(f"  Solo {metric} scores (best → worst):")
+    for idx, score in sorted_by_score:
+        logger.info(f"    {_labels[idx]:<25s}  {score:.6f}")
+
+    # Full correlation matrix
+    full_corr = compute_correlation_matrix(oof_list)
+    full_neff = effective_ensemble_size(full_corr)
+    logger.info(f"  Full matrix N_eff={full_neff:.2f} (all {n_models} arrays)")
+
+    # Correlation heatmap (top-left triangle, compact)
+    logger.info(f"  Pairwise correlations (high=redundant):")
+    # Show pairs with highest and lowest correlation
+    corr_pairs = []
+    for i in range(n_models):
+        for j in range(i + 1, n_models):
+            corr_pairs.append((_labels[i], _labels[j], full_corr[i, j]))
+    corr_pairs.sort(key=lambda x: x[2], reverse=True)
+    n_show = min(5, len(corr_pairs))
+    logger.info(f"    Most correlated (top {n_show}):")
+    for a, b, r in corr_pairs[:n_show]:
+        logger.info(f"      {a} <-> {b}: {r:.4f}")
+    logger.info(f"    Least correlated (top {n_show}):")
+    for a, b, r in corr_pairs[-n_show:]:
+        logger.info(f"      {a} <-> {b}: {r:.4f}")
+    logger.info("=" * 60)
+
+    study = optuna.create_study(
+        directions=["maximize", "maximize"],
+        sampler=optuna.samplers.NSGAIISampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    nsga2_elapsed = _time.time() - nsga2_start
+
+    # Extract Pareto front trials
+    pareto_trials = study.best_trials
+    n_completed = sum(
+        1 for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    )
+    logger.info(
+        f"NSGA-II: {n_completed}/{n_trials} trials completed in {nsga2_elapsed:.1f}s "
+        f"({nsga2_elapsed / max(n_trials, 1) * 1000:.1f}ms/trial), "
+        f"Pareto front: {len(pareto_trials)} solutions"
+    )
+    if not pareto_trials:
+        # Fallback: use all models with equal weights
+        n_models_use = n_models
+        selected_indices = list(range(n_models_use))
+        equal_weights = [1.0 / n_models_use] * n_models_use
+        test_preds = sum(w * p for w, p in zip(equal_weights, test_list))
+        return np.array(test_preds), {
+            "selected_models": selected_indices,
+            "weights": equal_weights,
+            "metric_score": 0.0,
+            "effective_size": 1.0,
+            "pareto_front": [],
+            "pareto_trials": [],
+        }
+
+    # Select from Pareto front
+    test_preds, info_dict = select_from_pareto(
+        pareto_trials, oof_list, test_list, y,
+        n_models=n_models,
+        diversity_weight=diversity_weight,
+        metric=metric,
+        labels=_labels,
+    )
+
+    # Include pareto_trials for reuse with different diversity_weights
+    info_dict["pareto_trials"] = pareto_trials
 
     return test_preds, info_dict
 

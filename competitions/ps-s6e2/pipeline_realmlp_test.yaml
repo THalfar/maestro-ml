@@ -1,0 +1,70 @@
+# =============================================================================
+# RealMLP Quick Test — vain RealMLP, nopea validointi
+# =============================================================================
+# Testaa että RealMLP toimii GPU:lla end-to-end (train + OOF + ensemble)
+# Ajo kestää ~2-5 min RTX 5090:lla
+# =============================================================================
+
+data:
+  train_path: "data/ps-s6e2/train.csv"
+  test_path: "data/ps-s6e2/test.csv"
+  target_column: "Heart Disease"
+  id_column: "id"
+  task_type: "binary_classification"
+  target_mapping:
+    Presence: 1
+    Absence: 0
+
+cv:
+  n_folds: 3                     # 3 foldia riittää testiin
+  seed: 42
+  stratified: true
+
+strategy:
+  mode: "manual"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "competitions/ps-s6e2/results/eda_report.txt"
+    strategy_input_path: "competitions/ps-s6e2/strategy_realmlp_test.yaml"
+
+models:
+  - realmlp
+  - ridge                        # nopea baseline vertailuksi
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "blend"              # yksinkertaisin, nopein
+  blend_trials: 50
+  meta_trials: 20
+  nsga2_trials: 50
+  diversity_weight: 0.3
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+  model_timeouts:
+    realmlp: "30s"                # 2 min riittää testiin
+    gaussian_nb: "10s" 
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 2
+
+output:
+  submission_path: "competitions/ps-s6e2/results/submission_realmlp_test.csv"
+  results_dir: "competitions/ps-s6e2/results_realmlp_test/"
+  save_oof: true

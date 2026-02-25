@@ -1,0 +1,62 @@
+======================================================================
+MAESTRO-ML EDA REPORT
+======================================================================
+Train shape : [630000, 15]  (72.1 MB)
+Test shape  : [270000, 14]  (28.8 MB)
+Features    : 13
+
+────────────────────────────────────────
+TARGET DISTRIBUTION
+────────────────────────────────────────
+           0 :   347546  (55.17%)
+           1 :   282454  (44.83%)
+  dtype=int64, unique=2
+
+──────────────────────────────────────────────────────────────────────
+FEATURE                                 CORR TYPE                            MISS%
+──────────────────────────────────────────────────────────────────────
+Thallium                             +0.6058 ordinal                           0.0
+Chest pain type                      +0.4607 ordinal                           0.0
+Exercise angina                      +0.4419 binary                            0.0
+Max HR                               -0.4410 numeric_continuous                0.0
+Number of vessels fluro              +0.4386 ordinal                           0.0
+ST depression                        +0.4306 numeric_continuous                0.0
+Slope of ST                          +0.4150 ordinal                           0.0
+Sex                                  +0.3424 binary                            0.0
+EKG results                          +0.2190 ordinal                           0.0
+Age                                  +0.2121 numeric_continuous                0.0
+Cholesterol                          +0.0828 numeric_continuous                0.0
+FBS over 120                         +0.0336 binary                            0.0
+BP                                   -0.0052 numeric_continuous                0.0
+
+────────────────────────────────────────
+WEAK FEATURES (|corr| < 0.05)
+────────────────────────────────────────
+  BP                             corr=-0.0052  → consider_dropping
+  FBS over 120                   corr=+0.0336  → consider_dropping
+
+────────────────────────────────────────
+FEATURE CLUSTERS (|corr| >= 0.5)
+────────────────────────────────────────
+  (no clusters found)
+
+────────────────────────────────────────
+MISSING VALUES
+────────────────────────────────────────
+  (no missing values)
+
+────────────────────────────────────────
+COLUMN TYPE BREAKDOWN
+────────────────────────────────────────
+  binary                              3
+  numeric_continuous                  5
+  ordinal                             5
+
+────────────────────────────────────────
+RECOMMENDATIONS
+────────────────────────────────────────
+  1. Top correlated features: Thallium, Chest pain type, Exercise angina, Max HR, Number of vessels fluro. Consider creating interaction features between these.
+  2. Weak features (|corr| < 0.05): BP, FBS over 120. Consider dropping or using only in interactions with stronger features.
+  3. Binary features (Sex, FBS over 120, Exercise angina) can be multiplied with top continuous features (Age, BP, Cholesterol) to create conditional interaction features.
+
+======================================================================

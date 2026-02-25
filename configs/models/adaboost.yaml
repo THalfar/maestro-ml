@@ -1,0 +1,59 @@
+# =============================================================================
+# AdaBoost Configuration — maestro-ml
+# =============================================================================
+# Adaptive boosting — different boosting strategy than gradient boosting.
+# Re-weights difficult samples differently, producing diverse predictions.
+# Uses decision stumps (depth-1 trees) as base learner by default.
+# Provides ensemble diversity when combined with gradient boosters.
+# =============================================================================
+
+name: AdaBoost
+class_path:
+  binary_classification: sklearn.ensemble.AdaBoostClassifier
+  regression: sklearn.ensemble.AdaBoostRegressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  n_estimators:
+    type: int
+    low: 50
+    high: 200                                  # 500 too slow on 630K rows (no parallelism)
+  learning_rate:
+    type: float
+    low: 0.01
+    high: 1.0
+    log: true
+
+fixed_params:
+  random_state: 42
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_state
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: false
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 20                                 # fewer trials — diversity model, not primary
+  qmc_warmup_ratio: 0.1
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 1                              # retrain only best config (1×1×10 = 10 fits)
+  n_seeds: 1                                   # sequential learner — seed avg adds little

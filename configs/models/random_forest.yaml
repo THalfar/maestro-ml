@@ -25,18 +25,18 @@ hyperparameters:
   n_estimators:
     type: int
     low: 100
-    high: 1000
+    high: 300                                  # 1000 too slow on 630K×10-fold (~19min/trial)
   max_depth:
     type: int
-    low: 3
-    high: 20
+    low: 5
+    high: 15                                   # deep trees on 567K rows = slow + overfit
   min_samples_leaf:
     type: int
-    low: 1
+    low: 2
     high: 50
   max_features:
     type: categorical
-    choices: [sqrt, log2, 0.5, 0.7, 1.0]
+    choices: [sqrt, log2, 0.5, 0.7]            # 1.0 = no subsampling, defeats bagging
 
 fixed_params:
   n_jobs: -1
@@ -57,10 +57,10 @@ feature_requirements:
   handles_missing: false
 
 optuna:
-  n_trials: 50
+  n_trials: 15                                 # diversity model — fewer trials sufficient
   qmc_warmup_ratio: 0.3
   timeout: null
   pruner:
     type: none
-  n_top_trials: 3
-  n_seeds: 3
+  n_top_trials: 1                              # retrain only best (1×1×10 = 10 fits)
+  n_seeds: 1                                   # RF is already stochastic via bootstrap

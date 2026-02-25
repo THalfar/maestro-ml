@@ -1,0 +1,543 @@
+{
+  "dataset_info": {
+    "train_shape": [
+      630000,
+      15
+    ],
+    "test_shape": [
+      270000,
+      14
+    ],
+    "train_memory_mb": 72.098,
+    "test_memory_mb": 28.839,
+    "n_features": 13
+  },
+  "target_analysis": {
+    "dtype": "int64",
+    "n_unique": 2,
+    "distribution": {
+      "0": 347546,
+      "1": 282454
+    },
+    "class_balance_pct": {
+      "0": 55.17,
+      "1": 44.83
+    },
+    "missing_pct": 0.0
+  },
+  "columns": {
+    "Age": {
+      "dtype": "int64",
+      "detected_type": "numeric_continuous",
+      "missing_pct": 0.0,
+      "cardinality": 42,
+      "top_values": {
+        "54": 46826,
+        "58": 41714,
+        "51": 37526,
+        "57": 32442,
+        "59": 31713,
+        "52": 30572,
+        "60": 29437,
+        "62": 25872,
+        "44": 25476,
+        "41": 24633
+      },
+      "stats": {
+        "mean": 54.136706,
+        "std": 8.256301,
+        "min": 29.0,
+        "max": 77.0,
+        "median": 54.0
+      },
+      "target_correlation": 0.212091
+    },
+    "Sex": {
+      "dtype": "int64",
+      "detected_type": "binary",
+      "missing_pct": 0.0,
+      "cardinality": 2,
+      "top_values": {
+        "1": 450283,
+        "0": 179717
+      },
+      "stats": {
+        "mean": 0.714735,
+        "std": 0.451541,
+        "min": 0.0,
+        "max": 1.0,
+        "median": 1.0
+      },
+      "target_correlation": 0.342446
+    },
+    "Chest pain type": {
+      "dtype": "int64",
+      "detected_type": "ordinal",
+      "missing_pct": 0.0,
+      "cardinality": 4,
+      "top_values": {
+        "4": 329179,
+        "3": 197278,
+        "2": 74941,
+        "1": 28602
+      },
+      "stats": {
+        "mean": 3.312752,
+        "std": 0.851615,
+        "min": 1.0,
+        "max": 4.0,
+        "median": 4.0
+      },
+      "target_correlation": 0.460684
+    },
+    "BP": {
+      "dtype": "int64",
+      "detected_type": "numeric_continuous",
+      "missing_pct": 0.0,
+      "cardinality": 66,
+      "top_values": {
+        "120": 116574,
+        "130": 106259,
+        "140": 99775,
+        "150": 44272,
+        "110": 42639,
+        "160": 24133,
+        "125": 20480,
+        "112": 18905,
+        "128": 18559,
+        "138": 18523
+      },
+      "stats": {
+        "mean": 130.497433,
+        "std": 14.975802,
+        "min": 94.0,
+        "max": 200.0,
+        "median": 130.0
+      },
+      "target_correlation": -0.005181
+    },
+    "Cholesterol": {
+      "dtype": "int64",
+      "detected_type": "numeric_continuous",
+      "missing_pct": 0.0,
+      "cardinality": 150,
+      "top_values": {
+        "234": 29562,
+        "269": 24604,
+        "254": 21887,
+        "226": 17562,
+        "243": 17405,
+        "211": 17162,
+        "233": 17160,
+        "282": 17016,
+        "239": 16708,
+        "212": 16182
+      },
+      "stats": {
+        "mean": 245.011814,
+        "std": 33.681581,
+        "min": 126.0,
+        "max": 564.0,
+        "median": 243.0
+      },
+      "target_correlation": 0.082753
+    },
+    "FBS over 120": {
+      "dtype": "int64",
+      "detected_type": "binary",
+      "missing_pct": 0.0,
+      "cardinality": 2,
+      "top_values": {
+        "0": 579608,
+        "1": 50392
+      },
+      "stats": {
+        "mean": 0.079987,
+        "std": 0.271274,
+        "min": 0.0,
+        "max": 1.0,
+        "median": 0.0
+      },
+      "target_correlation": 0.03357
+    },
+    "EKG results": {
+      "dtype": "int64",
+      "detected_type": "ordinal",
+      "missing_pct": 0.0,
+      "cardinality": 3,
+      "top_values": {
+        "0": 320116,
+        "2": 308562,
+        "1": 1322
+      },
+      "stats": {
+        "mean": 0.98166,
+        "std": 0.998783,
+        "min": 0.0,
+        "max": 2.0,
+        "median": 0.0
+      },
+      "target_correlation": 0.218961
+    },
+    "Max HR": {
+      "dtype": "int64",
+      "detected_type": "numeric_continuous",
+      "missing_pct": 0.0,
+      "cardinality": 93,
+      "top_values": {
+        "162": 36703,
+        "160": 30000,
+        "163": 27914,
+        "172": 26376,
+        "132": 19643,
+        "125": 19513,
+        "152": 18382,
+        "173": 18236,
+        "142": 18040,
+        "150": 17385
+      },
+      "stats": {
+        "mean": 152.816763,
+        "std": 19.112927,
+        "min": 71.0,
+        "max": 202.0,
+        "median": 157.0
+      },
+      "target_correlation": -0.440985
+    },
+    "Exercise angina": {
+      "dtype": "int64",
+      "detected_type": "binary",
+      "missing_pct": 0.0,
+      "cardinality": 2,
+      "top_values": {
+        "0": 457553,
+        "1": 172447
+      },
+      "stats": {
+        "mean": 0.273725,
+        "std": 0.44587,
+        "min": 0.0,
+        "max": 1.0,
+        "median": 0.0
+      },
+      "target_correlation": 0.441864
+    },
+    "ST depression": {
+      "dtype": "float64",
+      "detected_type": "numeric_continuous",
+      "missing_pct": 0.0,
+      "cardinality": 66,
+      "top_values": {
+        "0.0": 314939,
+        "1.2": 29269,
+        "1.0": 28647,
+        "1.6": 28395,
+        "1.4": 27146,
+        "1.8": 21511,
+        "0.6": 20722,
+        "0.2": 20474,
+        "2.0": 17050,
+        "0.8": 16644
+      },
+      "stats": {
+        "mean": 0.716028,
+        "std": 0.948472,
+        "min": 0.0,
+        "max": 6.2,
+        "median": 0.1
+      },
+      "target_correlation": 0.430641
+    },
+    "Slope of ST": {
+      "dtype": "int64",
+      "detected_type": "ordinal",
+      "missing_pct": 0.0,
+      "cardinality": 3,
+      "top_values": {
+        "1": 358293,
+        "2": 256215,
+        "3": 15492
+      },
+      "stats": {
+        "mean": 1.455871,
+        "std": 0.545192,
+        "min": 1.0,
+        "max": 3.0,
+        "median": 1.0
+      },
+      "target_correlation": 0.41505
+    },
+    "Number of vessels fluro": {
+      "dtype": "int64",
+      "detected_type": "ordinal",
+      "missing_pct": 0.0,
+      "cardinality": 4,
+      "top_values": {
+        "0": 445862,
+        "1": 106978,
+        "2": 54303,
+        "3": 22857
+      },
+      "stats": {
+        "mean": 0.45104,
+        "std": 0.798549,
+        "min": 0.0,
+        "max": 3.0,
+        "median": 0.0
+      },
+      "target_correlation": 0.438604
+    },
+    "Thallium": {
+      "dtype": "int64",
+      "detected_type": "ordinal",
+      "missing_pct": 0.0,
+      "cardinality": 3,
+      "top_values": {
+        "3": 372286,
+        "7": 246748,
+        "6": 10966
+      },
+      "stats": {
+        "mean": 4.618873,
+        "std": 1.950007,
+        "min": 3.0,
+        "max": 7.0,
+        "median": 3.0
+      },
+      "target_correlation": 0.605776
+    }
+  },
+  "correlation_matrix": {
+    "columns": [
+      "Age",
+      "Sex",
+      "Chest pain type",
+      "BP",
+      "Cholesterol",
+      "FBS over 120",
+      "EKG results",
+      "Max HR",
+      "Exercise angina",
+      "ST depression",
+      "Slope of ST",
+      "Number of vessels fluro",
+      "Thallium"
+    ],
+    "values": [
+      [
+        1.0,
+        0.088397,
+        0.109453,
+        -0.00396,
+        0.019485,
+        0.013354,
+        0.057431,
+        -0.097542,
+        0.110153,
+        0.103064,
+        0.096337,
+        0.102758,
+        0.150124
+      ],
+      [
+        0.088397,
+        1.0,
+        0.195893,
+        -0.003355,
+        0.038373,
+        0.020333,
+        0.09359,
+        -0.176186,
+        0.192705,
+        0.181093,
+        0.169854,
+        0.1747,
+        0.275282
+      ],
+      [
+        0.109453,
+        0.195893,
+        1.0,
+        -0.003587,
+        0.045463,
+        0.023036,
+        0.120907,
+        -0.221806,
+        0.246211,
+        0.240228,
+        0.233849,
+        0.236787,
+        0.319887
+      ],
+      [
+        -0.00396,
+        -0.003355,
+        -0.003587,
+        1.0,
+        -0.004597,
+        -0.000784,
+        -0.003738,
+        0.004391,
+        -0.003295,
+        -0.004024,
+        -0.003203,
+        -0.003143,
+        -0.005884
+      ],
+      [
+        0.019485,
+        0.038373,
+        0.045463,
+        -0.004597,
+        1.0,
+        0.006212,
+        0.024948,
+        -0.048575,
+        0.049774,
+        0.044678,
+        0.040197,
+        0.0488,
+        0.061817
+      ],
+      [
+        0.013354,
+        0.020333,
+        0.023036,
+        -0.000784,
+        0.006212,
+        1.0,
+        0.016258,
+        -0.024895,
+        0.027971,
+        0.031324,
+        0.030327,
+        0.025691,
+        0.032895
+      ],
+      [
+        0.057431,
+        0.09359,
+        0.120907,
+        -0.003738,
+        0.024948,
+        0.016258,
+        1.0,
+        -0.125047,
+        0.128814,
+        0.149273,
+        0.144468,
+        0.130943,
+        0.169017
+      ],
+      [
+        -0.097542,
+        -0.176186,
+        -0.221806,
+        0.004391,
+        -0.048575,
+        -0.024895,
+        -0.125047,
+        1.0,
+        -0.236232,
+        -0.229462,
+        -0.20619,
+        -0.236319,
+        -0.306912
+      ],
+      [
+        0.110153,
+        0.192705,
+        0.246211,
+        -0.003295,
+        0.049774,
+        0.027971,
+        0.128814,
+        -0.236232,
+        1.0,
+        0.281298,
+        0.245243,
+        0.270413,
+        0.357076
+      ],
+      [
+        0.103064,
+        0.181093,
+        0.240228,
+        -0.004024,
+        0.044678,
+        0.031324,
+        0.149273,
+        -0.229462,
+        0.281298,
+        1.0,
+        0.43824,
+        0.293642,
+        0.316891
+      ],
+      [
+        0.096337,
+        0.169854,
+        0.233849,
+        -0.003203,
+        0.040197,
+        0.030327,
+        0.144468,
+        -0.20619,
+        0.245243,
+        0.43824,
+        1.0,
+        0.247005,
+        0.30052
+      ],
+      [
+        0.102758,
+        0.1747,
+        0.236787,
+        -0.003143,
+        0.0488,
+        0.025691,
+        0.130943,
+        -0.236319,
+        0.270413,
+        0.293642,
+        0.247005,
+        1.0,
+        0.33346
+      ],
+      [
+        0.150124,
+        0.275282,
+        0.319887,
+        -0.005884,
+        0.061817,
+        0.032895,
+        0.169017,
+        -0.306912,
+        0.357076,
+        0.316891,
+        0.30052,
+        0.33346,
+        1.0
+      ]
+    ]
+  },
+  "feature_clusters": [],
+  "weak_features": [
+    {
+      "column": "BP",
+      "target_correlation": -0.005181026617473481,
+      "recommendation": "consider_dropping"
+    },
+    {
+      "column": "FBS over 120",
+      "target_correlation": 0.03357027699891557,
+      "recommendation": "consider_dropping"
+    }
+  ],
+  "recommendations": [
+    "Top correlated features: Thallium, Chest pain type, Exercise angina, Max HR, Number of vessels fluro. Consider creating interaction features between these.",
+    "Weak features (|corr| < 0.05): BP, FBS over 120. Consider dropping or using only in interactions with stronger features.",
+    "Binary features (Sex, FBS over 120, Exercise angina) can be multiplied with top continuous features (Age, BP, Cholesterol) to create conditional interaction features."
+  ]
+}

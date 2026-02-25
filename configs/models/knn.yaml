@@ -30,10 +30,11 @@ hyperparameters:
     choices: [uniform, distance]
   metric:
     type: categorical
-    choices: [euclidean, manhattan, cosine]
+    choices: [euclidean, manhattan]      # cosine forces brute O(n²) — too slow on large data
 
 fixed_params:
   n_jobs: -1
+  algorithm: ball_tree                   # O(n log n) vs brute O(n²) — critical for 630K rows
 
 training:
   early_stopping: false
@@ -50,10 +51,12 @@ feature_requirements:
   handles_missing: false
 
 optuna:
-  n_trials: 30
-  qmc_warmup_ratio: 0.3
-  timeout: null
+  n_trials: 15                             # Only 3 hparams — 15 trials covers the space well
+  qmc_warmup_ratio: 0.1
+  timeout: 300                             # 5min hard cap — predict on 630K rows is expensive
   pruner:
-    type: none
+    type: median                           # Prune slow/bad configs after 3 folds
+    n_warmup_steps: 3
+    n_startup_trials: 5
   n_top_trials: 1
   n_seeds: 1

@@ -1,0 +1,33 @@
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+models:
+  - realmlp
+  - ridge
+
+overrides:
+  realmlp:
+    hidden_sizes:
+      type: int_list
+      n: 2
+      low: 8
+      high: 32
+    lr:
+      low: 0.005
+      high: 0.08
+    batch_size:
+      choices: [4096, 8000, 16000]
+    n_epochs:
+      type: fixed
+      value: 5
+
+
+reasoning: >
+  Quick RealMLP test run: 2 models, 3 folds, minimal Optuna trials.
+  Validates GPU training, OOF collection, and ensemble pipeline.

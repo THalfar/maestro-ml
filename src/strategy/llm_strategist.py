@@ -157,6 +157,9 @@ def _call_llm_api(prompt: str, config: dict) -> str:
     max_retries = 3
     last_exc = None
 
+    if provider not in ("anthropic", "openai"):
+        raise ValueError(f"Unknown provider: '{provider}'")
+
     for attempt in range(max_retries):
         try:
             if provider == "anthropic":
@@ -169,7 +172,7 @@ def _call_llm_api(prompt: str, config: dict) -> str:
                 )
                 return message.content[0].text
 
-            elif provider == "openai":
+            else:  # openai
                 import openai
                 client = openai.OpenAI(api_key=api_key)
                 response = client.chat.completions.create(
@@ -178,9 +181,6 @@ def _call_llm_api(prompt: str, config: dict) -> str:
                     messages=[{"role": "user", "content": prompt}],
                 )
                 return response.choices[0].message.content
-
-            else:
-                raise ValueError(f"Unknown provider: '{provider}'")
 
         except Exception as exc:
             last_exc = exc
@@ -489,14 +489,15 @@ def run_manual_mode(
     eda_text_path.write_text(formatted_eda, encoding="utf-8")
     print(f"\n[EDA report also saved to: {eda_text_path}]")
 
+    prompt_file = Path("prompts/strategy_prompt.md")
     print("\n" + "=" * 60)
     print("MANUAL STRATEGY MODE")
     print("=" * 60)
     print("Instructions:")
-    print("  1. Copy the EDA report above (or from the saved file).")
-    print("  2. Paste it into Claude or ChatGPT with this prompt:")
-    print('     "Analyze this EDA report and produce a YAML strategy for')
-    print('     feature engineering and model selection."')
+    print(f"  1. Open the strategy prompt:  {prompt_file}")
+    print(f"     Copy the full prompt into Claude / ChatGPT.")
+    print(f"  2. Replace [PASTE EDA REPORT HERE] with the EDA report above")
+    print(f"     (or from: {eda_text_path})")
     print(f"  3. Save the LLM's YAML response to: {output_path}")
     print("  4. Press Enter here when done.")
     print("=" * 60)
@@ -511,9 +512,14 @@ def run_manual_mode(
 
     strategy = load_yaml(output_path)
 
-    # Validate (best-effort — don't crash if we can't get available models)
+    configs_dir = Path("configs/models")
+    available_models = (
+        [p.stem for p in sorted(configs_dir.glob("*.yaml"))]
+        if configs_dir.exists()
+        else []
+    )
     try:
-        _validate_strategy(strategy, available_models=list(strategy.get("models", [])))
+        _validate_strategy(strategy, available_models=available_models)
     except ValueError as exc:
         logger.warning(f"Strategy validation warning: {exc}")
 

@@ -16,6 +16,9 @@ data:
   target_column: "target"
   id_column: "id"
   task_type: "binary_classification"
+  # target_mapping:              # Uncomment if target is string-valued
+  #   Positive: 1               # Maps string labels → numeric (0/1)
+  #   Negative: 0
 
 cv:
   n_folds: 10
@@ -38,7 +41,12 @@ models:
   - xgboost
   - lightgbm
   - ridge
+  - elastic_net
   - knn
+  - svm
+  - gaussian_nb
+  - realmlp
+  - adaboost
   - random_forest
   - extra_trees
 
@@ -61,6 +69,9 @@ ensemble:
 optuna:
   global_seed: 42
   global_timeout: null
+  # model_timeouts:        # per-model Optuna timeout (overrides model YAML)
+  #   catboost: "3h"       # supports: seconds (7200), or "2h", "30m", "1h30m"
+  #   lightgbm: "2h"
 
 runtime:
   gpu_check: true

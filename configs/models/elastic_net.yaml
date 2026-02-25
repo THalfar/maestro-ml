@@ -1,0 +1,70 @@
+# =============================================================================
+# Elastic Net Configuration — maestro-ml
+# =============================================================================
+# Linear model with L1 + L2 regularization. The L1 component provides
+# automatic feature selection (sparse weights), unlike Ridge which only
+# uses L2. Different solution from Ridge — adds diversity in ensembles.
+#
+# Classification uses SGDClassifier with log_loss (logistic regression
+# via SGD) so that both tasks share the same alpha/l1_ratio parameters.
+# Regression uses sklearn's ElasticNet directly.
+# =============================================================================
+
+name: Elastic Net
+class_path:
+  binary_classification: sklearn.linear_model.SGDClassifier
+  regression: sklearn.linear_model.ElasticNet
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: false
+  params: {}
+  fallback: {}
+  install_notes: CPU-only sklearn model.
+
+hyperparameters:
+  alpha:
+    type: float
+    low: 0.0001
+    high: 10.0
+    log: true
+  l1_ratio:
+    type: float
+    low: 0.05
+    high: 0.95
+
+fixed_params:
+  binary_classification:
+    loss: log_loss
+    penalty: elasticnet
+    max_iter: 5000
+    tol: 0.001
+    random_state: 42
+  regression:
+    max_iter: 2000
+    random_state: 42
+
+training:
+  early_stopping: false
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_state
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: true
+  handles_categorical: false
+  handles_missing: false
+
+optuna:
+  n_trials: 15
+  qmc_warmup_ratio: 0.1
+  timeout: null
+  pruner:
+    type: none
+  n_top_trials: 1
+  n_seeds: 1

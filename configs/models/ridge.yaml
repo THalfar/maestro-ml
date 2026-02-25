@@ -29,11 +29,11 @@ hyperparameters:
 
 fixed_params:
   binary_classification:
-    max_iter: 2000
+    max_iter: 10000
     solver: lbfgs
     random_state: 42
   regression:
-    max_iter: 2000
+    max_iter: 10000
 
 training:
   early_stopping: false
@@ -50,8 +50,8 @@ feature_requirements:
   handles_missing: false
 
 optuna:
-  n_trials: 50
-  qmc_warmup_ratio: 0.3
+  n_trials: 15
+  qmc_warmup_ratio: 0.1
   timeout: null
   pruner:
     type: none

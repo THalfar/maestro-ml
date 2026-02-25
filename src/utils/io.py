@@ -58,7 +58,7 @@ class EnsembleConfig:
     blend_trials: int = 500
     meta_trials: int = 100
     nsga2_trials: int = 300
-    diversity_weight: float = 0.3
+    diversity_weight: float | list[float] = 0.3
 
 
 @dataclass
@@ -67,6 +67,7 @@ class OptunaGlobalConfig:
 
     global_seed: int = 42
     global_timeout: Optional[int] = None
+    model_timeouts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -113,6 +114,7 @@ class PipelineConfig:
     target_column: str = ""
     id_column: str = ""
     task_type: str = "binary_classification"
+    target_mapping: dict[str, int] | None = None
     cv: CVConfig = field(default_factory=CVConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     models: list[str] = field(default_factory=list)
@@ -167,6 +169,41 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
+# Time Parsing
+# ---------------------------------------------------------------------------
+
+def parse_timeout(value: int | str | None) -> int | None:
+    """Parse a timeout value that can be seconds (int) or a human string.
+
+    Supported formats: 7200, "7200", "2h", "30m", "1h30m", "90s".
+    Returns seconds as int, or None if value is None/empty.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    import re
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    # Pure number string
+    if s.isdigit():
+        return int(s)
+    total = 0
+    pattern = re.compile(r"(\d+(?:\.\d+)?)\s*([hms])")
+    for match in pattern.finditer(s):
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit == "h":
+            total += amount * 3600
+        elif unit == "m":
+            total += amount * 60
+        else:
+            total += amount
+    return int(total) if total > 0 else None
+
+
+# ---------------------------------------------------------------------------
 # YAML Loading
 # ---------------------------------------------------------------------------
 
@@ -193,7 +230,7 @@ def load_yaml(path: str | Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"YAML file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 
 def load_pipeline_config(path: str | Path) -> PipelineConfig:
@@ -261,9 +298,16 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         diversity_weight=ensemble_raw.get("diversity_weight", 0.3),
     )
 
+    raw_timeouts = optuna_raw.get("model_timeouts", {}) or {}
+    model_timeouts = {
+        name: parse_timeout(val) for name, val in raw_timeouts.items()
+        if parse_timeout(val) is not None
+    }
+
     optuna = OptunaGlobalConfig(
         global_seed=optuna_raw.get("global_seed", 42),
         global_timeout=optuna_raw.get("global_timeout", None),
+        model_timeouts=model_timeouts,
     )
 
     runtime = RuntimeConfig(
@@ -279,12 +323,20 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         save_oof=output_raw.get("save_oof", True),
     )
 
+    target_mapping_raw = data.get("target_mapping")
+    target_mapping = (
+        {str(k): int(v) for k, v in target_mapping_raw.items()}
+        if target_mapping_raw
+        else None
+    )
+
     return PipelineConfig(
         train_path=data.get("train_path", ""),
         test_path=data.get("test_path", ""),
         target_column=data.get("target_column", ""),
         id_column=data.get("id_column", ""),
         task_type=data.get("task_type", "binary_classification"),
+        target_mapping=target_mapping,
         cv=cv,
         strategy=strategy,
         models=raw.get("models", []) or [],
@@ -451,5 +503,8 @@ def setup_logging(verbose: int = 1) -> logging.Logger:
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+    else:
+        for h in logger.handlers:
+            h.setLevel(level)
 
     return logger

@@ -68,9 +68,27 @@ Viz: matplotlib, seaborn
 Scientific: scipy
 Testing: pytest
 
+## Shell & Python Environment
+
+- **Shell: Git Bash on Windows** — NOT PowerShell, NOT cmd.exe
+- **Always use Unix-style paths**: `/c/Users/...` never `C:\Users\...`
+- **Conda environment**: `maestro`
+- **Project root**: `/c/Projektit/maestro-ml`
+
+Run Python scripts:
+```bash
+conda run -n maestro python script.py
+conda run -n maestro python check_imports.py
+```
+
+Run tests:
+```bash
+conda run -n maestro pytest tests/ -v
+```
+
 ## Testing
 
-- Run tests: `pytest`
+- Run tests: `conda run -n maestro pytest tests/ -v`
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module should get its own test file in a `tests/` directory
 
@@ -85,8 +103,8 @@ model = registry.get_model("catboost", hparams={"depth": 6}, gpu=True)
 
 ### Running the pipeline
 ```bash
-python run.py --config configs/templates/binary_classification.yaml
-python run.py --config pipeline.yaml --strategy manual
+conda run -n maestro python run.py --config configs/templates/binary_classification.yaml
+conda run -n maestro python run.py --config pipeline.yaml --strategy manual
 ```
 
 ## File Structure Quick Reference

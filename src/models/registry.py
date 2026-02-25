@@ -205,8 +205,14 @@ class ModelRegistry:
 
         if overrides:
             for param_name, override_spec in overrides.items():
-                if param_name in space:
-                    space[param_name].update(override_spec)
+                if isinstance(override_spec, dict):
+                    if param_name in space:
+                        space[param_name].update(override_spec)
+                    else:
+                        space[param_name] = override_spec
+                else:
+                    # Scalar override → fix the parameter to that value
+                    space[param_name] = {"type": "fixed", "value": override_spec}
 
         return space
 

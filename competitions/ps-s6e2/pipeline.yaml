@@ -1,7 +1,7 @@
 # =============================================================================
 # Kaggle Playground Series S6E2 — Heart Disease Prediction
 # =============================================================================
-# Binary classification: predict HeartDisease (0/1)
+# Binary classification: predict HeartDisease (Presence/Absence → 1/0)
 # Features: Age, Sex, Chest pain type, BP, Cholesterol, FBS over 120,
 #   EKG results, Max HR, Exercise angina, ST depression, Slope of ST,
 #   Number of vessels fluro, Thallium
@@ -13,9 +13,12 @@ data:
   target_column: "Heart Disease"
   id_column: "id"
   task_type: "binary_classification"
+  target_mapping:
+    Presence: 1
+    Absence: 0
 
 cv:
-  n_folds: 10
+  n_folds: 5
   seed: 42
   stratified: true
 
@@ -31,13 +34,16 @@ strategy:
     strategy_input_path: "competitions/ps-s6e2/strategy_output.yaml"
 
 models:
+  - realmlp
   - catboost
   - xgboost
-  - lightgbm
   - ridge
-  - knn
-  - random_forest
-  - extra_trees
+  - elastic_net
+  - knn  
+  - gaussian_nb
+  - adaboost
+  
+  
 
 features:
   interactions: []
@@ -49,21 +55,28 @@ features:
   custom: []
 
 ensemble:
-  strategy: "auto"
-  blend_trials: 500
-  meta_trials: 100
-  nsga2_trials: 300
-  diversity_weight: 0.3
+  strategy: "nsga2"
+  nsga2_trials: 15000
+  diversity_weight: [0.3, 0.4, 0.5]
 
 optuna:
   global_seed: 42
   global_timeout: null
+  model_timeouts:          # 10h yöajo — RTX 5090 (+ ~30min ensemble/retrain)
+    realmlp: "4h"          # GPU neural net — 1000 trials, top 20 diversiteetti
+    catboost: "2h"         # GPU boosting — paras single model
+    xgboost: "1h15m"       # GPU boosting — matala depth, diversiteetti CB:stä    
+    adaboost: "30m"        # hidas sklearn
+    ridge: "10m"           # lineaarinen, konvergoi nopeasti
+    elastic_net: "10m"     # lineaarinen
+    knn: "10m"             # distance calc
+    gaussian_nb: "5m"      # triviaali
 
 runtime:
   gpu_check: true
   gpu_fallback: true
   n_jobs: -1
-  verbose: 1
+  verbose: 2
 
 output:
   submission_path: "competitions/ps-s6e2/results/submission.csv"

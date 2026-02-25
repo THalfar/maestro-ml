@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell.exe -Command \"Set-Location ''C:\\\\Projektit\\\\maestro-ml''; & ''C:\\\\Users\\\\tobia\\\\condamini3\\\\envs\\\\maestro\\\\python.exe'' check_imports.py; exit $LASTEXITCODE\")",
+      "Bash(conda run -n maestro pytest:*)",
+      "Bash(conda run:*)",
+      "Bash(python:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:openreview.net)",
+      "Bash(wc -l:*)"
+    ]
+  }
+}
