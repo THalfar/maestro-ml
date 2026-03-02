@@ -57,20 +57,21 @@ features:
 ensemble:
   strategy: "nsga2"
   nsga2_trials: 15000
-  diversity_weight: [0.3, 0.4, 0.5]
+  diversity_weight: 0.3
+  
 
 optuna:
   global_seed: 42
   global_timeout: null
-  model_timeouts:          # 10h yöajo — RTX 5090 (+ ~30min ensemble/retrain)
-    realmlp: "4h"          # GPU neural net — 1000 trials, top 20 diversiteetti
-    catboost: "2h"         # GPU boosting — paras single model
-    xgboost: "1h15m"       # GPU boosting — matala depth, diversiteetti CB:stä    
-    adaboost: "30m"        # hidas sklearn
-    ridge: "10m"           # lineaarinen, konvergoi nopeasti
-    elastic_net: "10m"     # lineaarinen
-    knn: "10m"             # distance calc
-    gaussian_nb: "5m"      # triviaali
+  model_timeouts:          # 8h ajo — RTX 5090 (~7h30m Optuna + 30min ensemble/retrain)
+    realmlp: "5h"       # GPU neural net — nopein GPU-malli, eniten hyötyä ajasta
+    catboost: "1h30m"         # GPU boosting — paras single model, pidetään täytenä
+    xgboost: "1h30m"          # GPU boosting — vähennetty 15min CB:n hyväksi
+    adaboost: "20m"        # hidas sklearn — riittää konvergenssiin
+    ridge: "8m"            # lineaarinen, konvergoi nopeasti
+    elastic_net: "8m"      # lineaarinen
+    knn: "8m"              # distance calc
+    gaussian_nb: "4m"      # triviaali, <50 trialia riittää
 
 runtime:
   gpu_check: true

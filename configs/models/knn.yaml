@@ -52,7 +52,7 @@ feature_requirements:
 
 optuna:
   n_trials: 15                             # Only 3 hparams — 15 trials covers the space well
-  qmc_warmup_ratio: 0.1
+  qmc_warmup_trials: 5
   timeout: 300                             # 5min hard cap — predict on 630K rows is expensive
   pruner:
     type: median                           # Prune slow/bad configs after 3 folds

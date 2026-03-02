@@ -91,6 +91,7 @@ from src.ensemble.diversity import (
     compute_correlation_matrix,
     run_nsga2_ensemble,
     select_from_pareto,
+    log_fold_diversity,
     print_diversity_report,
 )
 from src.strategy.llm_strategist import generate_strategy
@@ -224,6 +225,13 @@ def main(pipeline_yaml_path: str | Path) -> None:
         f"EDA complete: train={dataset_info.get('train_shape')}, "
         f"test={dataset_info.get('test_shape')}"
     )
+
+    # Apply log1p to target (e.g. for RMSLE competitions like House Prices)
+    if pipeline_config.log_transform_target:
+        target_col = pipeline_config.target_column
+        logger.info(f"Applying log1p transform to target '{target_col}'")
+        train[target_col] = np.log1p(train[target_col])
+
     # Log top 5 correlated features
     sorted_cols = sorted(
         eda_report.get("columns", {}).items(),
@@ -389,27 +397,89 @@ def main(pipeline_yaml_path: str | Path) -> None:
             diversity_weight=dw_values[0],
             seed=seed,
             labels=model_labels,
+            diversity_metric=ensemble_cfg.diversity_metric,
         )
         sel = first_info["selected_models"]
         wts = first_info["weights"]
-        final_oof = apply_blend([all_oof[i] for i in sel], wts)
-        final_test_preds = first_test
+        nsga2_blend_oof = apply_blend([all_oof[i] for i in sel], wts)
+        nsga2_blend_test = first_test
+
+        # Log selected models compactly
+        logger.info(
+            f"NSGA-II selected {len(sel)}/{len(all_oof)} arrays: "
+            + ", ".join(
+                f"{model_labels[sel[j]]}({wts[j]:.3f})"
+                for j in range(len(sel))
+            )
+        )
+
+        # Chain: train meta-model on NSGA-II selected models
+        sel_oof = [all_oof[i] for i in sel]
+        sel_test = [all_test[i] for i in sel]
+        sel_labels = [model_labels[i] for i in sel]
+        try:
+            meta_oof, meta_test = train_meta_model(
+                sel_oof, sel_test, y_true,
+                n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type,
+            )
+            # Compare: NSGA-II linear blend vs meta-model stacking
+            if task_type != "regression":
+                blend_score = roc_auc_score(y_true, nsga2_blend_oof)
+                meta_score = roc_auc_score(y_true, meta_oof)
+            else:
+                blend_score = -float(np.sqrt(mean_squared_error(y_true, nsga2_blend_oof)))
+                meta_score = -float(np.sqrt(mean_squared_error(y_true, meta_oof)))
+
+            logger.info(
+                f"NSGA-II blend vs meta-stacking: "
+                f"blend={blend_score:.6f}, meta={meta_score:.6f}"
+            )
+            if meta_score > blend_score:
+                final_oof = meta_oof
+                final_test_preds = meta_test
+                chosen_strategy = "nsga2+meta"
+                logger.info("  -> Meta-stacking wins!")
+            else:
+                final_oof = nsga2_blend_oof
+                final_test_preds = nsga2_blend_test
+                chosen_strategy = "nsga2+blend"
+                logger.info("  -> Linear blend wins!")
+        except Exception as exc:
+            logger.warning(f"Meta-stacking on NSGA-II selection failed: {exc}")
+            final_oof = nsga2_blend_oof
+            final_test_preds = nsga2_blend_test
+            chosen_strategy = "nsga2+blend"
 
         # Re-select from same Pareto front for additional weights
         nsga2_submissions: dict[float, tuple[np.ndarray, dict]] = {
             dw_values[0]: (first_test, first_info),
         }
         if len(dw_values) > 1:
-            pareto_trials = first_info["pareto_trials"]
+            pareto_data = first_info["pareto_trials"]
             for dw in dw_values[1:]:
                 extra_test, extra_info = select_from_pareto(
-                    pareto_trials, all_oof, all_test, y_true,
+                    pareto_data["F"], pareto_data["X"],
+                    all_oof, all_test, y_true,
                     n_models=len(all_oof),
                     diversity_weight=dw,
                     metric=metric,
                     labels=model_labels,
                 )
                 nsga2_submissions[dw] = (extra_test, extra_info)
+
+        # Fold-level diversity diagnostics for primary selection
+        if len(sel) > 1:
+            fold_val_indices = [
+                val_idx for _, val_idx in cv_folds.split(
+                    train_feat[feature_cols], y_true
+                )
+            ]
+            sel_oofs = [all_oof[i] for i in sel]
+            sel_labels = [model_labels[i] for i in sel]
+            log_fold_diversity(
+                sel_oofs, y_true, fold_val_indices,
+                weights=wts, metric=metric, labels=sel_labels,
+            )
 
     else:  # 'auto' — try all, pick best
         candidates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -443,6 +513,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
                 diversity_weight=_auto_dw,
                 seed=seed,
                 labels=model_labels,
+                diversity_metric=ensemble_cfg.diversity_metric,
             )
             sel = nsga2_info["selected_models"]
             wts = nsga2_info["weights"]
@@ -493,6 +564,11 @@ def main(pipeline_yaml_path: str | Path) -> None:
     else:
         test_ids = test.index.to_series()
 
+    # Reverse log1p → expm1 before saving predictions
+    if pipeline_config.log_transform_target:
+        logger.info("Applying expm1 (inverse log1p) to final predictions")
+        final_test_preds = np.expm1(final_test_preds)
+
     base_sub_path = Path(pipeline_config.output.submission_path)
     submission_paths: list[str] = []
 
@@ -504,6 +580,8 @@ def main(pipeline_yaml_path: str | Path) -> None:
     ):
         for dw in sorted(nsga2_submissions.keys()):
             dw_test, dw_info = nsga2_submissions[dw]
+            if pipeline_config.log_transform_target:
+                dw_test = np.expm1(dw_test)
             dw_path = base_sub_path.parent / f"{base_sub_path.stem}_dw{dw:.2f}{base_sub_path.suffix}"
             save_submission(
                 ids=test_ids,
@@ -528,7 +606,8 @@ def main(pipeline_yaml_path: str | Path) -> None:
 
     if pipeline_config.output.save_oof:
         oof_path = results_dir / "oof_predictions.npy"
-        np.save(str(oof_path), final_oof)
+        oof_to_save = np.expm1(final_oof) if pipeline_config.log_transform_target else final_oof
+        np.save(str(oof_path), oof_to_save)
         logger.info(f"OOF predictions saved: {oof_path}")
 
     total_elapsed = time.time() - pipeline_start

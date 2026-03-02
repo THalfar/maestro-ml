@@ -1,0 +1,77 @@
+# =============================================================================
+# Kaggle House Prices — Advanced Regression Techniques
+# =============================================================================
+# Regression: predict SalePrice (log1p-transformed → RMSLE metric)
+# Dataset: 1460 train / 1459 test, 79 features (numeric + categorical)
+# Evaluation: RMSLE (Root Mean Squared Log Error)
+# =============================================================================
+
+data:
+  train_path: "competitions/house_prices/train.csv"
+  test_path: "competitions/house_prices/test.csv"
+  target_column: "SalePrice"
+  id_column: "Id"
+  task_type: "regression"
+  log_transform_target: true        # log1p(SalePrice) → optimoi RMSLE:tä
+
+cv:
+  n_folds: 5
+  seed: 42
+  stratified: false                  # KFold regression
+
+strategy:
+  mode: "api"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-6"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "competitions/house_prices/results/eda_report.txt"
+    strategy_input_path: "competitions/house_prices/strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - ridge
+  - elastic_net
+  - random_forest
+  - extra_trees
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "nsga2"
+  nsga2_trials: 15000
+  diversity_weight: [0.3, 0.4, 0.5]
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+  model_timeouts:
+    catboost: "45m"       # GPU boosting — paras single model
+    xgboost: "30m"        # GPU boosting
+    lightgbm: "30m"       # CPU, hyvin optimoitu
+    ridge: "5m"           # lineaarinen, konvergoi nopeasti
+    elastic_net: "5m"     # lineaarinen
+    random_forest: "20m"  # hidas sklearn, riittää ~100 trialia
+    extra_trees: "15m"    # nopeampi kuin RF
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 2
+
+output:
+  submission_path: "competitions/house_prices/results/submission.csv"
+  results_dir: "competitions/house_prices/results/"
+  save_oof: true

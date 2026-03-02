@@ -59,6 +59,7 @@ class EnsembleConfig:
     meta_trials: int = 100
     nsga2_trials: int = 300
     diversity_weight: float | list[float] = 0.3
+    diversity_metric: str = "pearson_neff"
 
 
 @dataclass
@@ -115,6 +116,7 @@ class PipelineConfig:
     id_column: str = ""
     task_type: str = "binary_classification"
     target_mapping: dict[str, int] | None = None
+    log_transform_target: bool = False
     cv: CVConfig = field(default_factory=CVConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     models: list[str] = field(default_factory=list)
@@ -130,7 +132,7 @@ class OptunaModelConfig:
     """Per-model Optuna study configuration."""
 
     n_trials: int = 150
-    qmc_warmup_ratio: float = 0.3
+    qmc_warmup_trials: int = 50
     timeout: Optional[int] = None
     pruner: dict[str, Any] = field(default_factory=lambda: {
         "type": "median",
@@ -296,6 +298,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         meta_trials=ensemble_raw.get("meta_trials", 100),
         nsga2_trials=ensemble_raw.get("nsga2_trials", 300),
         diversity_weight=ensemble_raw.get("diversity_weight", 0.3),
+        diversity_metric=ensemble_raw.get("diversity_metric", "pearson_neff"),
     )
 
     raw_timeouts = optuna_raw.get("model_timeouts", {}) or {}
@@ -337,6 +340,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         id_column=data.get("id_column", ""),
         task_type=data.get("task_type", "binary_classification"),
         target_mapping=target_mapping,
+        log_transform_target=bool(data.get("log_transform_target", False)),
         cv=cv,
         strategy=strategy,
         models=raw.get("models", []) or [],
@@ -373,7 +377,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
     optuna_raw = raw.get("optuna", {})
     optuna = OptunaModelConfig(
         n_trials=optuna_raw.get("n_trials", 150),
-        qmc_warmup_ratio=optuna_raw.get("qmc_warmup_ratio", 0.3),
+        qmc_warmup_trials=optuna_raw.get("qmc_warmup_trials", 50),
         timeout=optuna_raw.get("timeout", None),
         pruner=optuna_raw.get("pruner", {"type": "median", "n_warmup_steps": 3, "n_startup_trials": 10}),
         n_top_trials=optuna_raw.get("n_top_trials", 5),

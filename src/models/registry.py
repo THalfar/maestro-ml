@@ -172,6 +172,7 @@ class ModelRegistry:
         self,
         name: str,
         overrides: dict[str, dict[str, Any]] | None = None,
+        task_type: str = "binary_classification",
     ) -> dict[str, dict[str, Any]]:
         """Get the Optuna search space definition for a model.
 
@@ -203,6 +204,13 @@ class ModelRegistry:
         config = self._configs[name]
         space = copy.deepcopy(config.hyperparameters)
 
+        # Handle task-type-specific hyperparameters (e.g., ridge.yaml).
+        # Same detection logic as fixed_params: if all top-level keys are
+        # known task_type strings, select the sub-dict for this task.
+        _TASK_TYPES = {"binary_classification", "multiclass", "regression"}
+        if space and isinstance(space, dict) and set(space.keys()) <= _TASK_TYPES:
+            space = space.get(task_type, {}) or {}
+
         if overrides:
             for param_name, override_spec in overrides.items():
                 if isinstance(override_spec, dict):
@@ -223,7 +231,7 @@ class ModelRegistry:
             name: Registered model name.
 
         Returns:
-            Dictionary with n_trials, qmc_warmup_ratio, timeout, pruner,
+            Dictionary with n_trials, qmc_warmup_trials, timeout, pruner,
             n_top_trials, n_seeds (from the model's optuna YAML section).
 
         Steps:
@@ -236,7 +244,7 @@ class ModelRegistry:
         optuna_cfg = self._configs[name].optuna
         return {
             "n_trials": optuna_cfg.n_trials,
-            "qmc_warmup_ratio": optuna_cfg.qmc_warmup_ratio,
+            "qmc_warmup_trials": optuna_cfg.qmc_warmup_trials,
             "timeout": optuna_cfg.timeout,
             "pruner": optuna_cfg.pruner,
             "n_top_trials": optuna_cfg.n_top_trials,

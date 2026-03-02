@@ -6,4 +6,5 @@ filterwarnings = [
     "ignore:.*LeafSpec.*:DeprecationWarning",
     "ignore:.*torch.jit.script.*:DeprecationWarning",
     "ignore::optuna.exceptions.ExperimentalWarning",
+    "ignore:.*cKDTree.*:DeprecationWarning",
 ]

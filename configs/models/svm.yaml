@@ -58,7 +58,7 @@ feature_requirements:
 
 optuna:
   n_trials: 40
-  qmc_warmup_ratio: 0.3
+  qmc_warmup_trials: 12
   timeout: null
   pruner:
     type: none

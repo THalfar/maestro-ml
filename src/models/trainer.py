@@ -106,14 +106,14 @@ def run_optuna_study(
     """
     optuna_cfg = registry.get_optuna_config(model_name)
 
-    # Search space with optional LLM overrides
-    overrides_all = strategy.get("overrides", {}) or {}
-    model_overrides = overrides_all.get(model_name, None)
-    search_space = registry.get_search_space(model_name, overrides=model_overrides)
-
     # CV splitter
     cv_cfg = pipeline_config.cv
     task_type = pipeline_config.task_type
+
+    # Search space with optional LLM overrides
+    overrides_all = strategy.get("overrides", {}) or {}
+    model_overrides = overrides_all.get(model_name, None)
+    search_space = registry.get_search_space(model_name, overrides=model_overrides, task_type=task_type)
     if cv_cfg.stratified and task_type != "regression":
         cv = StratifiedKFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
     else:
@@ -161,7 +161,7 @@ def run_optuna_study(
         study=study,
         objective=objective,
         n_trials=optuna_cfg["n_trials"],
-        qmc_warmup_ratio=optuna_cfg["qmc_warmup_ratio"],
+        qmc_warmup_trials=optuna_cfg["qmc_warmup_trials"],
         timeout=effective_timeout,
         global_seed=pipeline_config.optuna.global_seed,
         verbose=pipeline_config.runtime.verbose,
@@ -284,6 +284,20 @@ def _create_objective(
                     )
                     for i in range(n_elements)
                 ]
+            elif param_type == "dynamic_int_list":
+                # Suggest variable-length list: first choose length, then values.
+                # YAML: hidden_sizes: {type: dynamic_int_list, n_min: 1, n_max: 3, low: 4, high: 256}
+                n_min = int(spec["n_min"])
+                n_max = int(spec["n_max"])
+                low = int(spec["low"])
+                high = int(spec["high"])
+                n_layers = trial.suggest_int(f"{param_name}_n", n_min, n_max)
+                hparams[param_name] = [
+                    trial.suggest_int(
+                        f"{param_name}_{i}", low, high, log=use_log
+                    )
+                    for i in range(n_layers)
+                ]
 
         # Add eval_metric to constructor params where needed
         eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
@@ -370,7 +384,7 @@ def _run_two_phase_study(
     study: optuna.Study,
     objective: Callable[[optuna.Trial], float],
     n_trials: int,
-    qmc_warmup_ratio: float,
+    qmc_warmup_trials: int,
     timeout: int | None = None,
     global_seed: int = 42,
     verbose: int = 1,
@@ -388,13 +402,12 @@ def _run_two_phase_study(
         study: Optuna study object (already created with pruner).
         objective: Objective function to optimize.
         n_trials: Total number of trials (QMC + TPE combined).
-        qmc_warmup_ratio: Fraction of n_trials to use for QMC warmup
-                          (e.g., 0.3 means 30% QMC, 70% TPE).
+        qmc_warmup_trials: Number of QMC warmup trials (e.g. 50).
         timeout: Optional timeout in seconds for the entire study.
         global_seed: Seed for reproducibility.
 
     Steps:
-        1. Calculate n_qmc = int(n_trials * qmc_warmup_ratio).
+        1. Use n_qmc = qmc_warmup_trials directly.
         2. Calculate n_tpe = n_trials - n_qmc.
         3. Phase 1: Set study.sampler to QMCSampler(seed=global_seed).
            Run study.optimize(objective, n_trials=n_qmc, timeout=timeout).
@@ -403,7 +416,7 @@ def _run_two_phase_study(
            Run study.optimize(objective, n_trials=n_tpe, timeout=remaining).
         5. Log phase completion summaries.
     """
-    n_qmc = max(1, int(n_trials * qmc_warmup_ratio))
+    n_qmc = max(1, qmc_warmup_trials)
     n_tpe = max(1, n_trials - n_qmc)
 
     start_time = time.time()
@@ -636,20 +649,25 @@ def train_with_config(
 
 
 def _reassemble_int_lists(params: dict[str, Any]) -> dict[str, Any]:
-    """Reassemble int_list params (e.g. hidden_sizes_0, hidden_sizes_1) back into lists.
+    """Reassemble int_list / dynamic_int_list params back into lists.
 
     Optuna stores them as separate keys. This function detects the pattern
     ``<name>_0, <name>_1, ...`` and combines them into ``<name>: [v0, v1, ...]``.
+    For dynamic_int_list, ``<name>_n`` holds the layer count and is removed.
     """
     import re
-    # Find all keys matching the pattern <name>_<digit>
+    # Find all keys matching the pattern <name>_<digit> or <name>_n
     list_keys: dict[str, dict[int, Any]] = {}
+    n_keys: dict[str, int] = {}  # <name>_n from dynamic_int_list
     plain_keys: dict[str, Any] = {}
     for k, v in params.items():
         m = re.match(r"^(.+)_(\d+)$", k)
+        m_n = re.match(r"^(.+)_n$", k)
         if m:
             name, idx = m.group(1), int(m.group(2))
             list_keys.setdefault(name, {})[idx] = v
+        elif m_n:
+            n_keys[m_n.group(1)] = v
         else:
             plain_keys[k] = v
 
@@ -663,6 +681,10 @@ def _reassemble_int_lists(params: dict[str, Any]) -> dict[str, Any]:
             # Not a complete sequence, keep as separate keys
             for idx, val in idx_map.items():
                 result[f"{name}_{idx}"] = val
+    # Drop _n keys that were already consumed (dynamic_int_list)
+    for name in n_keys:
+        if name not in result:
+            result[f"{name}_n"] = n_keys[name]
     return result
 
 

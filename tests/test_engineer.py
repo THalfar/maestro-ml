@@ -318,6 +318,75 @@ class TestBuildFeatures:
             "docstring step 1 requires copies to prevent caller-side mutation"
         )
 
+    def test_string_columns_are_encoded(self):
+        """build_features must ordinal-encode all string/object columns to numeric."""
+        rng = np.random.default_rng(42)
+        n = 60
+        train = pd.DataFrame({
+            "num_a": rng.normal(0, 1, n),
+            "cat_str": rng.choice(["Grvl", "Pave", "Dirt"], n),
+            "target": rng.choice([0, 1], n).astype(float),
+        })
+        test = pd.DataFrame({
+            "num_a": rng.normal(0, 1, 20),
+            "cat_str": rng.choice(["Pave", "Grvl"], 20),
+        })
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train, test, strategy, target_col="target")
+
+        str_cols_out = train_out.select_dtypes(include=["object", "string"]).columns.tolist()
+        assert len(str_cols_out) == 0, f"String columns remain in train: {str_cols_out}"
+        assert pd.api.types.is_numeric_dtype(train_out["cat_str"])
+        assert pd.api.types.is_numeric_dtype(test_out["cat_str"])
+
+    def test_string_columns_not_in_original(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        """Ordinal encoding must not mutate original DataFrames."""
+        # train_df fixture has cat_x, cat_y as object dtype
+        original_dtype = train_df["cat_x"].dtype
+        strategy = {"features": {}}
+        build_features(train_df, test_df, strategy)
+        assert train_df["cat_x"].dtype == original_dtype
+
+    def test_unknown_test_categories_get_minus_one(self):
+        """Unknown categories in test set should be encoded as -1."""
+        rng = np.random.default_rng(42)
+        n = 60
+        train = pd.DataFrame({
+            "cat": rng.choice(["A", "B"], n),
+            "target": rng.choice([0, 1], n).astype(float),
+        })
+        test = pd.DataFrame({"cat": ["C", "A", "B"]})  # C is unknown
+        strategy = {"features": {}}
+        _, test_out = build_features(train, test, strategy, target_col="target")
+        assert test_out["cat"].iloc[0] == -1.0, "Unknown category should be encoded as -1"
+        assert test_out["cat"].iloc[1] != -1.0, "Known category A should not be -1"
+
+    def test_many_string_columns_all_encoded(self):
+        """House Prices-like scenario: many mixed string and numeric columns."""
+        rng = np.random.default_rng(42)
+        n = 100
+        train = pd.DataFrame({
+            "LotArea": rng.integers(5000, 20000, n).astype(float),
+            "MSZoning": rng.choice(["RL", "RM", "C"], n),
+            "Neighborhood": rng.choice(["NAmes", "CollgCr", "OldTown"], n),
+            "ExterQual": rng.choice(["Ex", "Gd", "TA", "Fa"], n),
+            "SalePrice": rng.normal(200000, 50000, n),
+        })
+        test = pd.DataFrame({
+            "LotArea": rng.integers(5000, 20000, 30).astype(float),
+            "MSZoning": rng.choice(["RL", "RM"], 30),
+            "Neighborhood": rng.choice(["NAmes", "CollgCr"], 30),
+            "ExterQual": rng.choice(["Gd", "TA"], 30),
+        })
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train, test, strategy, target_col="SalePrice")
+
+        remaining = train_out.select_dtypes(include=["object", "string"]).columns.tolist()
+        assert remaining == [], f"String columns still present: {remaining}"
+        for col in ["MSZoning", "Neighborhood", "ExterQual"]:
+            assert pd.api.types.is_numeric_dtype(train_out[col]), f"{col} not numeric in train"
+            assert pd.api.types.is_numeric_dtype(test_out[col]), f"{col} not numeric in test"
+
 
 # ---------------------------------------------------------------------------
 # get_feature_columns

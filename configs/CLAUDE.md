@@ -65,7 +65,7 @@ feature_requirements:
 
 optuna:
   n_trials: 50
-  qmc_warmup_ratio: 0.3    # 30% QMC space-filling, then 70% TPE
+  qmc_warmup_trials: 15    # Number of QMC space-filling trials, then TPE
   n_top_trials: 5           # top configs to retrain with multiple seeds
   n_seeds: 3
   timeout: 1800             # seconds (None = unlimited)

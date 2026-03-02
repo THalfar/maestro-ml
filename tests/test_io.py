@@ -98,7 +98,7 @@ def sample_model_yaml(tmp_dir: Path) -> Path:
         "feature_requirements": {"needs_scaling": True},
         "optuna": {
             "n_trials": 30,
-            "qmc_warmup_ratio": 0.2,
+            "qmc_warmup_trials": 6,
             "timeout": 120,
             "pruner": {"type": "none"},
             "n_top_trials": 2,
@@ -224,7 +224,7 @@ class TestLoadModelConfig:
     def test_optuna_section(self, sample_model_yaml: Path):
         cfg = load_model_config(sample_model_yaml)
         assert cfg.optuna.n_trials == 30
-        assert cfg.optuna.qmc_warmup_ratio == 0.2
+        assert cfg.optuna.qmc_warmup_trials == 6
         assert cfg.optuna.timeout == 120
         assert cfg.optuna.n_top_trials == 2
 

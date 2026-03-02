@@ -51,7 +51,7 @@ feature_requirements:
 
 optuna:
   n_trials: 20                                 # fewer trials — diversity model, not primary
-  qmc_warmup_ratio: 0.1
+  qmc_warmup_trials: 5
   timeout: null
   pruner:
     type: none

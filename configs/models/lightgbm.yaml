@@ -79,11 +79,11 @@ feature_requirements:
 
 optuna:
   n_trials: 200
-  qmc_warmup_ratio: 0.3
+  qmc_warmup_trials: 60
   timeout: null
   pruner:
     type: median
     n_warmup_steps: 3
     n_startup_trials: 10
-  n_top_trials: 5
-  n_seeds: 3
+  n_top_trials: 10
+  n_seeds: 1

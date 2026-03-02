@@ -502,12 +502,16 @@ def run_manual_mode(
     print("  4. Press Enter here when done.")
     print("=" * 60)
 
-    input("\n>>> Press Enter when you have saved the strategy YAML... ")
+    try:
+        input("\n>>> Press Enter when you have saved the strategy YAML... ")
+    except EOFError:
+        # Non-interactive context (e.g. conda run). Proceed if file exists.
+        pass
 
     if not output_path.exists():
         raise FileNotFoundError(
             f"Strategy YAML not found at: {output_path}. "
-            "Please save the LLM's YAML response to that path and try again."
+            "Please save the LLM's YAML response to that path and run again."
         )
 
     strategy = load_yaml(output_path)

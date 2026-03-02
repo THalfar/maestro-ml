@@ -1,0 +1,88 @@
+# =============================================================================
+# Kaggle Playground Series S6E3 — Customer Churn Prediction
+# =============================================================================
+# Binary classification: predict Churn (Yes/No → 1/0)
+# Metric: AUC-ROC
+# Features: gender, SeniorCitizen, Partner, Dependents, tenure, PhoneService,
+#   MultipleLines, InternetService, OnlineSecurity, OnlineBackup,
+#   DeviceProtection, TechSupport, StreamingTV, StreamingMovies,
+#   Contract, PaperlessBilling, PaymentMethod, MonthlyCharges, TotalCharges
+# ~594k train rows, ~594k test rows
+# =============================================================================
+
+data:
+  train_path: "data/ps-s6e3/train.csv"
+  test_path: "data/ps-s6e3/test.csv"
+  target_column: "Churn"
+  id_column: "id"
+  task_type: "binary_classification"
+  target_mapping:
+    "Yes": 1
+    "No": 0
+
+cv:
+  n_folds: 5
+  seed: 42
+  stratified: true
+
+strategy:
+  mode: "manual"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "competitions/ps-s6e3/results/eda_report.txt"
+    strategy_input_path: "competitions/ps-s6e3/strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - realmlp
+  - ridge
+  - elastic_net
+  - knn
+  - gaussian_nb
+  - adaboost
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "nsga2"
+  nsga2_trials: 15000
+  diversity_weight: 0.3
+  diversity_metric: "spearman_neff"        # Spearman rank correlation — better for AUC (ranking metric)
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+  model_timeouts:
+    realmlp: "5h"
+    catboost: "1h30m"
+    xgboost: "45m"
+    lightgbm: "45m"
+    adaboost: "20m"
+    ridge: "8m"
+    elastic_net: "8m"
+    knn: "8m"
+    gaussian_nb: "4m"
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 2
+
+output:
+  submission_path: "competitions/ps-s6e3/results/submission.csv"
+  results_dir: "competitions/ps-s6e3/results/"
+  save_oof: true

@@ -21,11 +21,18 @@ gpu:
   install_notes: CPU-only sklearn model.
 
 hyperparameters:
-  C:
-    type: float
-    low: 0.001
-    high: 100.0
-    log: true
+  binary_classification:
+    C:
+      type: float
+      low: 0.001
+      high: 100.0
+      log: true
+  regression:
+    alpha:
+      type: float
+      low: 0.001
+      high: 100.0
+      log: true
 
 fixed_params:
   binary_classification:
@@ -51,7 +58,7 @@ feature_requirements:
 
 optuna:
   n_trials: 15
-  qmc_warmup_ratio: 0.1
+  qmc_warmup_trials: 5
   timeout: null
   pruner:
     type: none

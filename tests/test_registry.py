@@ -45,7 +45,7 @@ def model_configs_dir(tmp_path: Path) -> Path:
         },
         "optuna": {
             "n_trials": 20,
-            "qmc_warmup_ratio": 0.3,
+            "qmc_warmup_trials": 6,
             "timeout": None,
             "pruner": {"type": "none"},
             "n_top_trials": 1,
@@ -78,7 +78,7 @@ def model_configs_dir(tmp_path: Path) -> Path:
         },
         "optuna": {
             "n_trials": 30,
-            "qmc_warmup_ratio": 0.2,
+            "qmc_warmup_trials": 6,
             "n_top_trials": 3,
             "n_seeds": 2,
         },

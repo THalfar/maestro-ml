@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.preprocessing import OrdinalEncoder
 
 logger = logging.getLogger("maestro")
 
@@ -97,6 +98,24 @@ def build_features(
     if custom:
         train = _add_custom_features(train, custom, _copy=False)
         test = _add_custom_features(test, custom, _copy=False)
+
+    # Ordinal-encode any remaining string/object columns so all models
+    # receive numeric-only DataFrames. Fit on train, apply to test.
+    # NaN is filled with a placeholder string so the encoder sees consistent
+    # categories; the -1 sentinel is used for any unknown test values.
+    # Use select_dtypes for robust dtype detection; assign column-by-column
+    # to avoid pandas 2.0+ Copy-on-Write silent failures.
+    str_cols = train.select_dtypes(include=["object", "string"]).columns.tolist()
+    if str_cols:
+        train_str = train[str_cols].fillna("__missing__")
+        test_str = test[str_cols].fillna("__missing__")
+        enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+        encoded_train = enc.fit_transform(train_str)
+        encoded_test = enc.transform(test_str)
+        for i, col in enumerate(str_cols):
+            train[col] = encoded_train[:, i]
+            test[col] = encoded_test[:, i]
+        logger.info(f"Ordinal-encoded {len(str_cols)} string columns: {str_cols[:5]}{'...' if len(str_cols) > 5 else ''}")
 
     return train, test
 

@@ -15,6 +15,7 @@ from src.models.registry import ModelRegistry
 from src.models.trainer import (
     _compute_cv_metric,
     _get_eval_metric_value,
+    _reassemble_int_lists,
     get_top_configs,
     run_optuna_study,
     train_with_config,
@@ -54,7 +55,7 @@ def ridge_configs_dir(tmp_path: Path) -> Path:
         "feature_requirements": {"needs_scaling": True},
         "optuna": {
             "n_trials": 5,
-            "qmc_warmup_ratio": 0.4,
+            "qmc_warmup_trials": 2,
             "timeout": None,
             "pruner": {"type": "none"},
             "n_top_trials": 2,
@@ -303,3 +304,56 @@ class TestGetTopConfigs:
         top = get_top_configs(study, n_top=3)
         if len(top) >= 2:
             assert top[0]["value"] >= top[1]["value"]
+
+
+# ---------------------------------------------------------------------------
+# _reassemble_int_lists
+# ---------------------------------------------------------------------------
+
+class TestReassembleIntLists:
+    """Tests for int_list and dynamic_int_list reassembly."""
+
+    def test_fixed_int_list(self):
+        """Standard int_list: hidden_sizes_0, hidden_sizes_1 -> hidden_sizes: [v0, v1]."""
+        params = {"hidden_sizes_0": 128, "hidden_sizes_1": 64, "lr": 0.01}
+        result = _reassemble_int_lists(params)
+        assert result["hidden_sizes"] == [128, 64]
+        assert result["lr"] == 0.01
+        assert "hidden_sizes_0" not in result
+        assert "hidden_sizes_1" not in result
+
+    def test_dynamic_int_list_single_layer(self):
+        """dynamic_int_list with 1 layer: hidden_sizes_n=1, hidden_sizes_0=64."""
+        params = {"hidden_sizes_n": 1, "hidden_sizes_0": 64, "lr": 0.01}
+        result = _reassemble_int_lists(params)
+        assert result["hidden_sizes"] == [64]
+        assert result["lr"] == 0.01
+        assert "hidden_sizes_n" not in result
+
+    def test_dynamic_int_list_three_layers(self):
+        """dynamic_int_list with 3 layers."""
+        params = {
+            "hidden_sizes_n": 3,
+            "hidden_sizes_0": 256,
+            "hidden_sizes_1": 128,
+            "hidden_sizes_2": 32,
+            "batch_size": 8192,
+        }
+        result = _reassemble_int_lists(params)
+        assert result["hidden_sizes"] == [256, 128, 32]
+        assert result["batch_size"] == 8192
+        assert "hidden_sizes_n" not in result
+
+    def test_no_list_keys(self):
+        """Plain params pass through unchanged."""
+        params = {"lr": 0.01, "batch_size": 4096}
+        result = _reassemble_int_lists(params)
+        assert result == params
+
+    def test_incomplete_sequence_kept_separate(self):
+        """Keys like foo_0, foo_2 (missing foo_1) stay separate."""
+        params = {"foo_0": 10, "foo_2": 30}
+        result = _reassemble_int_lists(params)
+        assert "foo" not in result
+        assert result["foo_0"] == 10
+        assert result["foo_2"] == 30

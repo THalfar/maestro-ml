@@ -32,7 +32,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 ## Features
 
 - **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
-- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously. Correlation matrix eigenvalues compute effective ensemble size, preventing the common failure mode where ensembles collapse into near-identical models.
+- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously. Correlation matrix eigenvalues compute effective ensemble size, preventing the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression) and compared against the linear blend — the best wins automatically.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
 - **GPU auto-detection** — Per-model micro-trial detects CUDA availability at startup, with automatic CPU fallback.
@@ -149,7 +149,7 @@ The pipeline will:
 2. **Strategy** — Pause for you to generate a strategy YAML via LLM (manual mode). Use `prompts/strategy_prompt.md` as the LLM prompt template
 3. **Features** — Create interaction, ratio, and target-encoded features from the strategy
 4. **Optuna** — Run per-model hyperparameter optimization (QMC warmup + TPE)
-5. **Ensemble** — Try blend, rank average, meta-model, and NSGA-II; pick the best
+5. **Ensemble** — NSGA-II selects diverse models, then compares linear blend vs meta-model stacking; picks the best on OOF score
 6. **Output** — Save `submission.csv` and OOF predictions with full timing breakdown
 
 ### 4. Submit
@@ -204,7 +204,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - Optimized weighted blend (Optuna)
 - Rank averaging
 - Meta-model stacking (LogisticRegression/Ridge with logit features)
-- NSGA-II diversity-aware selection
+- NSGA-II diversity-aware selection → meta-model stacking chain (best of blend vs stacking)
 - Auto mode: tries all strategies, picks the best on OOF score
 
 ---
@@ -216,7 +216,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 | CatBoost | CUDA | eval_set | Native categoricals, ordered boosting |
 | XGBoost | CUDA | eval_set | `device="cuda"` (v2.0+) |
 | LightGBM | Special build | callbacks | CPU-only by default |
-| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, label smoothing |
+| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, dynamic layer depth (1-4), label smoothing |
 | Ridge / LogReg | CPU | — | Fast linear baseline |
 | Elastic Net | CPU | — | L1+L2 linear regression |
 | KNN | CPU | — | Instance-based, adds diversity |
@@ -267,10 +267,13 @@ maestro-ml/
 ├── prompts/
 │   └── strategy_prompt.md    # LLM prompt template for manual mode
 ├── competitions/             # Competition-specific configs
-│   └── ps-s6e2/              # Kaggle PS S6E2 Heart Disease
+│   ├── ps-s6e2/              # Kaggle PS S6E2 Heart Disease
+│   │   ├── pipeline.yaml
+│   │   └── strategy_output.yaml
+│   └── ps-s6e3/              # Kaggle PS S6E3 Customer Churn
 │       ├── pipeline.yaml
-│       └── strategy_output.yaml  # Example strategy (ready to use)
-├── tests/                    # 173 tests
+│       └── strategy_output.yaml
+├── tests/                    # 240 tests
 ├── requirements.txt
 └── CLAUDE.md                 # AI-assisted development instructions
 ```
@@ -284,10 +287,10 @@ pytest tests/ -v
 ```
 
 ```
-173 passed in ~2s
+240 passed in ~4s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training, ensemble blending, diversity metrics, LLM strategy parsing, and end-to-end pipeline integration.
+Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including dynamic_int_list for neural net architecture search), ensemble blending, diversity metrics, LLM strategy parsing, and end-to-end pipeline integration.
 
 ---
 
@@ -315,7 +318,7 @@ Each model config in `configs/models/` defines:
 - `fixed_params` — Always-on parameters (can be task-type-keyed)
 - `gpu` — GPU params and CPU fallback
 - `training` — Early stopping, eval metric, seed parameter name
-- `optuna` — Per-model trial budget, QMC ratio, pruner settings
+- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings
 
 ---
 
@@ -357,9 +360,11 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] GPU auto-detection with per-model micro-trials
 - [x] Multi-seed retraining for stability
 - [x] Four ensemble strategies (blend, rank, meta-model, NSGA-II)
+- [x] NSGA-II → meta-model stacking chain (diversity selection + non-linear stacking)
 - [x] Diversity-aware selection via correlation matrix eigenvalues
+- [x] Dynamic neural net architecture search (Optuna chooses layer count + widths)
 - [x] End-to-end pipeline orchestrator
-- [x] 173 tests with full coverage
+- [x] 240 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [ ] Feature importance analysis and selection

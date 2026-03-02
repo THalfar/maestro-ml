@@ -7,6 +7,7 @@ pytabkit>=1.7
 
 # Optimization
 optuna>=3.4
+pymoo>=0.6
 
 # Data
 pandas>=2.0

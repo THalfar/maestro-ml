@@ -27,29 +27,41 @@ gpu:
 
 hyperparameters:
   hidden_sizes:
-    type: int_list
-    n: 2
-    low: 8
+    type: dynamic_int_list
+    n_min: 1                                        # 1-4 layers — Optuna decides depth
+    n_max: 3
+    low: 4
     high: 128
   lr:
     type: float
-    low: 0.001
+    low: 0.0001
     high: 0.1
     log: true
   batch_size:
-    type: categorical
-    choices: [64, 128, 256, 512]
+    type: int
+    low: 4096
+    high: 32384                                                                   
+  p_drop:
+    type: float
+    low: 0.0
+    high: 0.8                                       # dropout regularization
+  wd:
+    type: float
+    low: 0.000001
+    high: 0.01                                      # weight decay
+    log: true
   use_ls:
     type: categorical
-    choices: [true, false]
+    choices: [true, false]                          # label smoothing (off may be better for AUC)
 
 fixed_params:
-  n_epochs: 20                                   # max epochs (early stopping usually stops sooner)
-  n_cv: 1                                        # internal 80/20 val split for early stopping
-  n_refit: 0                                     # no internal refitting
-  use_early_stopping: true                       # stop if val metric plateaus
-  early_stopping_additive_patience: 5           # +15 epochs patience after best
-  verbosity: 0                                   # suppress training output
+  n_epochs: 256                                     # more epochs — early stopping handles the rest
+  n_cv: 1                                          # internal 80/20 val split for early stopping
+  n_refit: 0                                       # no internal refitting
+  use_early_stopping: true                         # stop if val metric plateaus
+  early_stopping_additive_patience: 10             # +10 epochs patience after best
+  val_metric_name: cross_entropy                   # better for AUC than accuracy
+  verbosity: 0                                     # suppress training output
   random_state: 42
 
 training:
@@ -68,11 +80,11 @@ feature_requirements:
 
 optuna:
   n_trials: 1000                                  # GPU-accelerated, can afford more trials
-  qmc_warmup_ratio: 0.05
+  qmc_warmup_trials: 50
   timeout: null
   pruner:
     type: median                                 # prune bad trials after a few folds
     n_warmup_steps: 1                            # evaluate at least 2 folds before pruning
-    n_startup_trials: 20                          # let first 5 trials finish fully
+    n_startup_trials: 30                          # let first 5 trials finish fully
   n_top_trials: 20
   n_seeds: 1                                     # neural nets benefit from seed averaging

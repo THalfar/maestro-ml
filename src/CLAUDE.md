@@ -69,7 +69,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
 - Registry auto-loads all YAMLs from `configs/models/` — no registration code needed.
 
 ### `models/trainer.py`
-- Optuna flow: **Phase 1 QMC warmup** (space-filling, `qmc_warmup_ratio` of total trials) → **Phase 2 TPE** (Bayesian).
+- Optuna flow: **Phase 1 QMC warmup** (space-filling, `qmc_warmup_trials` trials) → **Phase 2 TPE** (Bayesian).
 - After study: top `n_top_trials` configs retrained with `n_seeds` seeds for stability.
 - Test predictions: `test_preds += preds / n_folds` (average across folds).
 

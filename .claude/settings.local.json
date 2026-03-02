@@ -10,7 +10,12 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:pypi.org)",
       "WebFetch(domain:openreview.net)",
-      "Bash(wc -l:*)"
+      "Bash(wc -l:*)",
+      "WebFetch(domain:pymoo.org)",
+      "WebFetch(domain:www.pymoo.org)",
+      "WebFetch(domain:blog.finxter.com)",
+      "WebFetch(domain:zlatankr.github.io)",
+      "WebFetch(domain:chriskhanhtran.github.io)"
     ]
   }
 }

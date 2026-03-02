@@ -1,0 +1,68 @@
+======================================================================
+MAESTRO-ML EDA REPORT
+======================================================================
+Train shape : [594194, 21]  (564.4 MB)
+Test shape  : [254655, 20]  (239.9 MB)
+Features    : 19
+
+────────────────────────────────────────
+TARGET DISTRIBUTION
+────────────────────────────────────────
+           0 :   460377  (77.48%)
+           1 :   133817  (22.52%)
+  dtype=int64, unique=2
+
+──────────────────────────────────────────────────────────────────────
+FEATURE                                 CORR TYPE                            MISS%
+──────────────────────────────────────────────────────────────────────
+tenure                               -0.4185 numeric_continuous                0.0
+MonthlyCharges                       +0.2730 numeric_continuous                0.0
+SeniorCitizen                        +0.2364 binary                            0.0
+TotalCharges                         -0.2184 numeric_continuous                0.0
+gender                               +0.0000 binary                            0.0
+Partner                              +0.0000 binary                            0.0
+Dependents                           +0.0000 binary                            0.0
+PhoneService                         +0.0000 binary                            0.0
+MultipleLines                        +0.0000 low_cardinality_categorical       0.0
+InternetService                      +0.0000 low_cardinality_categorical       0.0
+OnlineSecurity                       +0.0000 low_cardinality_categorical       0.0
+OnlineBackup                         +0.0000 low_cardinality_categorical       0.0
+DeviceProtection                     +0.0000 low_cardinality_categorical       0.0
+TechSupport                          +0.0000 low_cardinality_categorical       0.0
+StreamingTV                          +0.0000 low_cardinality_categorical       0.0
+StreamingMovies                      +0.0000 low_cardinality_categorical       0.0
+Contract                             +0.0000 low_cardinality_categorical       0.0
+PaperlessBilling                     +0.0000 binary                            0.0
+PaymentMethod                        +0.0000 low_cardinality_categorical       0.0
+
+────────────────────────────────────────
+WEAK FEATURES (|corr| < 0.05)
+────────────────────────────────────────
+  (none)
+
+────────────────────────────────────────
+FEATURE CLUSTERS (|corr| >= 0.5)
+────────────────────────────────────────
+  Cluster 1 (mean_corr=0.51): tenure, TotalCharges, MonthlyCharges
+
+────────────────────────────────────────
+MISSING VALUES
+────────────────────────────────────────
+  (no missing values)
+
+────────────────────────────────────────
+COLUMN TYPE BREAKDOWN
+────────────────────────────────────────
+  binary                              6
+  low_cardinality_categorical         10
+  numeric_continuous                  3
+
+────────────────────────────────────────
+RECOMMENDATIONS
+────────────────────────────────────────
+  1. Top correlated features: tenure, MonthlyCharges, SeniorCitizen, TotalCharges. Consider creating interaction features between these.
+  2. Feature cluster (mean corr=0.51): tenure, TotalCharges, MonthlyCharges. These are highly correlated — consider keeping only the strongest, or create ratio features between them.
+  3. Binary features (gender, SeniorCitizen, Partner) can be multiplied with top continuous features (tenure, MonthlyCharges, TotalCharges) to create conditional interaction features.
+  4. Categorical features: MultipleLines, InternetService, OnlineSecurity, OnlineBackup, DeviceProtection. Apply OOF target encoding with smoothing (alpha=15) to avoid leakage.
+
+======================================================================

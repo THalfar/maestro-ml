@@ -5,6 +5,7 @@ model instances, and work end-to-end through Optuna studies.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,22 @@ from sklearn.model_selection import StratifiedKFold
 from src.models.registry import ModelRegistry
 from src.models.trainer import run_optuna_study, train_with_config
 from src.utils.io import PipelineConfig, CVConfig, OptunaGlobalConfig, OutputConfig
+
+# ---------------------------------------------------------------------------
+# RealMLP availability guard
+# ---------------------------------------------------------------------------
+# conftest.py pre-imports torch to load shm.dll before pytabkit.
+# If that pre-import failed (OSError caught silently), torch is absent from
+# sys.modules. Re-importing torch at this point would cause a Windows fatal
+# exception (0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND) — uncatchable by Python.
+# We check sys.modules instead of importing, and skip all RealMLP tests when
+# torch is not already loaded.
+_TORCH_OK = "torch" in sys.modules
+_SKIP_REALMLP = pytest.mark.skipif(
+    not _TORCH_OK,
+    reason="torch/pytabkit unavailable: shm.dll failed to load (Windows). "
+           "Run check_realmlp_gpu.py to diagnose.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +181,7 @@ class TestModelInstantiation:
         from sklearn.ensemble import AdaBoostRegressor
         assert isinstance(model, AdaBoostRegressor)
 
+    @_SKIP_REALMLP
     def test_realmlp_classifier(self, registry: ModelRegistry):
         model = registry.get_model(
             "realmlp",
@@ -174,6 +192,7 @@ class TestModelInstantiation:
         from pytabkit import RealMLP_TD_Classifier
         assert isinstance(model, RealMLP_TD_Classifier)
 
+    @_SKIP_REALMLP
     def test_realmlp_regressor(self, registry: ModelRegistry):
         model = registry.get_model(
             "realmlp",
@@ -197,8 +216,11 @@ class TestPredictProba:
         ("elastic_net", {"alpha": 0.01, "l1_ratio": 0.5}),
         ("gaussian_nb", {"var_smoothing": 1e-9}),
         ("adaboost", {"n_estimators": 50, "learning_rate": 0.1}),
-        ("realmlp", {"hidden_sizes": [128, 128], "lr": 0.01,
-                     "batch_size": 64, "use_ls": False}),
+        pytest.param(
+            "realmlp", {"hidden_sizes": [128, 128], "lr": 0.01,
+                        "batch_size": 64, "use_ls": False},
+            marks=_SKIP_REALMLP,
+        ),
     ])
     def test_predict_proba_works(self, registry: ModelRegistry,
                                   binary_data, model_name, hparams):
@@ -282,7 +304,7 @@ class TestOptunaStudy:
             "training": {"needs_eval_set": False, "early_stopping": False,
                          "eval_metric_param": None, "seed_param": None},
             "feature_requirements": {"needs_scaling": True},
-            "optuna": {"n_trials": 3, "qmc_warmup_ratio": 0.3,
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
                        "timeout": None, "pruner": {"type": "none"},
                        "n_top_trials": 1, "n_seeds": 1},
         }
@@ -309,7 +331,7 @@ class TestOptunaStudy:
             "training": {"needs_eval_set": False, "early_stopping": False,
                          "eval_metric_param": None, "seed_param": "random_state"},
             "feature_requirements": {"needs_scaling": True},
-            "optuna": {"n_trials": 3, "qmc_warmup_ratio": 0.3,
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
                        "timeout": None, "pruner": {"type": "none"},
                        "n_top_trials": 1, "n_seeds": 1},
         }
@@ -330,7 +352,7 @@ class TestOptunaStudy:
             "training": {"needs_eval_set": False, "early_stopping": False,
                          "eval_metric_param": None, "seed_param": None},
             "feature_requirements": {"needs_scaling": True},
-            "optuna": {"n_trials": 3, "qmc_warmup_ratio": 0.3,
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
                        "timeout": None, "pruner": {"type": "none"},
                        "n_top_trials": 1, "n_seeds": 1},
         }
@@ -353,7 +375,7 @@ class TestOptunaStudy:
             "training": {"needs_eval_set": False, "early_stopping": False,
                          "eval_metric_param": None, "seed_param": "random_state"},
             "feature_requirements": {"needs_scaling": False},
-            "optuna": {"n_trials": 3, "qmc_warmup_ratio": 0.3,
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
                        "timeout": None, "pruner": {"type": "none"},
                        "n_top_trials": 1, "n_seeds": 1},
         }
@@ -381,7 +403,7 @@ class TestOptunaStudy:
             "feature_requirements": {"needs_scaling": False,
                                      "handles_categorical": True,
                                      "handles_missing": False},
-            "optuna": {"n_trials": 3, "qmc_warmup_ratio": 0.3,
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
                        "timeout": None, "pruner": {"type": "none"},
                        "n_top_trials": 1, "n_seeds": 1},
         }
@@ -390,7 +412,8 @@ class TestOptunaStudy:
         return configs_dir
 
     @pytest.mark.parametrize("model_name", [
-        "svm", "elastic_net", "gaussian_nb", "adaboost", "realmlp",
+        "svm", "elastic_net", "gaussian_nb", "adaboost",
+        pytest.param("realmlp", marks=_SKIP_REALMLP),
     ])
     def test_optuna_study_completes(self, quick_configs_dir, binary_data,
                                      quick_pipeline, model_name):
@@ -425,8 +448,11 @@ class TestTrainWithConfig:
         ("elastic_net", {"alpha": 0.01, "l1_ratio": 0.5}),
         ("gaussian_nb", {"var_smoothing": 1e-9}),
         ("adaboost", {"n_estimators": 50, "learning_rate": 0.1}),
-        ("realmlp", {"hidden_sizes": [128, 128], "lr": 0.01,
-                     "batch_size": 64, "use_ls": False}),
+        pytest.param(
+            "realmlp", {"hidden_sizes": [128, 128], "lr": 0.01,
+                        "batch_size": 64, "use_ls": False},
+            marks=_SKIP_REALMLP,
+        ),
     ])
     def test_train_produces_oof(self, registry, binary_data, tmp_path,
                                  model_name, hparams):

@@ -45,7 +45,7 @@ feature_requirements:
 
 optuna:
   n_trials: int               # Trials for this model's study (default: 150)
-  qmc_warmup_ratio: float     # Fraction of trials using QMC sampler (default: 0.3)
+  qmc_warmup_trials: int       # Number of QMC warmup trials (default: 50)
   timeout: int | null         # Max seconds for this study (null = no limit)
   pruner:
     type: str                 # "median" | "hyperband" | "none"
