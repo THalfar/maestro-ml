@@ -57,8 +57,14 @@ def _greedy_pareto_select(
 
     Selects ``n_select`` composites by iteratively adding the composite
     that maximises ``(1-dw)*norm_score + dw*norm_diversity``.  Diversity
-    is computed using the actual configured metric (pearson_neff,
-    spearman_neff, ambiguity) rather than a proxy.
+    is computed using the configured metric (pearson_neff, spearman_neff,
+    or ambiguity).
+
+    .. note::
+        For ``pearson_neff`` and ``spearman_neff``, **prediction** correlation
+        is used (not error correlation as in the outer NSGA-II in
+        ``diversity.py``) because ``y_true`` is unavailable here.  Prediction
+        correlation is a reasonable proxy for composites from the same model.
 
     For ``spearman_neff`` the OOF arrays are pre-ranked once (O(n log n)
     per composite), then all subsequent pairwise computations are Pearson
@@ -629,6 +635,13 @@ def run_optuna_study(
     selection_mode = optuna_cfg.get("selection_mode", "global")
     tracker: PerFoldTracker | None = None
     if selection_mode == "per_fold":
+        if test is None:
+            logger.warning(
+                f"[{model_name}] selection_mode='per_fold' requires test DataFrame "
+                f"for test predictions, but test=None was passed. "
+                f"The tracker will be created but never populated — "
+                f"assemble() will return an empty list. Pass test= to fix this."
+            )
         maximize = task_type != "regression"
         tracker = PerFoldTracker(
             n_top=optuna_cfg["n_top_trials"],
@@ -953,10 +966,10 @@ def _create_objective(
                 raise optuna.exceptions.TrialPruned()
 
         overall_metric = _compute_cv_metric(y, oof, task_type)
-        # DISPUTE: test_oof_preds_stored and test_oof_alignment in test_trainer.py explicitly
-        # assert trial.user_attrs["oof_preds"] is present and valid. Removing this line
-        # would break those tests. The memory concern is real but the fix requires updating
-        # tests — reviewer should decide whether to drop those tests or gate on a debug flag.
+        # REVIEW:PERF — stores full OOF array (n_samples × 8 bytes) per completed trial.
+        # For 1000 trials × 100K samples = ~800MB. Acceptable for typical competition
+        # datasets (<100K rows) but could be gated on a debug/save_oof flag for large-scale use.
+        # Current tests (test_oof_preds_stored, test_oof_alignment) depend on this attribute.
         trial.set_user_attr("oof_preds", oof)  # numpy array: ~13x less memory than list
         return overall_metric
 
@@ -1485,7 +1498,7 @@ def run_all_studies(
 
                 top_configs = [
                     {
-                        "params": f"per_fold_{assembly_mode}",
+                        "params": {"assembly_mode": assembly_mode},
                         "value": c["avg_score"],
                         "trial_number": c["fold_trials"],
                     }
