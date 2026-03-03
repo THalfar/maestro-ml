@@ -32,6 +32,7 @@ from pymoo.mcdm.high_tradeoff import HighTradeoffPoints
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
+from pymoo.core.callback import Callback
 from pymoo.optimize import minimize as pymoo_minimize
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score, mean_squared_error
@@ -886,12 +887,30 @@ def run_nsga2_ensemble(
         eliminate_duplicates=True,
     )
 
+    # Progress callback — log every ~1000 evaluations
+    log_every = max(1, 1000 // pop_size)  # generations between logs
+
+    class _ProgressCallback(Callback):
+        def notify(self, algorithm, **kwargs):
+            gen = algorithm.n_gen
+            if gen % log_every == 0 or gen == n_gen:
+                n_evals_so_far = gen * pop_size
+                elapsed = _time.time() - nsga2_start
+                best_F = algorithm.pop.get("F").min(axis=0)
+                logger.info(
+                    f"  NSGA-II gen {gen}/{n_gen} | "
+                    f"{n_evals_so_far} evals | "
+                    f"best {metric}={-best_F[0]:.6f} | "
+                    f"{elapsed:.0f}s"
+                )
+
     result = pymoo_minimize(
         problem,
         algorithm,
         ("n_gen", n_gen),
         seed=seed,
         verbose=False,
+        callback=_ProgressCallback(),
     )
 
     nsga2_elapsed = _time.time() - nsga2_start

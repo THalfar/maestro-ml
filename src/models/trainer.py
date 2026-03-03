@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,6 +30,9 @@ logger = logging.getLogger("maestro")
 
 # Suppress Optuna's verbose logging
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Suppress pytorch_lightning "LOCAL_RANK" spam from RealMLP
+logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.WARNING)
 
 
 def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -> float:
@@ -429,11 +433,14 @@ def _run_two_phase_study(
         best_val = study.best_value if study.best_trial else float("nan")
         elapsed = time.time() - start_time
         if verbose >= 2:
-            # Show every trial with its own score
-            if trial.value is not None:
+            # Show every trial with its own score — check state, not value,
+            # because Optuna 3.x sets trial.value to last intermediate for pruned trials
+            if trial.state == optuna.trial.TrialState.COMPLETE:
                 trial_val = f"{trial.value:.6f}"
-            else:
+            elif trial.state == optuna.trial.TrialState.PRUNED:
                 trial_val = "pruned"
+            else:
+                trial_val = "failed"
             logger.info(
                 f"  Trial {n_done}/{n_trials} | "
                 f"score={trial_val} | "
@@ -449,11 +456,13 @@ def _run_two_phase_study(
 
     # Phase 1: QMC — categorical params fall back to RandomSampler automatically
     logger.info(f"Phase 1 (QMC): {n_qmc} trials")
-    study.sampler = optuna.samplers.QMCSampler(
-        seed=global_seed,
-        independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
-        warn_independent_sampling=False,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="QMCSampler is experimental")
+        study.sampler = optuna.samplers.QMCSampler(
+            seed=global_seed,
+            independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
+            warn_independent_sampling=False,
+        )
     study.optimize(
         objective,
         n_trials=n_qmc,
@@ -831,6 +840,20 @@ def run_all_studies(
                 f"avg {avg_trial_time:.1f}s/trial | "
                 f"best={study.best_value:.6f}"
             )
+
+            # Hyperparameter importance (fANOVA)
+            try:
+                importances = optuna.importance.get_param_importances(study)
+                if importances:
+                    imp_lines = [
+                        f"  {name}: {val:.3f}" for name, val in importances.items()
+                    ]
+                    logger.info(
+                        f"[{model_name}] Hyperparameter importance:\n"
+                        + "\n".join(imp_lines)
+                    )
+            except Exception:
+                pass  # Not enough completed trials or other issue
 
             optuna_cfg = registry.get_optuna_config(model_name)
             n_top = optuna_cfg["n_top_trials"]

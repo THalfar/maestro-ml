@@ -58,7 +58,7 @@ features:
 
 ensemble:
   strategy: "nsga2"
-  nsga2_trials: 15000
+  nsga2_trials: 2500
   diversity_weight: 0.3
   diversity_metric: "spearman_neff"        # Spearman rank correlation — better for AUC (ranking metric)
 

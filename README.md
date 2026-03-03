@@ -32,7 +32,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 ## Features
 
 - **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
-- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously. Correlation matrix eigenvalues compute effective ensemble size, preventing the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression) and compared against the linear blend — the best wins automatically.
+- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression) and compared against the linear blend — the best wins automatically.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
 - **GPU auto-detection** — Per-model micro-trial detects CUDA availability at startup, with automatic CPU fallback.
@@ -205,6 +205,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - Rank averaging
 - Meta-model stacking (LogisticRegression/Ridge with logit features)
 - NSGA-II diversity-aware selection → meta-model stacking chain (best of blend vs stacking)
+- Three diversity metrics: `pearson_neff` (Pearson eigenvalues), `spearman_neff` (Spearman rank — better for AUC), `ambiguity` (prediction variance decomposition)
 - Auto mode: tries all strategies, picks the best on OOF score
 
 ---
@@ -216,7 +217,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 | CatBoost | CUDA | eval_set | Native categoricals, ordered boosting |
 | XGBoost | CUDA | eval_set | `device="cuda"` (v2.0+) |
 | LightGBM | Special build | callbacks | CPU-only by default |
-| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, dynamic layer depth (1-4), label smoothing |
+| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, dynamic layer depth, label smoothing |
 | Ridge / LogReg | CPU | — | Fast linear baseline |
 | Elastic Net | CPU | — | L1+L2 linear regression |
 | KNN | CPU | — | Instance-based, adds diversity |
@@ -267,13 +268,15 @@ maestro-ml/
 ├── prompts/
 │   └── strategy_prompt.md    # LLM prompt template for manual mode
 ├── competitions/             # Competition-specific configs
+│   ├── house_prices/         # Kaggle House Prices (regression)
+│   │   └── pipeline.yaml
 │   ├── ps-s6e2/              # Kaggle PS S6E2 Heart Disease
 │   │   ├── pipeline.yaml
 │   │   └── strategy_output.yaml
 │   └── ps-s6e3/              # Kaggle PS S6E3 Customer Churn
 │       ├── pipeline.yaml
 │       └── strategy_output.yaml
-├── tests/                    # 240 tests
+├── tests/                    # 264 tests
 ├── requirements.txt
 └── CLAUDE.md                 # AI-assisted development instructions
 ```
@@ -287,10 +290,10 @@ pytest tests/ -v
 ```
 
 ```
-240 passed in ~4s
+264 passed, 5 skipped in ~4s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including dynamic_int_list for neural net architecture search), ensemble blending, diversity metrics, LLM strategy parsing, and end-to-end pipeline integration.
+Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including dynamic_int_list for neural net architecture search), ensemble blending, all three diversity metrics (Pearson/Spearman/ambiguity), NSGA-II→meta-model stacking chain, LLM strategy parsing, and end-to-end pipeline integration.
 
 ---
 
@@ -305,7 +308,7 @@ Tests cover all modules: YAML loading, EDA profiling, feature engineering (inclu
 | `strategy` | `mode` (`api`/`manual`), `api.provider`, `api.model` | LLM strategy mode |
 | `models` | List of model names | Which models to train |
 | `features` | `interactions`, `ratios`, `target_encoding`, `custom` | Feature engineering (populated by LLM) |
-| `ensemble` | `strategy` (`auto`/`blend`/`rank`/`meta`/`nsga2`), `diversity_weight` | Ensemble selection |
+| `ensemble` | `strategy` (`auto`/`blend`/`rank`/`meta`/`nsga2`), `diversity_weight`, `diversity_metric` (`pearson_neff`/`spearman_neff`/`ambiguity`) | Ensemble selection |
 | `optuna` | `global_seed`, `global_timeout` | Global Optuna settings |
 | `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
 | `output` | `submission_path`, `results_dir`, `save_oof` | Output paths |
@@ -361,10 +364,10 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Multi-seed retraining for stability
 - [x] Four ensemble strategies (blend, rank, meta-model, NSGA-II)
 - [x] NSGA-II → meta-model stacking chain (diversity selection + non-linear stacking)
-- [x] Diversity-aware selection via correlation matrix eigenvalues
+- [x] Configurable diversity metrics (Pearson N_eff, Spearman N_eff, ambiguity decomposition)
 - [x] Dynamic neural net architecture search (Optuna chooses layer count + widths)
 - [x] End-to-end pipeline orchestrator
-- [x] 240 tests with full coverage
+- [x] 264 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [ ] Feature importance analysis and selection

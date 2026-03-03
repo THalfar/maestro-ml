@@ -45,6 +45,33 @@ Implement in this order (each module depends on the ones above it):
 - **XGBoost:** v2.0+ uses `device="cuda"`, not the deprecated `tree_method="gpu_hist"`.
 - **LightGBM:** Default pip/conda installs are CPU-only. GPU requires special build.
 
+## Model-Specific Quirks
+
+- **Seed parameter names vary**: CatBoost uses `random_seed`, all others use `random_state`.
+- **CatBoost**: `eval_metric` goes in the constructor, not in `fit()`.
+- **XGBoost/LightGBM**: `eval_metric` goes in `fit()` via `eval_set` / callbacks.
+- **LightGBM**: Early stopping uses `callbacks=[lgb.early_stopping(...)]`, NOT the deprecated `early_stopping_rounds` parameter.
+- **RealMLP**: Uses `dynamic_int_list` custom Optuna type for architecture search (Optuna picks layer count 1-4 AND per-layer widths). See `trainer.py:reassemble_int_lists()`.
+- **Ridge/Elastic Net YAML**: `fixed_params` is task-type-keyed (`binary_classification` / `regression`) because Ridge wraps different sklearn classes per task.
+- **AdaBoost/GaussianNB/SVM/KNN**: No early stopping, no GPU — simple sklearn models added for ensemble diversity.
+
+## Ensemble & Diversity
+
+- **NSGA-II → meta-model chain** (in `run.py`): NSGA-II selects diverse models, then trains a LogisticRegression/Ridge meta-model on selected OOFs. Compares linear blend vs meta-stacking on OOF score — picks the winner automatically.
+- **Three diversity metrics** (`diversity_metric` in pipeline YAML):
+  - `pearson_neff` — Effective ensemble size from Pearson error correlation eigenvalues (default).
+  - `spearman_neff` — Same but Spearman rank correlation. Better for AUC (ranking metric).
+  - `ambiguity` — Weighted prediction variance. Directly measures ensemble benefit.
+- **`diversity_weight`** can be a single float or a list of floats. Multiple weights re-select from the same Pareto front without re-running NSGA-II.
+- **`select_from_pareto()`** in `diversity.py` re-selects from cached Pareto data with different `diversity_weight`.
+
+## Pipeline YAML Key Features
+
+- **`target_mapping`**: Converts string labels to numeric (`{Yes: 1, No: 0}`).
+- **`log_transform_target`**: Applies `log1p()` to regression targets (for RMSLE optimization).
+- **Timeout strings**: `model_timeouts` accepts human-readable strings like `"1h30m"`, `"45m"`, `"90s"` — parsed by `parse_timeout()` in `io.py`.
+- **`diversity_metric`**: Selects NSGA-II diversity objective per competition (`pearson_neff`, `spearman_neff`, `ambiguity`).
+
 ## CV and OOF Predictions
 
 - Same `StratifiedKFold(n_folds, seed)` (or `KFold` for regression) used everywhere.
@@ -56,12 +83,15 @@ Implement in this order (each module depends on the ones above it):
 ## Configuration Files
 
 - `configs/schemas/` — YAML schema documentation (pipeline, model, EDA report)
-- `configs/models/` — One YAML per model type (catboost, xgboost, lightgbm, ridge, knn, random_forest, extra_trees)
+- `configs/models/` — One YAML per model type (12 models: catboost, xgboost, lightgbm, realmlp, ridge, elastic_net, knn, random_forest, extra_trees, adaboost, gaussian_nb, svm)
 - `configs/templates/` — Ready-to-use pipeline configurations (binary_classification, regression)
+- `competitions/` — Per-competition pipeline configs + strategy YAML (house_prices, ps-s6e2, ps-s6e3)
 
 ## Dependencies
 
 Core: catboost, xgboost, lightgbm, scikit-learn, optuna, pandas, numpy
+Neural nets: pytabkit (RealMLP), torch
+Multi-objective: pymoo (NSGA-II)
 LLM: anthropic, openai, python-dotenv
 Config: pyyaml
 Viz: matplotlib, seaborn
@@ -89,8 +119,12 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
+- Expected: **264 passed, 5 skipped, ~4s**
 - `test_gpu.py` tests GPU availability — do not modify
-- Each module should get its own test file in a `tests/` directory
+- Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
+- `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds
+- All test data is tiny synthetic data (n_samples ≤ 50) — no real CSVs in tests
+- **Known**: torch DLL loading may print a traceback on Windows — this is non-fatal, tests still pass
 
 ## Common Patterns
 
@@ -109,13 +143,13 @@ conda run -n maestro python run.py --config pipeline.yaml --strategy manual
 
 ## File Structure Quick Reference
 ```
-src/utils/io.py          — load_yaml, load_pipeline_config, load_model_config, save_*
+src/utils/io.py          — load_yaml, load_pipeline_config, load_model_config, save_*, parse_timeout
 src/eda/profiler.py      — run_eda, format_eda_for_llm
 src/features/engineer.py — build_features, target encoding, interactions, ratios
 src/models/registry.py   — ModelRegistry class (register, get_model, get_search_space)
-src/models/trainer.py    — run_optuna_study, train_with_config, run_all_studies
+src/models/trainer.py    — run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists
 src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_model
-src/ensemble/diversity.py — effective_ensemble_size, run_nsga2_ensemble
+src/ensemble/diversity.py — run_nsga2_ensemble, select_from_pareto, effective_ensemble_size, _compute_diversity
 src/strategy/llm_strategist.py — generate_strategy (API + manual modes)
-run.py                   — main pipeline orchestrator
+run.py                   — main pipeline orchestrator (includes NSGA-II→meta chain logic)
 ```
