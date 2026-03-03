@@ -15,7 +15,7 @@ Three layers:
 - **YAML is the source of truth.** Never hardcode hyperparameter ranges, feature lists, or model configs in Python code. Everything comes from `configs/models/*.yaml` and the strategy YAML.
 - **Architect/coder pattern.** Python files contain function signatures + detailed docstrings. The docstrings ARE the specification — implement exactly what they describe.
 - **Type hints everywhere.** Use `from __future__ import annotations` at the top of every file.
-- **Functions over classes** except for `ModelRegistry` and dataclasses in `src/utils/io.py`.
+- **Functions over classes** except for `ModelRegistry`, `PerFoldTracker` (in `trainer.py`), and dataclasses in `src/utils/io.py`.
 - **No in-place DataFrame mutation.** Every function that takes a DataFrame should return a new one unless explicitly documented otherwise.
 - **Deterministic where possible.** Always pass random seeds. Same config = same results.
 
@@ -51,9 +51,21 @@ Implement in this order (each module depends on the ones above it):
 - **CatBoost**: `eval_metric` goes in the constructor, not in `fit()`.
 - **XGBoost/LightGBM**: `eval_metric` goes in `fit()` via `eval_set` / callbacks.
 - **LightGBM**: Early stopping uses `callbacks=[lgb.early_stopping(...)]`, NOT the deprecated `early_stopping_rounds` parameter.
-- **RealMLP**: Uses `dynamic_int_list` custom Optuna type for architecture search (Optuna picks layer count 1-4 AND per-layer widths). See `trainer.py:reassemble_int_lists()`.
+- **RealMLP**: Uses rectangular architecture (`hidden_sizes: "rectangular"` in fixed_params) with `n_hidden_layers` and `hidden_width` as Optuna search params. Uses **per-fold selection** (`selection_mode: per_fold`) — see "Per-Fold Selection" section below.
+- **RealMLP fixed_params**: Task-type-keyed (`binary_classification` / `regression`), like Ridge. `n_ens` (pytabkit internal ensemble count) is in the Optuna search space, not fixed.
 - **Ridge/Elastic Net YAML**: `fixed_params` is task-type-keyed (`binary_classification` / `regression`) because Ridge wraps different sklearn classes per task.
 - **AdaBoost/GaussianNB/SVM/KNN**: No early stopping, no GPU — simple sklearn models added for ensemble diversity.
+
+## Per-Fold Selection (RealMLP)
+
+Neural networks benefit from stochasticity — a trial may excel on one fold but not others. Per-fold selection exploits this:
+
+- **During Optuna**: Each fold's trained model immediately predicts on test data. `PerFoldTracker` maintains a bounded per-fold leaderboard (top `n_top_trials` per fold), including predictions from pruned trials.
+- **After Optuna**: `tracker.assemble()` builds composite prediction arrays. Composite k uses the k-th best trial per fold (each fold may come from a different trial). **No retraining needed.**
+- **fold_timeout**: Per-fold time limit (seconds). If a single fold exceeds this, the trial is pruned (but completed folds' predictions are still saved to the tracker).
+- **Config**: Set `selection_mode: per_fold` and `fold_timeout: 180` in the model YAML's `optuna` section.
+- **NSGA-II integration**: Per-fold composites have the same format as global-mode arrays — `(n_train,)` OOF + `(n_test,)` test. NSGA-II doesn't know or care about the difference.
+- **Global mode** (`selection_mode: global`, default): Existing behaviour — retrain top N configs with multiple seeds. All other models use this.
 
 ## Ensemble & Diversity
 
@@ -71,6 +83,8 @@ Implement in this order (each module depends on the ones above it):
 - **`log_transform_target`**: Applies `log1p()` to regression targets (for RMSLE optimization).
 - **Timeout strings**: `model_timeouts` accepts human-readable strings like `"1h30m"`, `"45m"`, `"90s"` — parsed by `parse_timeout()` in `io.py`.
 - **`diversity_metric`**: Selects NSGA-II diversity objective per competition (`pearson_neff`, `spearman_neff`, `ambiguity`).
+- **`selection_mode`**: Per-model in model YAML (`global` or `per_fold`). Controls whether top configs are retrained (global) or per-fold composites are assembled (per_fold).
+- **`fold_timeout`**: Per-model in model YAML. Max seconds per CV fold — exceeding prunes the trial.
 
 ## CV and OOF Predictions
 
@@ -119,7 +133,7 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
-- Expected: **264 passed, 5 skipped, ~4s**
+- Expected: **427 passed, 5 skipped, ~5s**
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
 - `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds
@@ -147,7 +161,7 @@ src/utils/io.py          — load_yaml, load_pipeline_config, load_model_config,
 src/eda/profiler.py      — run_eda, format_eda_for_llm
 src/features/engineer.py — build_features, target encoding, interactions, ratios
 src/models/registry.py   — ModelRegistry class (register, get_model, get_search_space)
-src/models/trainer.py    — run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists
+src/models/trainer.py    — PerFoldTracker, run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists
 src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_model
 src/ensemble/diversity.py — run_nsga2_ensemble, select_from_pareto, effective_ensemble_size, _compute_diversity
 src/strategy/llm_strategist.py — generate_strategy (API + manual modes)

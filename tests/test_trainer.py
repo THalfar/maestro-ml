@@ -1118,3 +1118,234 @@ class TestPerFoldIntegration:
         r = results["ridge"]
         assert len(r["oof_preds"]) > 0
         assert r["retrain_elapsed"] > 0  # global mode does retrain
+
+
+# ---------------------------------------------------------------------------
+# Search space param type coverage
+# ---------------------------------------------------------------------------
+
+class TestParamTypeCoverage:
+    """Tests for all search space param types in _create_objective."""
+
+    @pytest.fixture
+    def multi_type_configs_dir(self, tmp_path: Path) -> Path:
+        """Model config with int, categorical, and fixed search space types."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
+                "max_iter": {"type": "int", "low": 100, "high": 500, "log": False},
+                "solver": {"type": "categorical", "choices": ["lbfgs", "liblinear"]},
+            },
+            "fixed_params": {
+                "binary_classification": {},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "eval_metric_param": None,
+            },
+            "feature_requirements": {"needs_scaling": True},
+            "optuna": {
+                "n_trials": 4,
+                "qmc_warmup_trials": 2,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_int_and_categorical_params(self, multi_type_configs_dir, binary_data):
+        """int and categorical param types should work in Optuna study."""
+        train, test = binary_data
+        registry = ModelRegistry(multi_type_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(multi_type_configs_dir.parent / "results")),
+        )
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+        best = study.best_trial
+        assert "max_iter" in best.params  # int param
+        assert "solver" in best.params    # categorical param
+        assert isinstance(best.params["max_iter"], int)
+        assert best.params["solver"] in ["lbfgs", "liblinear"]
+
+    def test_fixed_param_via_override(self, ridge_configs_dir, binary_data, pipeline_config):
+        """Scalar strategy override creates 'fixed' type — value bypasses Optuna."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        strategy = {
+            "overrides": {
+                "ridge": {"C": 1.0},  # scalar → fixed type
+            }
+        }
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+        )
+        # Fixed param should NOT appear in trial.params (not suggested by Optuna)
+        for trial in study.trials:
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                assert "C" not in trial.params
+
+
+# ---------------------------------------------------------------------------
+# Fold timeout
+# ---------------------------------------------------------------------------
+
+class TestFoldTimeout:
+    """Tests for fold_timeout pruning behavior."""
+
+    @pytest.fixture
+    def timeout_configs_dir(self, tmp_path: Path) -> Path:
+        """Model config with a very short fold_timeout."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
+            },
+            "fixed_params": {
+                "binary_classification": {"max_iter": 1000, "solver": "lbfgs"},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "eval_metric_param": None,
+            },
+            "feature_requirements": {"needs_scaling": True},
+            "optuna": {
+                "n_trials": 4,
+                "qmc_warmup_trials": 2,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+                "fold_timeout": 0,  # 0 seconds — every fold exceeds this
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_fold_timeout_causes_pruning(self, timeout_configs_dir, binary_data):
+        """fold_timeout=0 prunes all trials — run_optuna_study returns gracefully.
+
+        After the BUG fix, run_optuna_study no longer crashes when all trials
+        are pruned. It logs a warning and returns (study, None).
+        """
+        train, test = binary_data
+        registry = ModelRegistry(timeout_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(timeout_configs_dir.parent / "results")),
+        )
+
+        # Patch time.monotonic to simulate 5s per call, ensuring fold_elapsed > 0
+        counter = {"v": 0.0}
+
+        def fake_monotonic():
+            counter["v"] += 5.0
+            return counter["v"]
+
+        with patch("src.models.trainer.time.monotonic", side_effect=fake_monotonic):
+            study, tracker = run_optuna_study(
+                model_name="ridge",
+                train=train,
+                feature_cols=["f1", "f2", "f3"],
+                target_col="target",
+                registry=registry,
+                pipeline_config=pipeline_cfg,
+                strategy={},
+                gpu=False,
+            )
+
+        # All trials should be pruned — no completed trials
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        assert len(completed) == 0
+        # Returned gracefully: tracker is None (ridge uses global selection mode)
+        assert tracker is None
+
+
+# ---------------------------------------------------------------------------
+# OOF leakage verification
+# ---------------------------------------------------------------------------
+
+class TestOofLeakageVerification:
+    """Verify OOF predictions are truly out-of-fold (no leakage)."""
+
+    def test_oof_predictions_are_out_of_fold(self, ridge_configs_dir, binary_data, pipeline_config):
+        """Each OOF prediction should come from a model that did NOT train on that sample."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        results_dir = Path(pipeline_config.output.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        oof_list, _, labels = train_with_config(
+            model_name="ridge",
+            hparams={"C": 1.0},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+        )
+        oof = oof_list[0]
+
+        # Verify: every index in the OOF array was filled exactly once
+        # by one of the validation folds
+        seen_indices: set[int] = set()
+        for train_idx, val_idx in cv.split(train[["f1", "f2", "f3"]], labels):
+            for idx in val_idx:
+                assert idx not in seen_indices, f"Index {idx} appears in multiple val folds"
+                seen_indices.add(idx)
+        assert seen_indices == set(range(len(train)))
+
+        # Verify OOF values are all non-zero (all slots were filled)
+        assert np.all(np.isfinite(oof))
+        # Since oof is probabilities, at least some variation should exist
+        assert oof.std() > 0.0

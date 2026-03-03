@@ -10,124 +10,24 @@
 [0;31m  ──────────────────────────────[0m
 ---
 
-## === REVIEW SUMMARY: src/eda/profiler.py ===
-
-**Tests: 55/56 passed (4 new, 52 existing)**
-- New: `test_regression_target`, `test_categorical_dtype_column`, `test_non_numeric_target_fallback`, `test_empty_report`
-- 1 failure: `test_non_numeric_target_fallback` — exposes the BUG below
-
-**BUG: 1 issue**
-- `profiler.py:271-275` — `_compute_correlations()` non-numeric target fallback checks `dtype == object` which misses pandas 2.x `StringDtype`. When a string target column uses `StringDtype`, the category-codes conversion is skipped and raw strings are passed to `corrwith()`, crashing with `ValueError: could not convert string to float`. **Fix:** replace `target_series.dtype == object` with `pd.api.types.is_string_dtype(target_series)` or `not pd.api.types.is_numeric_dtype(target_series)`.
-
-**LEAK: 0 issues**
-- Module is pure EDA (Layer 1). All statistics computed on train only. Test data is read and returned but never used for analysis. No target leakage vectors.
-
-**PERF: 1 issue**
-- `profiler.py:378` — `series.dropna()` called twice for numeric columns with cardinality ≤ 20 (first at line 354 for stats, again at line 378 for ordinal check). Minor — reuse the existing `non_null` variable.
-
-**STYLE: 1 issue**
-- `profiler.py:100-106` — Schema (`eda_schema.yaml`) uses `class_balance` and `memory_mb`, but code uses `class_balance_pct`, `train_memory_mb`/`test_memory_mb`, and adds `n_features`. Not a bug since schema is documentation-only, but they should stay in sync.
-
-**TODO: 0 issues**
-
-**Verdict: NEEDS FIXES** (1 BUG must be resolved)
-
-[1;33m  ⚠ 3 kommenttia:[0m
-100:    # REVIEW:STYLE — schema says "class_balance" but code uses "class_balance_pct";
-274:        # REVIEW:BUG — dtype == object misses StringDtype (pandas 2.x). Strings created
-381:            # REVIEW:PERF — series.dropna() already called on line 354; reuse the variable
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-All 3 REVIEW comments fixed. 56/56 tests pass.
-
----
-
-**Summary of changes:**
-
-**BUG — `_compute_correlations` (was line 274-281)**
-Replaced `if target_series.dtype == object:` with unconditional `pd.Categorical(df[target_col]).codes`. Since we're already in the `else` branch where target is not numeric, the inner check was both redundant and broken — pandas 2.x `StringDtype` columns have `dtype != object`, so the old code would pass raw strings to `corrwith()` and crash. Now it always encodes to category codes, covering `object`, `StringDtype`, `CategoricalDtype`, etc.
-
-**PERF — `_detect_column_types` (was line 381-384)**
-Removed the second `non_null = series.dropna()` call in the ordinal detection branch. The `elif is_numeric and cardinality <= 20:` branch can only be reached when `is_numeric` is True, meaning `non_null` was already assigned in the stats block just above. Eliminates a redundant O(n) allocation.
-
-**STYLE — `configs/schemas/eda_schema.yaml`**
-Updated schema to match the code's actual output: `class_balance_pct` (was `class_balance`), removed `column` from `target_analysis` (code never emitted it), replaced single `memory_mb` with `train_memory_mb` + `test_memory_mb` + `n_features` (matching `dataset_info` dict). Code and schema now agree.
-
-[0;31m  ▸ REVIEWER (opus) kierros 2[0m
-[0;31m  ──────────────────────────────[0m
-All 56 tests pass. Now let me do the careful code review.
-
-I've read:
-- `src/eda/profiler.py` (the target)
-- `src/utils/io.py` (dependency — dataclasses, YAML loading)
-- `configs/schemas/eda_schema.yaml` (output contract)
-- `tests/test_profiler.py` (56 existing tests)
-
-Let me trace through each function for correctness, leakage, and spec compliance.
-
----
-
-## Leakage Checks
-
-- **No ML, no randomness, no CV splits** — This is a pure statistics module. Correlations and distributions are computed on the full training set, which is correct for EDA (no train/val split leakage possible).
-- **Test set is read but never analyzed against target** — test_df is returned as-is. No leakage.
-- **Target mapping applied only to train** — Correct, test has no target column.
-
-## Function-by-function Review
-
-**`run_eda` (lines 21–150):** Clean. Steps match docstring. `target_mapping` uses `.map()` which is applied to an internally-created DataFrame (read_csv), so the "no in-place mutation" rule doesn't apply (it's the function's own data, returned to caller). `n_features` arithmetic is correct. Correlation merge defaults missing cols to 0.0.
-
-**`_compute_correlations` (lines 236–300):** Handles numeric target (Pearson via `corrwith`), non-numeric target (category codes fallback), NaN columns (`fillna(0.0)`). Target excluded from both target_correlations dict and the feature correlation matrix. Correlation matrix rounded to 6 decimals matching schema.
-
-**`_detect_column_types` (lines 303–391):** Classification logic is correct:
-- Binary check (cardinality==2) comes first regardless of dtype — handles both numeric 0/1 and string yes/no.
-- Object/categorical check before numeric-ordinal check.
-- Ordinal detection requires integer-valued floats with cardinality ≤ 20.
-- `non_null` variable is always defined before use at line 374 because `is_numeric` must be True.
-- All-NaN column (cardinality 0): falls through to `numeric_continuous`. Correct.
-
-**`_find_feature_clusters` (lines 394–476):** BFS connected components on correlation adjacency graph. Absolute correlation ≥ threshold. Singletons filtered. Mean internal correlation uses abs values of all pairs. Sorted by size descending. All correct per docstring.
-
-**`_identify_weak_features` (lines 479–518):** Filters by `|corr| < threshold`, defaults recommendation to `consider_dropping`, sorted by ascending absolute correlation. Matches spec.
-
-**`_generate_recommendations` (lines 153–233):** Covers all five recommendation categories from the docstring (top correlated, weak, clusters, binary×continuous interactions, categoricals for target encoding, missing values). Clean.
-
-**`format_eda_for_llm` (lines 521–670):** All 8 sections from the docstring spec present: dataset overview, target distribution, feature table, weak features, clusters, missing values, column type breakdown, numbered recommendations. Handles empty data gracefully.
-
-## Test Coverage Assessment
-
-The 56 existing tests are thorough:
-- **`run_eda`**: 12 integration tests (report keys, shapes, target analysis, id exclusion, target mapping, regression target)
-- **`_detect_column_types`**: 14 unit tests (all 5 detected types, edge cases: all-NaN, float non-ordinal, CategoricalDtype, binary strings)
-- **`_compute_correlations`**: 6 tests (sorting, exclusions, NaN, no-numeric, non-numeric target)
-- **`_find_feature_clusters`**: 6 tests (cluster formation, empty, negative correlation, size sorting)
-- **`_identify_weak_features`**: 4 tests (identification, sorting, empty, negative)
-- **`_generate_recommendations`**: 7 tests (all recommendation types + empty input)
-- **`format_eda_for_llm`**: 7 tests (sections, edge cases, empty report)
-
-No significant gaps found. All functions and edge cases are covered.
-
-## Issues Found
-
-**None.** The code is clean, matches the eda_schema.yaml contract, follows CLAUDE.md principles (type hints, `from __future__ import annotations`, no in-place mutation of external DataFrames, deterministic), and the test suite is comprehensive.
-
----
-
 ```
 === REVIEW SUMMARY: src/eda/profiler.py ===
 Tests: 56/56 passed (0 new, 56 existing)
 BUG:   0 issues
 LEAK:  0 issues
 PERF:  0 issues
-STYLE: 0 issues
+STYLE: 1 issue (informational — does not block PASS)
 TODO:  0 issues
 Verdict: PASS
-
-=== APPROVED: src/eda/profiler.py ===
 ```
 
-[0;32m  ✓ APPROVED kierroksella 2[0m
+**STYLE note (informational):** `run_eda()` docstring step 9 says "Strongest correlated features (suggest target-encoded pairs)" but the implementation in `_generate_recommendations()` suggests "interaction features" for top-correlated features instead, with target encoding suggested for categoricals. The actual recommendation text is reasonable — just doesn't match the docstring word-for-word.
+
+The code is clean, well-structured, and thoroughly tested. All functions match their docstring specifications. No leakage vectors (this is pure EDA — no CV or model training). Edge cases (all-NaN columns, no numeric features, non-numeric targets, empty inputs) are all handled correctly.
+
+**=== APPROVED: src/eda/profiler.py ===**
+
+[0;32m  ✓ APPROVED kierroksella 1[0m
 
 [1;33m━━━ src/ensemble/blender.py ━━━[0m
 
@@ -141,97 +41,7 @@ Verdict: PASS
 
 [0;31m  ▸ REVIEWER (opus) kierros 1[0m
 [0;31m  ──────────────────────────────[0m
-I now have complete context. Let me write the review.
 
----
-
-## Code Review: `src/ensemble/diversity.py`
-
-### Step 1-2: Tests
-
-**69 existing tests, all passing.** Coverage is comprehensive:
-
-| Function | Tests | Status |
-|---|---|---|
-| `compute_correlation_matrix` | 5 | All pass |
-| `compute_error_correlation_matrix` | 4 | All pass |
-| `compute_spearman_correlation_matrix` | 6 | All pass |
-| `compute_spearman_error_correlation_matrix` | 2 | All pass |
-| `compute_ambiguity` | 4 | All pass |
-| `_compute_diversity` | 6 | All pass |
-| `effective_ensemble_size` | 4 | All pass |
-| `greedy_diverse_select` | 6 (incl. negative scores edge case) | All pass |
-| `_weights_to_selection` | 3 | All pass |
-| `_normalize` | 2 | All pass |
-| `select_from_pareto` | 5 | All pass |
-| `run_nsga2_ensemble` | 6 (incl. determinism, Pareto reuse) | All pass |
-| NSGA-II with all 3 metrics | 4 (parametrized) | All pass |
-| `log_fold_diversity` | 7 | All pass |
-| `print_diversity_report` | 5 | All pass |
-
-No new tests needed — edge cases (constant OOF, negative scores, single model, all-below-threshold weights, knee-point fallback) are well covered.
-
-### Step 3: All 69 tests pass
-
-### Step 4: Detailed Code Review
-
-**Leakage checks:**
-- This module operates entirely on pre-computed OOF predictions — no raw data access, no feature engineering, no fitting on validation data.
-- `y_true` is used only for error computation (`oof - y_true`) and metric scoring, never for fitting.
-- Meta-model (in blender.py, not here) uses its own CV on OOF predictions — confirmed correct.
-- No global means or scaling computed on full data.
-
-**Leakage verdict: Clean.**
-
-**Code quality review:**
-
-- **`compute_correlation_matrix`** (L62-84): Correct. NaN handling for zero-variance arrays is solid — replaces NaN with 0.0 and restores diagonal to 1.0.
-
-- **`compute_error_correlation_matrix`** (L87-110): Clean delegation to `compute_correlation_matrix` on residuals.
-
-- **`compute_spearman_correlation_matrix`** (L113-136): Correctly handles scipy's scalar return for 2 variables (L130-133). NaN cleanup matches Pearson variant.
-
-- **`compute_ambiguity`** (L158-189): Math is correct — implements the ambiguity decomposition `Σ w_i · mean((f_i - f̄)²)`.
-
-- **`_compute_diversity`** (L192-226): Clean dispatcher. Single-model edge cases return sensible defaults (1.0 for N_eff, 0.0 for ambiguity).
-
-- **`effective_ensemble_size`** (L229-262): Correct eigenvalue formula with proper numerical stability (eigenvalue clipping, zero-sum guard).
-
-- **`greedy_diverse_select`** (L265-351): The negative-score fix at L311 (`max_score - abs(max_score) * (1 - ratio)`) is correct — verified by the passing test at L830.
-
-- **`_EnsembleProblem`** (L358-411): Clean pymoo problem definition. Penalty of `[1e6, 1e6]` for empty/failed solutions is appropriate.
-
-- **`_weights_to_selection`** (L418-431): Sensible fallback when all weights below threshold (include all, distribute proportionally).
-
-- **`select_from_pareto`** (L434-614): Control flow for knee vs linear selection is correct — all code paths set `best_idx` before L521. `HighTradeoffPoints` exception gracefully falls back to linear weighting. Logging is thorough and informative.
-
-- **`_normalize`** (L617-622): Correct min-max normalization with constant-array guard.
-
-- **`log_fold_diversity`** (L625-761): Purely diagnostic — no mutations, no leakage. Warning thresholds (0.3/0.5 for std_neff) are reasonable.
-
-- **`run_nsga2_ensemble`** (L764-964): Clean orchestration. Deterministic via seed. Progress callback closure captures outer scope correctly. Fallback for None/empty Pareto front is complete.
-
-**Only observations (STYLE, informational — no action required):**
-
-`diversity.py:49` — `_score_metric` duplicates `blender._score` logic. Both compute AUC/neg_RMSE identically, but the blender version logs a warning for unknown metrics while this version silently falls back. Not a bug (the module is self-contained), but a DRY consideration if the scoring logic ever changes.
-
----
-
-### === REVIEW SUMMARY: src/ensemble/diversity.py ===
-
-```
-Tests: 69/69 passed (0 new, 69 existing)
-BUG:   0 issues
-LEAK:  0 issues
-PERF:  0 issues
-STYLE: 1 observation (_score_metric duplication, informational)
-TODO:  0 issues
-Verdict: PASS
-```
-
-### === APPROVED: src/ensemble/diversity.py ===
-
-The code is clean, well-structured, and thoroughly tested. The NSGA-II integration with pymoo is correct, all three diversity metrics work properly, edge cases (constant OOF, single model, negative scores, all-below-threshold weights) are handled, and there is no data leakage. No changes required.
 
 [0;32m  ✓ APPROVED kierroksella 1[0m
 
@@ -243,351 +53,119 @@ The code is clean, well-structured, and thoroughly tested. The NSGA-II integrati
 
 ## === REVIEW SUMMARY: src/features/engineer.py ===
 
-**Tests: 32/33 passed (1 new, 32 existing)**
+**Tests: 40/40 passed (2 new, 38 existing)**
+- New: `test_ordinal_encoding_handles_nan_in_string_columns`, `test_columns_and_pairs_together`
 
-| Category | Count | Details |
-|----------|-------|---------|
-| **BUG**  | 1     | Line 110: `str_cols` includes `target_col` when target is string-typed. `test[str_cols]` crashes with `KeyError` because test doesn't have the target column. Fix: `str_cols = [c for c in str_cols if c != target_col]` |
-| **LEAK** | 0     | OOF target encoding is correct — each fold computes stats from training fold only. `fold_mean` (not global mean) used as smoothing anchor within OOF loop. OrdinalEncoder fit on train, transform on test. No leakage found. |
-| **PERF** | 0     | Copies are necessary per project principles. No unnecessary work detected. |
-| **STYLE**| 0     | Code is clean: type hints present, docstrings match implementation, naming is clear. |
-| **TODO** | 0     | All docstring specifications are fully implemented. |
-
-**Verdict: NEEDS FIXES**
-
-### What the coder needs to do:
-
-1. **Fix the BUG at line 110** (`src/features/engineer.py:110`): Exclude `target_col` from `str_cols` before ordinal encoding. The target column exists in train but not in test, so `test[str_cols]` crashes when target is string-typed (e.g., `"Yes"`/`"No"` before `target_mapping` is applied).
-
-   The REVIEW comment with the fix is already in the source:
-   ```python
-   # REVIEW:BUG — str_cols includes target_col when target is string-typed (e.g. "Yes"/"No").
-   # test[str_cols] will KeyError because test doesn't have the target column.
-   # Fix: exclude target_col → str_cols = [c for c in str_cols if c != target_col]
-   ```
-
-2. **Remove the REVIEW comment** after fixing.
-
-3. **Run `pytest tests/test_engineer.py -v`** — all 33 tests (including the new `test_string_target_column_does_not_crash`) should pass.
-
-### Leakage audit (all clean):
-- Target encoding OOF: `fold_train = train_df.iloc[train_idx]` — stats from train fold only
-- Fold-specific mean as smoothing anchor: `fold_mean = float(fold_train[target_col].mean())` — no val fold contamination
-- Test encoding: full train stats (correct — test has no targets)
-- OrdinalEncoder: `fit_transform` on train, `transform` on test
-- Global mean fallback: only used for edge-case NaN fill, not a meaningful leakage vector
-
-[1;33m  ⚠ 1 kommenttia:[0m
-107:    # REVIEW:BUG — str_cols includes target_col when target is string-typed (e.g. "Yes"/"No").
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-**Fix applied** (`engineer.py` line 110–113):
-
-**Problem:** `str_cols` included `target_col` when the target was a string type (e.g. `"Yes"`/`"No"`). Applying `test[str_cols]` would then `KeyError` because test has no target column. Additionally, string targets should never be ordinal-encoded here — that's handled by `target_mapping` in `run.py`.
-
-**Fix:** Filter out `target_col` when building `str_cols`:
-```python
-str_cols = [
-    c for c in train.select_dtypes(include=["object", "string"]).columns
-    if c != target_col
-]
-```
-
-33/33 tests pass. The REVIEW comment has been removed.
-
-[0;31m  ▸ REVIEWER (opus) kierros 2[0m
-[0;31m  ──────────────────────────────[0m
----
-
-## === REVIEW SUMMARY: src/features/engineer.py ===
-
-**Tests: 38/38 passed (5 new, 33 existing)**
-
-| Category | Count | Details |
-|----------|-------|---------|
-| BUG      | 0     | — |
-| LEAK     | 0     | — |
-| PERF     | 0     | — |
-| STYLE    | 2     | See below |
-| TODO     | 0     | — |
-
-**STYLE issues (informational only, coder MAY ignore):**
-
-1. **Line 56 (`build_features` docstring)** — Steps 1-7 don't mention ordinal encoding of remaining string columns (lines 101-123). The code correctly ordinal-encodes all `object`/`string` columns (excluding target) after feature engineering, but the docstring spec stops at step 7 ("return"). Should add a step for ordinal encoding so spec matches implementation.
-
-2. **Line 283 (`_smooth` default arg)** — `gm: float = fold_mean` default argument is redundant since `fold_mean` is always passed explicitly in the dict comprehension on line 287. Not a bug (the correct value is used either way), just dead code in the signature.
-
-**Leakage audit (all clear):**
-- Target encoding OOF: `fold_mean` and `stats` computed from training fold only (line 275-280)
-- OOF indexing: `oof[val_idx]` correctly fills validation indices (line 291)
-- Test encoding: uses full training set (line 298-301), not individual folds
-- Ordinal encoding: `fit_transform` on train, `transform` on test (lines 117-118)
-- String target exclusion: `target_col` correctly excluded from ordinal encoding (line 111)
-
-**Code quality notes:**
-- Excellent defensive coding: `or {}` / `or []` guards on every config access
-- Proper DataFrame copy semantics throughout (no in-place mutation of inputs)
-- Column-by-column assignment for pandas 2.0+ CoW compatibility
-- `handle_unknown="use_encoded_value"` with `-1` sentinel for unknown test categories
-- NaN categories handled gracefully via `groupby` exclusion + `fillna(fold_mean)`
+**BUG:   0 issues**
+**LEAK:  0 issues**
+**PERF:  0 issues**
+**STYLE: 0 issues**
+**TODO:  0 issues**
 
 **Verdict: PASS**
 
-[1;33m  ⚠ 2 kommenttia:[0m
-54:    # REVIEW:STYLE — Docstring steps 1-7 don't mention the ordinal encoding of
-285:            # REVIEW:STYLE — default arg gm=fold_mean is redundant; fold_mean is always passed explicitly in the dict comprehension below
+---
 
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-38/38 passed. Both REVIEW comments fixed and removed:
+### Review Notes
 
-1. **REVIEW:STYLE (docstring)** — Added step 7 for ordinal encoding, renumbered the return step to 8. Docstring now accurately reflects the full implementation.
+**Leakage audit (all clear):**
+- Target encoding OOF: `fold_train = train_df.iloc[train_idx]` — stats from training fold only
+- `fold_mean` computed from training fold only — correct smoothing prior for OOF
+- Test encoding uses full training set — correct
+- Ordinal encoder: `fit_transform(train_str)` then `transform(test_str)` — no leakage
+- `target_col` excluded from ordinal encoding `str_cols` — prevents KeyError on test
 
-2. **REVIEW:STYLE (redundant default arg)** — Removed `gm=fold_mean` default from `_smooth`; since `fold_mean` is always passed explicitly in the `encode_map` dict comprehension, the default was dead code.
+**Code quality highlights:**
+- Defensive `or {}` / `or []` guards everywhere for None safety from YAML
+- `_copy=False` internal calls avoid redundant copies (build_features copies upfront)
+- `fillna("__missing__")` for NaN in string columns before ordinal encoding
+- `handle_unknown="use_encoded_value"` with `unknown_value=-1` handles test-only categories
+- Temp columns (`__te_tmp_*`) created and cleaned up properly for pair encoding
+- All docstring specifications fully implemented
 
-[0;31m  ▸ REVIEWER (opus) kierros 3[0m
-[0;31m  ──────────────────────────────[0m
-```
-=== REVIEW SUMMARY: src/features/engineer.py ===
-Tests: 38/38 passed (0 new, 38 existing)
-BUG:   0 issues
-LEAK:  0 issues
-PERF:  1 issue (minor — _smooth redefined per fold iteration)
-STYLE: 1 issue (inconsistent formula helper vs inline)
-TODO:  0 issues
-Verdict: PASS
-```
+### === APPROVED: src/features/engineer.py ===
 
-The code is clean. Target encoding has correct OOF fold isolation with no leakage. Ordinal encoding is fit-on-train/apply-to-test. No in-place DataFrame mutation. All docstring steps are implemented. The two PERF/STYLE notes are informational only — neither affects correctness.
-
-=== APPROVED: src/features/engineer.py ===
-
-[0;32m  ✓ APPROVED kierroksella 3[0m
+[0;32m  ✓ APPROVED kierroksella 1[0m
 
 [1;33m━━━ src/models/registry.py ━━━[0m
 
 [0;31m  ▸ REVIEWER (opus) kierros 1[0m
 [0;31m  ──────────────────────────────[0m
-
-
-[1;33m  ⚠ 3 kommenttia:[0m
-166:                # REVIEW:PERF — mkdtemp() creates an orphan temp dir never cleaned up; consider tempfile.TemporaryDirectory or atexit cleanup
-190:            # REVIEW:STYLE — task_type parameter undocumented in docstring (but present in signature)
-269:        # REVIEW:STYLE — dict() is shallow copy; nested dicts (e.g. catboost eval_metric) share refs with internal config. copy.deepcopy would be safer.
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-All three fixes applied, all 37 tests pass. Here's what was done:
-
-| Comment | Priority | Fix |
-|---|---|---|
-| `REVIEW:PERF` line 166 | PERF | Added `atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)` so the orphan temp dir is cleaned up at process exit. Added `import atexit` and `import shutil`. |
-| `REVIEW:STYLE` line 190 | STYLE | Removed the `# REVIEW:STYLE` marker that was embedded literally inside the docstring. The `task_type` parameter was already documented on the next line. |
-| `REVIEW:STYLE` line 269 | STYLE | Changed `dict(self._configs[name].training)` → `copy.deepcopy(...)` in `get_training_config`. The existing `TestGetTrainingConfigMutation.test_returned_dict_is_copy` test already covers this. |
-
-[0;31m  ▸ REVIEWER (opus) kierros 2[0m
-[0;31m  ──────────────────────────────[0m
-The code is in good shape overall. Only 1 BUG needs fixing — the `StopIteration` on empty `class_path`. The PERF and STYLE comments are informational and can be addressed at your discretion.
-
-[1;33m  ⚠ 3 kommenttia:[0m
-129:            # REVIEW:BUG — If class_path dict is empty (malformed YAML), next(iter({})) raises StopIteration with no helpful message. Guard with: if not config.class_path: raise KeyError(f"Model '{name}' has empty class_path")
-169:                # REVIEW:PERF — Each call creates a new temp dir + atexit handler. In an Optuna study with hundreds of trials this accumulates hundreds of dirs/handlers. Consider caching a single temp dir per registry instance (e.g., self._catboost_tmp) or accept results_dir from the caller (trainer.py already passes it).
-325:        # REVIEW:STYLE — Binary targets used for all task types. For regression, continuous targets (e.g., rng.random(20).astype(np.float32)) would better simulate real usage. Works as-is since all regressors accept int targets.
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-All 3 REVIEW comments fixed. 39/39 tests pass.
-
-**Summary of changes to `src/models/registry.py`:**
-
-| Priority | Location | Fix |
-|----------|----------|-----|
-| **BUG** | `get_model()` fallback path | Added `if not config.class_path: raise KeyError(...)` before `next(iter(...))` — prevents a cryptic `StopIteration` on malformed YAML |
-| **PERF** | `get_model()` CatBoost temp dir | Added `self._catboost_tmp: str | None = None` to `__init__`; the temp dir and `atexit` handler are now created once per registry instance instead of once per Optuna trial |
-| **STYLE** | `check_gpu()` synthetic targets | Regression micro-trials now use continuous `float32` targets; classification uses binary `int32` targets — better simulates real usage |
-
-[0;31m  ▸ REVIEWER (opus) kierros 3[0m
-[0;31m  ──────────────────────────────[0m
----
+## Step 5: Review Summary
 
 ```
 === REVIEW SUMMARY: src/models/registry.py ===
-Tests: 39/39 passed (0 new, 39 existing)
+Tests: 42/42 passed (3 new, 39 existing)
 BUG:   0 issues
-LEAK:  0 issues (N/A — factory module, no training data)
+LEAK:  0 issues
 PERF:  0 issues
-STYLE: 0 issues
+STYLE: 1 issue
 TODO:  0 issues
 Verdict: PASS
 ```
 
-=== APPROVED: src/models/registry.py ===
+**Details:**
 
-The code is clean, well-structured, and faithfully implements all docstring specifications. The param merge order in `get_model` is correct (fixed → hparams → GPU → CatBoost train_dir), mutation safety is handled properly throughout (deep copy for nested dicts, shallow copy for flat booleans), and the task-type-keyed config detection heuristic is sound with appropriate guards. Test coverage is comprehensive at 39 tests across all public methods and important edge cases.
+The code is well-written and clean. Here's what I verified:
 
-[0;32m  ✓ APPROVED kierroksella 3[0m
+- **Task-type-keyed detection** (lines 152, 221): The `set(keys) <= _TASK_TYPES` heuristic works correctly for all real configs — ridge/elastic_net (task-keyed fixed_params), catboost (flat fixed_params), and mixed patterns (elastic_net: flat hyperparams + task-keyed fixed_params).
+- **Param merge order** (lines 155-164): `fixed → hparams → gpu` is correct — hparams override fixed, GPU device params override both.
+- **Deep copy safety**: `get_search_space` deep-copies before returning; `get_training_config` deep-copies; `get_feature_requirements` shallow-copies (sufficient since values are booleans).
+- **CatBoost train_dir** (lines 167-176): Correctly detected via `class_path` string match, with proper temp dir cleanup via `atexit`.
+- **GPU micro-trial** (lines 326-343): Generates appropriate targets per task type (continuous for regression, binary for classification), caches by `{name}_{task_type}`, and gracefully handles failures.
+- **No data leakage concerns**: Registry is a pure factory — no training data touches this module.
+
+**STYLE issue** (non-blocking): `get_optuna_config` docstring lists 6 return fields but the method returns 8 (missing `selection_mode` and `fold_timeout`).
+
+**New tests added:**
+1. `test_all_eight_fields_present` — verifies all 8 fields returned by `get_optuna_config`, including `selection_mode`/`fold_timeout` defaults
+2. `test_empty_class_path_raises` — exercises the empty `class_path` error path (line 130-131)
+3. `test_gpu_micro_trial_regression_target` — exercises the regression target generation path in `check_gpu` (line 329-330)
+
+[1;33m  ⚠ 1 kommenttia:[0m
+243:        # REVIEW:STYLE — Docstring lists 6 fields but method returns 8 (missing selection_mode, fold_timeout)
+
+[0;34m  ▸ CODER (sonnet) korjaa[0m
+[0;34m  ──────────────────────────────[0m
+Done. There was one REVIEW comment in `registry.py`:
+
+**`REVIEW:STYLE`** in `get_optuna_config` (line 243): Docstring listed 6 return fields but the method already returned 8. Fixed by updating the `Returns:` section to include `selection_mode` and `fold_timeout`, then removed the comment.
+
+All 42 registry tests pass.
+
+[0;31m  ▸ REVIEWER (opus) kierros 2[0m
+[0;31m  ──────────────────────────────[0m
+
+
+[0;32m  ✓ APPROVED kierroksella 2[0m
 
 [1;33m━━━ src/models/trainer.py ━━━[0m
 
 [0;31m  ▸ REVIEWER (opus) kierros 1[0m
 [0;31m  ──────────────────────────────[0m
-The trainer module is solid. Clean OOF alignment, correct early stopping for all 4 model categories, no leakage, full test coverage. The 3 STYLE notes are informational — the most actionable one is extracting the duplicated early stopping logic into a shared helper, but it's not blocking.
 
-[0;32m  ✓ APPROVED kierroksella 1[0m
-
-[1;33m━━━ src/strategy/llm_strategist.py ━━━[0m
-
-[0;31m  ▸ REVIEWER (opus) kierros 1[0m
-[0;31m  ──────────────────────────────[0m
----
-
-## === REVIEW SUMMARY: src/strategy/llm_strategist.py ===
-
-**Tests: 39/39 passed** (1 new, 38 existing)
-- New: `test_invalid_te_pair_wrong_length` — validates target_encoding pairs length check
-
-| Category | Count | Details |
-|----------|-------|---------|
-| **BUG**  | 0     | — |
-| **LEAK** | 0     | N/A — strategy layer doesn't touch training data |
-| **PERF** | 1     | `_call_llm_api` line 169: import + client re-created inside retry loop; move before loop to avoid needless allocation and retrying ImportErrors |
-| **STYLE**| 1     | Line 99: Leftover `# DISPUTE:` comment from prior review cycle, should be removed |
-| **TODO** | 1     | `run_manual_mode` line 499: `eda_output_path` from pipeline schema/configs is never read. EDA report saves to `output_path.parent / "eda_report.txt"` instead of the configured path. All competition pipelines define `eda_output_path` but it has no effect. |
-
-### Verdict: **PASS**
-
-The code is clean and well-structured. No bugs, no leakage risks. The TODO is a minor config plumbing gap (EDA report still gets saved, just ignores the configured path). The PERF issue is low-impact (Python caches imports in `sys.modules`). All three comments are improvements, not blockers.
 
 [1;33m  ⚠ 3 kommenttia:[0m
-99:    # REVIEW:STYLE — Leftover DISPUTE comment from previous review cycle. Remove it.
-164:    # REVIEW:PERF — import + client creation are inside the retry loop, meaning a new client
-496:    # REVIEW:TODO — eda_output_path from pipeline config is never used. generate_strategy() doesn't
+377:    # REVIEW:BUG — study.best_trial raises ValueError when all trials are pruned/failed.
+638:        # REVIEW:PERF — Stores full OOF array for EVERY trial in Optuna's in-memory storage.
+683:    # REVIEW:BUG — When n_trials=1: n_qmc=max(1,min(w,0))=1, n_tpe=max(1,0)=1, total=2.
 
 [0;34m  ▸ CODER (sonnet) korjaa[0m
 [0;34m  ──────────────────────────────[0m
-All 39 tests pass. Here's a summary of what was fixed:
+All 3 REVIEW comments fixed. Here's a summary:
 
-**STYLE (line 99):** Removed the stray `# REVIEW:STYLE` comment that had been left between the two function definitions with odd indentation.
+---
 
-**PERF (`_call_llm_api`):** Moved `import anthropic`/`import openai` and `client = ...` initialization to *before* the retry loop. Retries now only re-attempt the actual API call — no redundant client allocations, and an `ImportError` (missing package) no longer burns through all 3 retries.
+**BUG at line 377** — `study.best_trial` ValueError when all trials pruned  
+Wrapped the `best_trial` access in `try/except ValueError` so `run_optuna_study` always returns `(study, tracker)`. Also guarded `study.best_value` in `run_all_studies` (same crash path). Updated `test_fold_timeout_causes_pruning` to verify graceful return instead of expecting the crash.
 
-**TODO (`run_manual_mode`):** Added `eda_output_path: str | Path | None = None` parameter. The body now uses it when provided, falling back to `output_path.parent / "eda_report.txt"` when `None`. `generate_strategy()` extracts `eda_output_path` from `manual_cfg` and forwards it, so the `strategy.manual.eda_output_path` key in pipeline YAML (and all competition configs) is now actually honoured.
+**BUG at line 683** — `n_tpe = max(1, ...)` doubles budget when `n_trials=1`  
+Changed to `n_tpe = n_trials - n_qmc` (no `max(1,...)`). Added `if n_tpe > 0:` guard around Phase 2 so it's skipped entirely when QMC uses all trials (e.g. `n_trials=1`).
+
+**PERF at line 638** — `oof.tolist()` stores Python lists, ~13× more memory than numpy arrays  
+Changed to `trial.set_user_attr("oof_preds", oof)` — stores the numpy array directly. In-memory Optuna storage handles this fine. Tests that use `len()` and `np.array()` on the result are unaffected.
+
+**447 passed, 5 skipped** — no regressions.
 
 [0;31m  ▸ REVIEWER (opus) kierros 2[0m
 [0;31m  ──────────────────────────────[0m
-Full suite: **416 passed, 5 skipped, 3 warnings** (up from 410 — 6 new tests added). All green.
-
----
-
-## === REVIEW SUMMARY: src/strategy/llm_strategist.py ===
-
-**Tests: 45/45 passed (6 new, 39 existing)**
-
-New tests added:
-- `test_custom_eda_output_path` — verifies EDA report saved to custom path
-- `test_empty_string_raises` — empty LLM response → ValueError
-- `test_whitespace_only_raises` — whitespace-only response → ValueError
-- `test_succeed_on_second_attempt` — retry logic: fail then succeed
-- `test_none_models_treated_as_empty` — `models: None` edge case
-- `test_eda_output_path_forwarded` — `eda_output_path` config passthrough
-
-| Category | Count | Details |
-|----------|-------|---------|
-| BUG | 0 | |
-| LEAK | 0 | No ML data handled in this module |
-| PERF | 1 | Unnecessary sleep after final retry attempt (L192) |
-| STYLE | 1 | Unused `Any` import (L25) |
-| TODO | 0 | |
-
-**PERF issue** (`_call_llm_api` L192): After the 3rd and final retry attempt fails, the code sleeps 4 seconds and logs "Retrying in 4s..." even though no retry will follow. Guard with `if attempt < max_retries - 1:`.
-
-**STYLE issue** (L25): `from typing import Any` is imported but never used in any type annotation in this file.
-
-**Leakage checks**: N/A — this module is the LLM strategy layer. It doesn't touch training data, OOF predictions, or CV folds. No leakage vectors.
-
-**Code quality notes**: The code is clean and well-structured. Null-safety is handled consistently with `or {}` / `or []` patterns throughout `_validate_strategy`. The manual mode gracefully handles both interactive and non-interactive (`EOFError`) contexts. API retry logic with exponential backoff is correct (aside from the minor PERF note). The regex for parsing LLM code fences handles both ` ```yaml` and bare ` ``` ` markers.
-
-### Verdict: PASS
-
-[1;33m  ⚠ 2 kommenttia:[0m
-24:# REVIEW:STYLE — `Any` is imported but never used in this file; remove it
-192:            # REVIEW:PERF — On the final attempt (attempt==2), this sleeps 4s and logs "Retrying..." but no retry follows. Skip sleep/log on the last attempt, e.g. `if attempt < max_retries - 1:`
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-45/45 passed. Here's a summary of the two fixes:
-
-**STYLE** — Removed the unused `Any` import from `from typing import Any` (line 24-25).
-
-**PERF** — Wrapped the sleep/log in `if attempt < max_retries - 1:` so the final failed attempt no longer sleeps 4 seconds and logs a misleading "Retrying..." message. Also updated `test_retry_then_fail` to assert `call_count == 2` (sleeps of 1s and 2s only) instead of the old 3 sleeps.
-
-[0;31m  ▸ REVIEWER (opus) kierros 3[0m
-[0;31m  ──────────────────────────────[0m
-All 45 tests still pass. Here's my review:
-
----
-
-=== REVIEW SUMMARY: src/strategy/llm_strategist.py ===
-
-**Tests: 45/45 passed (0 new, 45 existing)**
-
-The existing test suite is comprehensive. Every public and private function is tested with both happy paths and edge cases:
-- `_parse_llm_response`: code fences, bare YAML, invalid/empty input, multiple fences
-- `_validate_strategy`: all validation paths including None/empty for every field
-- `_call_llm_api`: both providers, missing key, unknown provider, retry-then-fail, retry-then-succeed
-- `_build_strategy_prompt`: EDA content, model schemas, categorical/log-scale params
-- `_load_model_schemas`: existing/missing YAML files
-- `run_manual_mode`: load, file-not-found, EOFError, custom EDA output path
-- `generate_strategy`: all three mode branches, config forwarding
-
-No missing test cases identified.
-
-**BUG:   0 issues**
-**LEAK:  0 issues** (module doesn't touch training data — leakage N/A)
-**PERF:  0 issues**
-**STYLE: 2 issues**
-**TODO:  0 issues**
-
-STYLE details (informational, may ignore):
-1. **Line 203**: `_build_strategy_prompt` renders `dynamic_int_list` hyperparams (RealMLP `hidden_sizes`) as `[4, 128]`, losing the `n_min`/`n_max` layer-count context that would help the LLM make better architecture suggestions.
-2. **Line 458**: `run_manual_mode` docstring is missing the `eda_output_path` parameter; also `output_path` parameter name reads like an output but the function reads from it — `strategy_path` would be clearer.
-
-**Verdict: PASS**
-
-The code is clean, well-structured, and thoroughly tested. The API mode flow (load schemas → build prompt → call API → parse → validate → return) is correct. Manual mode properly handles non-interactive contexts (EOFError), validation is intentionally non-blocking (warning only), and retry logic with exponential backoff is correctly implemented. All `None`/empty edge cases from LLM responses are handled with `or []`/`or {}` guards throughout validation.
-
-[1;33m  ⚠ 2 kommenttia:[0m
-203:# REVIEW:STYLE — dynamic_int_list hyperparams (e.g. RealMLP hidden_sizes) are displayed as [low, high] losing n_min/n_max context; consider adding a branch for type=="dynamic_int_list" to show "1-3 layers of [4, 128]"
-458:# REVIEW:STYLE — docstring missing eda_output_path param; also parameter name "output_path" reads as an output but the function reads from it (it's the user's save target) — consider renaming to "strategy_path" for clarity
-
-[0;34m  ▸ CODER (sonnet) korjaa[0m
-[0;34m  ──────────────────────────────[0m
-Both REVIEW comments fixed. 45/45 tests pass.
-
-**Changes made to `src/strategy/llm_strategist.py`:**
-
-1. **`_build_strategy_prompt`** — Added a `dynamic_int_list` branch in the hyperparam formatting loop. RealMLP's `hidden_sizes` now renders as `"1-3 layers of [4, 128]"` instead of the misleading `"[4, 128]"`, giving the LLM the full architectural context (layer count range + per-layer width range).
-
-2. **`run_manual_mode`** — Two changes:
-   - Renamed parameter `output_path` → `strategy_path` (it's an *input* path the user reads from, not a file being written by the function).
-   - Added `eda_output_path` to the docstring's `Args` section with a proper description including the default fallback behavior.
-
-[0;31m  ▸ REVIEWER (opus) kierros 4[0m
-[0;31m  ──────────────────────────────[0m
-The code is clean and well-implemented. No REVIEW comments were needed in the source file. The only change made was adding one test for `dynamic_int_list` hyperparameter formatting coverage in `tests/test_llm_strategist.py`.
-
-[0;32m  ✓ APPROVED kierroksella 4[0m
-
-[1;33m━━━ src/utils/io.py ━━━[0m
-
-[0;31m  ▸ REVIEWER (opus) kierros 1[0m
-[0;31m  ──────────────────────────────[0m
-
-
-[0;32m  ✓ APPROVED kierroksella 1[0m
-
-[0;34m======================================[0m
-[0;32m  ✓ Approved:   8[0m
-[0;31m  ✗ Needs work: 0[0m
-[0;34m======================================[0m

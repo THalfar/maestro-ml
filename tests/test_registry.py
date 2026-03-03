@@ -214,6 +214,20 @@ class TestGetOptunaConfig:
         assert cfg["n_top_trials"] == 1
         assert cfg["n_seeds"] == 1
 
+    def test_all_eight_fields_present(self, registry: ModelRegistry):
+        """get_optuna_config must return all 8 fields including selection_mode and fold_timeout."""
+        cfg = registry.get_optuna_config("ridge")
+        expected_keys = {
+            "n_trials", "qmc_warmup_trials", "timeout", "pruner",
+            "n_top_trials", "n_seeds", "selection_mode", "fold_timeout",
+        }
+        assert set(cfg.keys()) == expected_keys
+        assert cfg["qmc_warmup_trials"] == 6
+        assert cfg["timeout"] is None
+        assert cfg["pruner"] == {"type": "none"}
+        assert cfg["selection_mode"] == "global"  # default
+        assert cfg["fold_timeout"] is None  # default
+
     def test_unknown_model_raises(self, registry: ModelRegistry):
         with pytest.raises(KeyError):
             registry.get_optuna_config("nope")
@@ -296,6 +310,39 @@ class TestCheckGpu:
         assert result is False
         assert reg._gpu_status["fakegpu_binary_classification"] is False
 
+    def test_gpu_micro_trial_regression_target(self, tmp_path: Path):
+        """Regression micro-trial should generate continuous targets, not binary."""
+        configs_dir = tmp_path / "gpu_reg"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "FakeGPUReg",
+            "class_path": {
+                "regression": "sklearn.ensemble.RandomForestRegressor",
+            },
+            "task_types": ["regression"],
+            "gpu": {
+                "supported": True,
+                "params": {"INVALID_PARAM_XYZ": True},
+                "fallback": {},
+            },
+            "hyperparameters": {},
+            "fixed_params": {},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 5, "qmc_warmup_trials": 2,
+                "n_top_trials": 1, "n_seeds": 1,
+            },
+        }
+        (configs_dir / "fakegpu_reg.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+        # Micro-trial fails (invalid param) but exercises the regression target path
+        result = reg.check_gpu("fakegpu_reg", task_type="regression")
+        assert result is False
+        assert "fakegpu_reg_regression" in reg._gpu_status
+
 
 # ---------------------------------------------------------------------------
 # get_model — edge cases
@@ -311,6 +358,26 @@ class TestGetModelEdgeCases:
         # Should fall back to binary_classification (first key)
         from sklearn.linear_model import LogisticRegression
         assert isinstance(model, LogisticRegression)
+
+    def test_empty_class_path_raises(self, tmp_path: Path):
+        """Model with empty class_path dict should raise KeyError."""
+        configs_dir = tmp_path / "empty_cp"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "EmptyCP",
+            "class_path": {},
+            "task_types": [],
+            "gpu": {"supported": False},
+            "hyperparameters": {},
+            "fixed_params": {},
+            "training": {},
+            "feature_requirements": {},
+            "optuna": {"n_trials": 5, "qmc_warmup_trials": 2, "n_top_trials": 1, "n_seeds": 1},
+        }
+        (configs_dir / "empty_cp.yaml").write_text(yaml.dump(cfg), encoding="utf-8")
+        reg = ModelRegistry(configs_dir)
+        with pytest.raises(KeyError, match="empty class_path"):
+            reg.get_model("empty_cp", hparams={})
 
     def test_import_error_bad_class_path(self, tmp_path: Path):
         """Bad class_path should raise ImportError."""
@@ -380,6 +447,41 @@ class TestGetModelEdgeCases:
         assert model_gpu.n_jobs == 1
 
         model_cpu = reg.get_model("rf_gpu", hparams={}, gpu=False)
+        assert model_cpu.n_jobs == -1
+
+    def test_gpu_params_override_hparams(self, tmp_path: Path):
+        """GPU params must override hparams (safety: e.g., CatBoost task_type: GPU)."""
+        configs_dir = tmp_path / "gpu_override"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "RFOverride",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {
+                "supported": True,
+                "params": {"n_jobs": 1},
+                "fallback": {"n_jobs": -1},
+            },
+            "hyperparameters": {},
+            "fixed_params": {"random_state": 0},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 5, "qmc_warmup_trials": 2,
+                "n_top_trials": 1, "n_seeds": 1,
+            },
+        }
+        (configs_dir / "rf_override.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+        # hparams says n_jobs=4, but gpu.params says n_jobs=1 — GPU must win
+        model = reg.get_model("rf_override", hparams={"n_jobs": 4}, gpu=True)
+        assert model.n_jobs == 1
+        # CPU fallback: hparams says n_jobs=4, fallback says n_jobs=-1 — fallback must win
+        model_cpu = reg.get_model("rf_override", hparams={"n_jobs": 4}, gpu=False)
         assert model_cpu.n_jobs == -1
 
     def test_catboost_train_dir_with_results_dir(self, tmp_path: Path):

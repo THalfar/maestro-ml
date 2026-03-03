@@ -16,7 +16,7 @@ conda run -n maestro pytest -k "test_blend" -v
 conda run -n maestro pytest tests/ -x -v
 ```
 
-Expected: **264 tests, ~4s** (no GPU, no real Optuna studies — all use tiny synthetic data).
+Expected: **427 tests, ~5s** (no GPU, no real Optuna studies — all use tiny synthetic data).
 
 ## Test File → Source Module Mapping
 
@@ -65,6 +65,12 @@ model = LogisticRegression()
 
 ### Testing OOF leakage (engineer.py)
 The target encoding tests check that val-fold values were computed only from train-fold data. See `test_engineer.py` for the pattern.
+
+### Testing per-fold selection (test_trainer.py)
+- `TestPerFoldTracker` — Unit tests for PerFoldTracker: top-N tracking, minimize/maximize, assemble shapes, pruned trials contribute, rank ordering.
+- `TestPerFoldIntegration` — Integration tests: run_optuna returns tracker, assembled OOF valid probabilities, run_all_studies per_fold mode, global mode unchanged.
+- Uses a `per_fold_configs_dir` fixture with `selection_mode: per_fold` and `n_top_trials: 3`.
+- `run_optuna_study()` returns `tuple[Study, PerFoldTracker | None]` — all callers unpack with `study, _ = ...`.
 
 ### Testing new model YAMLs (test_new_models.py)
 Each new model config needs at minimum:

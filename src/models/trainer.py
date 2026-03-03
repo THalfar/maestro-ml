@@ -374,12 +374,17 @@ def run_optuna_study(
         verbose=pipeline_config.runtime.verbose,
     )
 
-    best = study.best_trial
-    display_params = _reassemble_int_lists(dict(best.params))
-    logger.info(
-        f"[{model_name}] Best trial #{best.number}: "
-        f"value={best.value:.6f}, params={display_params}"
-    )
+    try:
+        best = study.best_trial
+        display_params = _reassemble_int_lists(dict(best.params))
+        logger.info(
+            f"[{model_name}] Best trial #{best.number}: "
+            f"value={best.value:.6f}, params={display_params}"
+        )
+    except ValueError:
+        logger.warning(
+            f"[{model_name}] No completed trials — all were pruned or failed."
+        )
 
     return study, tracker
 
@@ -631,7 +636,7 @@ def _create_objective(
                 raise optuna.exceptions.TrialPruned()
 
         overall_metric = _compute_cv_metric(y, oof, task_type)
-        trial.set_user_attr("oof_preds", oof.tolist())
+        trial.set_user_attr("oof_preds", oof)  # numpy array: ~13x less memory than list
         return overall_metric
 
     return objective
@@ -673,9 +678,8 @@ def _run_two_phase_study(
            Run study.optimize(objective, n_trials=n_tpe, timeout=remaining).
         5. Log phase completion summaries.
     """
-    # Cap QMC so QMC + TPE = n_trials exactly (docstring contract).
     n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
-    n_tpe = max(1, n_trials - n_qmc)
+    n_tpe = n_trials - n_qmc  # QMC + TPE = n_trials exactly
 
     start_time = time.time()
 
@@ -732,26 +736,27 @@ def _run_two_phase_study(
         f"Phase 1 done: {len(study.trials)} trials completed in {qmc_elapsed:.1f}s"
     )
 
-    # Phase 2: TPE
-    remaining_timeout = None
-    if timeout is not None:
-        remaining_timeout = max(1, timeout - int(qmc_elapsed))
+    # Phase 2: TPE — skipped when all trials were consumed by QMC (e.g. n_trials=1)
+    if n_tpe > 0:
+        remaining_timeout = None
+        if timeout is not None:
+            remaining_timeout = max(1, timeout - int(qmc_elapsed))
 
-    logger.info(f"Phase 2 (TPE): {n_tpe} trials")
-    study.sampler = optuna.samplers.TPESampler(
-        seed=global_seed, n_startup_trials=0
-    )
-    study.optimize(
-        objective,
-        n_trials=n_tpe,
-        timeout=remaining_timeout,
-        callbacks=[_progress_callback],
-        show_progress_bar=False,
-    )
-    total_elapsed = time.time() - start_time
-    logger.info(
-        f"Phase 2 done: {len(study.trials)} total trials in {total_elapsed:.1f}s"
-    )
+        logger.info(f"Phase 2 (TPE): {n_tpe} trials")
+        study.sampler = optuna.samplers.TPESampler(
+            seed=global_seed, n_startup_trials=0
+        )
+        study.optimize(
+            objective,
+            n_trials=n_tpe,
+            timeout=remaining_timeout,
+            callbacks=[_progress_callback],
+            show_progress_bar=False,
+        )
+        total_elapsed = time.time() - start_time
+        logger.info(
+            f"Phase 2 done: {len(study.trials)} total trials in {total_elapsed:.1f}s"
+        )
 
 
 def train_with_config(
@@ -1090,13 +1095,17 @@ def run_all_studies(
             )
             n_failed = len(study.trials) - n_completed - n_pruned
             avg_trial_time = optuna_elapsed / max(len(study.trials), 1)
+            try:
+                best_val_str = f"{study.best_value:.6f}"
+            except ValueError:
+                best_val_str = "n/a"
             logger.info(
                 f"[{model_name}] Optuna done in {optuna_elapsed:.0f}s "
                 f"({optuna_elapsed / 60:.1f}min) | "
                 f"{len(study.trials)} trials "
                 f"({n_completed} ok, {n_pruned} pruned, {n_failed} failed) | "
                 f"avg {avg_trial_time:.1f}s/trial | "
-                f"best={study.best_value:.6f}"
+                f"best={best_val_str}"
             )
 
             # Hyperparameter importance (fANOVA)

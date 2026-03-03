@@ -242,7 +242,8 @@ class ModelRegistry:
 
         Returns:
             Dictionary with n_trials, qmc_warmup_trials, timeout, pruner,
-            n_top_trials, n_seeds (from the model's optuna YAML section).
+            n_top_trials, n_seeds, selection_mode, fold_timeout
+            (from the model's optuna YAML section).
 
         Steps:
             1. Look up the ModelConfig from self._configs[name].

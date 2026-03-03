@@ -288,6 +288,30 @@ class TestAddTargetEncoding:
         assert train_enc["cat_te"].isna().sum() == 0
         assert test_enc["cat_te"].isna().sum() == 0
 
+    def test_columns_and_pairs_together(self, train_df: pd.DataFrame,
+                                         test_df: pd.DataFrame,
+                                         cv_folds: StratifiedKFold):
+        """Encoding single columns and pairs in one call should not interfere."""
+        train_enc, test_enc = _add_target_encoding(
+            train=train_df, test=test_df,
+            columns=["cat_x", "cat_y"],
+            pairs=[["cat_x", "cat_y"]],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        # All three TE columns should exist
+        assert "cat_x_te" in train_enc.columns
+        assert "cat_y_te" in train_enc.columns
+        assert "cat_x_cat_y_te" in train_enc.columns
+        # No NaN in any output
+        for col in ["cat_x_te", "cat_y_te", "cat_x_cat_y_te"]:
+            assert train_enc[col].isna().sum() == 0, f"NaN found in train {col}"
+            assert test_enc[col].isna().sum() == 0, f"NaN found in test {col}"
+        # Pair encoding should differ from single-column encodings
+        assert not np.allclose(
+            train_enc["cat_x_te"].values, train_enc["cat_x_cat_y_te"].values
+        ), "Pair TE should differ from single-column TE"
+
 
 # ---------------------------------------------------------------------------
 # _add_custom_features
@@ -505,6 +529,33 @@ class TestBuildFeatures:
         for col in ["MSZoning", "Neighborhood", "ExterQual"]:
             assert pd.api.types.is_numeric_dtype(train_out[col]), f"{col} not numeric in train"
             assert pd.api.types.is_numeric_dtype(test_out[col]), f"{col} not numeric in test"
+
+    def test_ordinal_encoding_handles_nan_in_string_columns(self):
+        """NaN in string columns should be encoded via __missing__ placeholder."""
+        rng = np.random.default_rng(42)
+        n = 50
+        cats = rng.choice(["A", "B", "C"], n).tolist()
+        cats[0] = None
+        cats[5] = None
+        train = pd.DataFrame({
+            "cat": pd.array(cats, dtype="object"),
+            "num": rng.normal(0, 1, n),
+            "target": rng.choice([0, 1], n).astype(float),
+        })
+        test_cats = ["A", None, "B", "C"]
+        test = pd.DataFrame({
+            "cat": pd.array(test_cats, dtype="object"),
+            "num": rng.normal(0, 1, 4),
+        })
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train, test, strategy, target_col="target")
+        # NaN rows should be encoded (not left as NaN or crashing)
+        assert pd.api.types.is_numeric_dtype(train_out["cat"])
+        assert pd.api.types.is_numeric_dtype(test_out["cat"])
+        assert train_out["cat"].isna().sum() == 0
+        assert test_out["cat"].isna().sum() == 0
+        # The two NaN rows in train should have the same encoded value
+        assert train_out["cat"].iloc[0] == train_out["cat"].iloc[5]
 
 
 # ---------------------------------------------------------------------------
