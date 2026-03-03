@@ -21,7 +21,6 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -88,7 +87,8 @@ def generate_strategy(
         strategy_input_path = manual_cfg.get(
             "strategy_input_path", "results/strategy.yaml"
         )
-        strategy = run_manual_mode(eda_report, strategy_input_path)
+        eda_output_path = manual_cfg.get("eda_output_path")
+        strategy = run_manual_mode(eda_report, strategy_input_path, eda_output_path=eda_output_path)
         logger.info("Strategy loaded from manual mode.")
         return strategy
 
@@ -160,11 +160,16 @@ def _call_llm_api(prompt: str, config: dict) -> str:
     if provider not in ("anthropic", "openai"):
         raise ValueError(f"Unknown provider: '{provider}'")
 
+    if provider == "anthropic":
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    else:  # openai
+        import openai
+        client = openai.OpenAI(api_key=api_key)
+
     for attempt in range(max_retries):
         try:
             if provider == "anthropic":
-                import anthropic
-                client = anthropic.Anthropic(api_key=api_key)
                 message = client.messages.create(
                     model=model_id,
                     max_tokens=max_tokens,
@@ -173,8 +178,6 @@ def _call_llm_api(prompt: str, config: dict) -> str:
                 return message.content[0].text
 
             else:  # openai
-                import openai
-                client = openai.OpenAI(api_key=api_key)
                 response = client.chat.completions.create(
                     model=model_id,
                     max_tokens=max_tokens,
@@ -184,12 +187,13 @@ def _call_llm_api(prompt: str, config: dict) -> str:
 
         except Exception as exc:
             last_exc = exc
-            wait_time = 2 ** attempt  # exponential backoff
-            logger.warning(
-                f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {exc}. "
-                f"Retrying in {wait_time}s..."
-            )
-            time.sleep(wait_time)
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # exponential backoff
+                logger.warning(
+                    f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {exc}. "
+                    f"Retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
 
     raise RuntimeError(
         f"LLM API call failed after {max_retries} attempts. Last error: {last_exc}"
@@ -245,6 +249,12 @@ def _build_strategy_prompt(
         for param, spec in hparams.items():
             if spec.get("type") == "categorical":
                 desc = f"choices={spec.get('choices')}"
+            elif spec.get("type") == "dynamic_int_list":
+                n_min = spec.get("n_min", 1)
+                n_max = spec.get("n_max", 4)
+                lo = spec.get("low")
+                hi = spec.get("high")
+                desc = f"{n_min}-{n_max} layers of [{lo}, {hi}]"
             else:
                 lo = spec.get("low")
                 hi = spec.get("high")
@@ -435,6 +445,12 @@ def _validate_strategy(
     if not isinstance(te_columns, list) or not all(isinstance(c, str) for c in te_columns):
         raise ValueError(f"target_encoding.columns must be a list of strings, got: {te_columns}")
 
+    for pair in (te.get("pairs", []) or []):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                f"target_encoding pair must be a list of exactly 2 column names, got: {pair}"
+            )
+
     for item in (features.get("custom", []) or []):
         if not isinstance(item, dict) or "name" not in item or "formula" not in item:
             raise ValueError(
@@ -446,7 +462,8 @@ def _validate_strategy(
 
 def run_manual_mode(
     eda_report: dict,
-    output_path: str | Path,
+    strategy_path: str | Path,
+    eda_output_path: str | Path | None = None,
 ) -> dict:
     """Run the human-in-the-loop manual strategy mode.
 
@@ -455,7 +472,10 @@ def run_manual_mode(
 
     Args:
         eda_report: Complete EDA report dict from Layer 1.
-        output_path: Path where the user should save the strategy YAML.
+        strategy_path: Path where the user should save the strategy YAML
+                       (the file this function reads after the user presses Enter).
+        eda_output_path: Optional path to save the formatted EDA report as a
+                         text file. Defaults to <strategy_path parent>/eda_report.txt.
 
     Returns:
         Parsed strategy dictionary from the user-provided YAML file.
@@ -478,13 +498,13 @@ def run_manual_mode(
     from src.eda.profiler import format_eda_for_llm
     from src.utils.io import load_yaml
 
-    output_path = Path(output_path)
+    strategy_path = Path(strategy_path)
     formatted_eda = format_eda_for_llm(eda_report)
 
     print(formatted_eda)
 
     # Save EDA to file for easy copy
-    eda_text_path = output_path.parent / "eda_report.txt"
+    eda_text_path = Path(eda_output_path) if eda_output_path else strategy_path.parent / "eda_report.txt"
     eda_text_path.parent.mkdir(parents=True, exist_ok=True)
     eda_text_path.write_text(formatted_eda, encoding="utf-8")
     print(f"\n[EDA report also saved to: {eda_text_path}]")
@@ -498,7 +518,7 @@ def run_manual_mode(
     print(f"     Copy the full prompt into Claude / ChatGPT.")
     print(f"  2. Replace [PASTE EDA REPORT HERE] with the EDA report above")
     print(f"     (or from: {eda_text_path})")
-    print(f"  3. Save the LLM's YAML response to: {output_path}")
+    print(f"  3. Save the LLM's YAML response to: {strategy_path}")
     print("  4. Press Enter here when done.")
     print("=" * 60)
 
@@ -508,13 +528,13 @@ def run_manual_mode(
         # Non-interactive context (e.g. conda run). Proceed if file exists.
         pass
 
-    if not output_path.exists():
+    if not strategy_path.exists():
         raise FileNotFoundError(
-            f"Strategy YAML not found at: {output_path}. "
+            f"Strategy YAML not found at: {strategy_path}. "
             "Please save the LLM's YAML response to that path and run again."
         )
 
-    strategy = load_yaml(output_path)
+    strategy = load_yaml(strategy_path)
 
     configs_dir = Path("configs/models")
     available_models = (

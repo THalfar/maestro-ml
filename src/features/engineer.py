@@ -13,7 +13,6 @@ modify the input DataFrames in-place.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -60,7 +59,9 @@ def build_features(
         5. If target_encoding config exists, call _add_target_encoding
            (this uses cv_folds to prevent leakage).
         6. If custom features exist, call _add_custom_features on both.
-        7. Return the modified (train, test) tuple.
+        7. Ordinal-encode any remaining string/object columns (fit on train,
+           apply to test) so all models receive numeric-only DataFrames.
+        8. Return the modified (train, test) tuple.
     """
     features_cfg = strategy.get("features", {}) or {}
 
@@ -105,7 +106,12 @@ def build_features(
     # categories; the -1 sentinel is used for any unknown test values.
     # Use select_dtypes for robust dtype detection; assign column-by-column
     # to avoid pandas 2.0+ Copy-on-Write silent failures.
-    str_cols = train.select_dtypes(include=["object", "string"]).columns.tolist()
+    # Exclude target_col: test has no target, and string targets (e.g. "Yes"/"No")
+    # must not be ordinal-encoded (they are handled by target_mapping in run.py).
+    str_cols = [
+        c for c in train.select_dtypes(include=["object", "string"]).columns
+        if c != target_col
+    ]
     if str_cols:
         train_str = train[str_cols].fillna("__missing__")
         test_str = test[str_cols].fillna("__missing__")
@@ -275,18 +281,16 @@ def _add_target_encoding(
                 .agg(["count", "mean"])
             )
 
-            def _smooth(count: float, mean: float, gm: float = fold_mean) -> float:
+            def _smooth(count: float, mean: float, gm: float) -> float:
                 return (count * mean + alpha * gm) / (count + alpha)
 
+            # Pre-build smoothed encoding dict for O(1) lookup per value.
+            encode_map = {
+                v: _smooth(stats.loc[v, "count"], stats.loc[v, "mean"], fold_mean)
+                for v in stats.index
+            }
             val_col = train_df.iloc[val_idx][col_name]
-            encoded_val = val_col.map(
-                lambda v, _s=stats, _fm=fold_mean: _smooth(
-                    _s.loc[v, "count"] if v in _s.index else 0,
-                    _s.loc[v, "mean"] if v in _s.index else _fm,
-                    _fm,
-                )
-            )
-            oof[val_idx] = encoded_val.values
+            oof[val_idx] = val_col.map(encode_map).fillna(fold_mean).values
 
         full_global_mean = float(train_df[target_col].mean())
         train_df[out_name] = oof
@@ -298,16 +302,13 @@ def _add_target_encoding(
             .agg(["count", "mean"])
         )
 
-        def _smooth_full(v: Any) -> float:
-            if v in full_stats.index:
-                cnt = full_stats.loc[v, "count"]
-                mn = full_stats.loc[v, "mean"]
-            else:
-                cnt, mn = 0, full_global_mean
-            return (cnt * mn + alpha * full_global_mean) / (cnt + alpha)
-
-        test_df[out_name] = test_df[col_name].map(_smooth_full)
-        test_df[out_name] = test_df[out_name].fillna(full_global_mean)
+        # Pre-build smoothed encoding dict for test; unknown categories fill with global mean.
+        encode_map_full = {
+            v: (float(full_stats.loc[v, "count"]) * float(full_stats.loc[v, "mean"]) + alpha * full_global_mean)
+            / (float(full_stats.loc[v, "count"]) + alpha)
+            for v in full_stats.index
+        }
+        test_df[out_name] = test_df[col_name].map(encode_map_full).fillna(full_global_mean)
 
         return train_df, test_df
 

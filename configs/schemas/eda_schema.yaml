@@ -9,13 +9,16 @@
 dataset_info:
   train_shape: [rows, cols]   # e.g., [918, 12]
   test_shape: [rows, cols]    # e.g., [612, 11]
-  memory_mb: float            # Total memory usage of training set in MB
+  train_memory_mb: float      # Memory usage of training set in MB
+  test_memory_mb: float       # Memory usage of test set in MB
+  n_features: int             # Number of feature columns (excl. target and id)
 
 target_analysis:
-  column: str                 # Target column name (e.g., "HeartDisease")
   dtype: str                  # Pandas dtype (e.g., "int64", "float64")
-  distribution: dict          # value -> count (e.g., {0: 410, 1: 508})
-  class_balance: dict         # value -> percentage (e.g., {0: 44.7, 1: 55.3})
+  n_unique: int               # Number of unique target values
+  distribution: dict          # value -> count (e.g., {"0": 410, "1": 508})
+  class_balance_pct: dict     # value -> percentage (e.g., {"0": 44.7, "1": 55.3})
+  missing_pct: float          # Percentage of missing target values
 
 columns:                      # Per-column analysis (dict keyed by column name)
   column_name:

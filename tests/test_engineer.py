@@ -238,6 +238,56 @@ class TestAddTargetEncoding:
         expected_test = (n * global_mean + 15.0 * global_mean) / (n + 15.0)
         np.testing.assert_allclose(test_enc["cat_te"].values[0], expected_test, atol=0.01)
 
+    def test_works_with_kfold_regression(self):
+        """Target encoding must work with KFold (regression), not only StratifiedKFold."""
+        rng = np.random.default_rng(7)
+        n = 90
+        train = pd.DataFrame({
+            "cat": rng.choice(["X", "Y", "Z"], n),
+            "target": rng.normal(100, 20, n),
+        })
+        test = pd.DataFrame({"cat": ["X", "Y", "Z", "W"]})
+        kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+        train_enc, test_enc = _add_target_encoding(
+            train=train, test=test,
+            columns=["cat"], pairs=[],
+            cv_folds=kf,
+            target_col="target", alpha=15.0,
+        )
+        assert "cat_te" in train_enc.columns
+        assert train_enc["cat_te"].isna().sum() == 0
+        assert test_enc["cat_te"].isna().sum() == 0
+        # Unknown category "W" should get smoothed toward global mean
+        global_mean = train["target"].mean()
+        np.testing.assert_allclose(test_enc.loc[3, "cat_te"], global_mean, atol=0.01)
+
+    def test_nan_in_categorical_column(self, cv_folds: StratifiedKFold):
+        """NaN values in the categorical column should be handled gracefully."""
+        rng = np.random.default_rng(11)
+        n = 90
+        cats = rng.choice(["A", "B", "C"], n).tolist()
+        # Inject some NaN values
+        cats[0] = None
+        cats[10] = None
+        cats[20] = None
+        train = pd.DataFrame({
+            "cat": pd.array(cats, dtype="object"),
+            "target": rng.choice([0, 1], n),
+        })
+        test = pd.DataFrame({"cat": ["A", None, "B"]})
+
+        train_enc, test_enc = _add_target_encoding(
+            train=train, test=test,
+            columns=["cat"], pairs=[],
+            cv_folds=cv_folds,
+            target_col="target", alpha=15.0,
+        )
+        # Should complete without error and have no NaN in output
+        assert "cat_te" in train_enc.columns
+        assert train_enc["cat_te"].isna().sum() == 0
+        assert test_enc["cat_te"].isna().sum() == 0
+
 
 # ---------------------------------------------------------------------------
 # _add_custom_features
@@ -261,6 +311,20 @@ class TestAddCustomFeatures:
         original_cols = list(train_df.columns)
         _add_custom_features(train_df, [{"name": "x", "formula": "num_a * 2"}])
         assert list(train_df.columns) == original_cols
+
+    def test_empty_name_or_formula_skipped(self, train_df: pd.DataFrame):
+        """Entries with blank name or formula should be silently skipped."""
+        formulas = [
+            {"name": "", "formula": "num_a + 1"},
+            {"name": "valid", "formula": ""},
+            {"formula": "num_a * 2"},  # missing 'name' key entirely
+            {"name": "ok", "formula": "num_a + num_b"},
+        ]
+        result = _add_custom_features(train_df, formulas)
+        assert "ok" in result.columns
+        # The three invalid entries should not produce columns
+        assert "" not in result.columns
+        assert "valid" not in result.columns
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +361,36 @@ class TestBuildFeatures:
         build_features(train_df, test_df, strategy)
         pd.testing.assert_frame_equal(train_df, original_train)
         pd.testing.assert_frame_equal(test_df, original_test)
+
+    def test_te_skipped_when_no_cv_folds(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        """Target encoding should be silently skipped when cv_folds is None."""
+        strategy = {
+            "features": {
+                "target_encoding": {
+                    "columns": ["cat_x"],
+                    "pairs": [],
+                    "alpha": 15.0,
+                },
+            }
+        }
+        train_out, test_out = build_features(
+            train_df, test_df, strategy, cv_folds=None, target_col="target"
+        )
+        assert "cat_x_te" not in train_out.columns
+        assert "cat_x_te" not in test_out.columns
+
+    def test_none_features_key(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        """strategy['features'] = None should be treated as empty."""
+        strategy = {"features": None}
+        train_out, test_out = build_features(train_df, test_df, strategy)
+        # Should not crash; columns are the same (plus ordinal encoding)
+        assert list(train_out.columns) == list(train_df.columns)
+
+    def test_no_features_key_at_all(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        """Strategy dict without 'features' key should be treated as empty."""
+        strategy = {}
+        train_out, test_out = build_features(train_df, test_df, strategy)
+        assert list(train_out.columns) == list(train_df.columns)
 
     def test_empty_strategy(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
         strategy = {"features": {}}
@@ -361,6 +455,31 @@ class TestBuildFeatures:
         assert test_out["cat"].iloc[0] == -1.0, "Unknown category should be encoded as -1"
         assert test_out["cat"].iloc[1] != -1.0, "Known category A should not be -1"
 
+    def test_string_target_column_does_not_crash(self):
+        """If target_col is a string type, ordinal encoding must not crash.
+
+        The target column exists in train but NOT in test. If str_cols
+        includes target_col, test[str_cols] raises KeyError.
+        """
+        rng = np.random.default_rng(42)
+        n = 40
+        train = pd.DataFrame({
+            "num_a": rng.normal(0, 1, n),
+            "cat": rng.choice(["A", "B"], n),
+            "target": rng.choice(["Yes", "No"], n),
+        })
+        test = pd.DataFrame({
+            "num_a": rng.normal(0, 1, 10),
+            "cat": rng.choice(["A", "B"], 10),
+        })
+        strategy = {"features": {}}
+        train_out, test_out = build_features(train, test, strategy, target_col="target")
+        # cat should be ordinal-encoded to numeric
+        assert pd.api.types.is_numeric_dtype(train_out["cat"])
+        assert pd.api.types.is_numeric_dtype(test_out["cat"])
+        # target should still exist in train (untouched or encoded, but no crash)
+        assert "target" in train_out.columns
+
     def test_many_string_columns_all_encoded(self):
         """House Prices-like scenario: many mixed string and numeric columns."""
         rng = np.random.default_rng(42)
@@ -417,3 +536,20 @@ class TestGetFeatureColumns:
             {"features": {}}, ["a", "b", "target"], exclude=["target"]
         )
         assert sorted(cols) == ["a", "b"]
+
+    def test_exclude_none_defaults_to_empty(self):
+        """exclude=None should not crash."""
+        cols = get_feature_columns({"features": {}}, ["a", "b"])
+        assert sorted(cols) == ["a", "b"]
+
+    def test_returns_sorted_deduplicated(self):
+        """Result should be sorted and deduplicated."""
+        strategy = {
+            "features": {
+                "interactions": [["a", "b"]],
+                "custom": [{"name": "a__x__b", "formula": "a*b"}],  # duplicate name
+            }
+        }
+        cols = get_feature_columns(strategy, ["a", "b"])
+        assert cols == sorted(set(cols)), "Result must be sorted and unique"
+        assert cols.count("a__x__b") == 1, "Duplicate names should be deduplicated"

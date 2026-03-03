@@ -25,6 +25,7 @@ from src.utils.io import (
     load_model_config,
     load_pipeline_config,
     load_yaml,
+    parse_timeout,
     save_eda_report,
     save_submission,
     setup_logging,
@@ -348,3 +349,229 @@ class TestDataclassDefaults:
         assert cfg.task_type == "binary_classification"
         assert isinstance(cfg.cv, CVConfig)
         assert isinstance(cfg.features, FeatureConfig)
+
+
+# ---------------------------------------------------------------------------
+# parse_timeout
+# ---------------------------------------------------------------------------
+
+class TestParseTimeout:
+    def test_none_returns_none(self):
+        assert parse_timeout(None) is None
+
+    def test_int_passthrough(self):
+        assert parse_timeout(7200) == 7200
+
+    def test_float_truncated_to_int(self):
+        assert parse_timeout(90.7) == 90
+
+    def test_digit_string(self):
+        assert parse_timeout("3600") == 3600
+
+    def test_hours(self):
+        assert parse_timeout("2h") == 7200
+
+    def test_minutes(self):
+        assert parse_timeout("30m") == 1800
+
+    def test_seconds(self):
+        assert parse_timeout("90s") == 90
+
+    def test_combined_hours_minutes(self):
+        assert parse_timeout("1h30m") == 5400
+
+    def test_combined_all_units(self):
+        assert parse_timeout("1h15m30s") == 4530
+
+    def test_empty_string_returns_none(self):
+        assert parse_timeout("") is None
+
+    def test_invalid_string_returns_none(self):
+        assert parse_timeout("abc") is None
+
+    def test_case_insensitive(self):
+        assert parse_timeout("2H") == 7200
+        assert parse_timeout("30M") == 1800
+
+    def test_whitespace_stripped(self):
+        assert parse_timeout("  45m  ") == 2700
+
+    def test_fractional_units(self):
+        assert parse_timeout("1.5h") == 5400
+
+
+# ---------------------------------------------------------------------------
+# Pipeline config: target_mapping, log_transform_target, diversity_metric,
+# model_timeouts with human strings, diversity_weight as list
+# ---------------------------------------------------------------------------
+
+class TestPipelineConfigExtended:
+    def test_target_mapping(self, tmp_dir: Path):
+        content = {
+            "data": {
+                "train_path": "t.csv",
+                "target_column": "churn",
+                "task_type": "binary_classification",
+                "target_mapping": {"Yes": 1, "No": 0},
+            },
+        }
+        path = tmp_dir / "tm.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.target_mapping == {"Yes": 1, "No": 0}
+
+    def test_target_mapping_none_when_absent(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "no_tm.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.target_mapping is None
+
+    def test_log_transform_target(self, tmp_dir: Path):
+        content = {
+            "data": {
+                "train_path": "t.csv",
+                "task_type": "regression",
+                "log_transform_target": True,
+            },
+        }
+        path = tmp_dir / "log.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.log_transform_target is True
+
+    def test_log_transform_target_default_false(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "nolog.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.log_transform_target is False
+
+    def test_diversity_metric(self, tmp_dir: Path):
+        content = {
+            "data": {"train_path": "t.csv"},
+            "ensemble": {"diversity_metric": "spearman_neff"},
+        }
+        path = tmp_dir / "dm.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.diversity_metric == "spearman_neff"
+
+    def test_diversity_metric_default(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "dm_def.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.diversity_metric == "pearson_neff"
+
+    def test_model_timeouts_human_strings(self, tmp_dir: Path):
+        content = {
+            "data": {"train_path": "t.csv"},
+            "optuna": {
+                "model_timeouts": {
+                    "catboost": "1h30m",
+                    "xgboost": "45m",
+                    "ridge": "5m",
+                },
+            },
+        }
+        path = tmp_dir / "timeouts.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.optuna.model_timeouts["catboost"] == 5400
+        assert cfg.optuna.model_timeouts["xgboost"] == 2700
+        assert cfg.optuna.model_timeouts["ridge"] == 300
+
+    def test_diversity_weight_as_list(self, tmp_dir: Path):
+        content = {
+            "data": {"train_path": "t.csv"},
+            "ensemble": {"diversity_weight": [0.3, 0.4, 0.5]},
+        }
+        path = tmp_dir / "dw_list.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.diversity_weight == [0.3, 0.4, 0.5]
+
+    def test_null_models_handled(self, tmp_dir: Path):
+        """models: null should produce empty list, not None."""
+        path = tmp_dir / "null_models.yaml"
+        path.write_text("data:\n  train_path: t.csv\nmodels: null\n", encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.models == []
+
+
+# ---------------------------------------------------------------------------
+# load_model_config — edge cases
+# ---------------------------------------------------------------------------
+
+class TestLoadModelConfigDefaults:
+    def test_minimal_model_yaml(self, tmp_dir: Path):
+        """Model YAML with only name should use defaults for all other fields."""
+        content = {"name": "Minimal"}
+        path = tmp_dir / "minimal.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.name == "Minimal"
+        assert cfg.class_path == {}
+        assert cfg.task_types == []
+        assert cfg.hyperparameters == {}
+        assert cfg.optuna.n_trials == 150
+        assert cfg.optuna.pruner["type"] == "median"
+
+
+# ---------------------------------------------------------------------------
+# save_submission — edge cases
+# ---------------------------------------------------------------------------
+
+class TestSaveSubmissionEdgeCases:
+    def test_series_with_none_name(self, tmp_dir: Path):
+        """pd.Series with name=None should fall back to 'id'."""
+        ids = pd.Series([1, 2, 3])  # name defaults to None
+        preds = np.array([0.1, 0.2, 0.3])
+        path = tmp_dir / "sub.csv"
+        save_submission(ids, preds, "target", path)
+        df = pd.read_csv(path)
+        assert "id" in df.columns
+
+
+# ---------------------------------------------------------------------------
+# save_eda_report — edge cases
+# ---------------------------------------------------------------------------
+
+class TestSaveEdaReportEdgeCases:
+    def test_creates_parent_dirs(self, tmp_dir: Path):
+        report = {"key": "value"}
+        path = tmp_dir / "deep" / "nested" / "report.json"
+        save_eda_report(report, path)
+        assert path.exists()
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded == report
+
+
+# ---------------------------------------------------------------------------
+# setup_logging — edge cases
+# ---------------------------------------------------------------------------
+
+class TestSetupLoggingEdgeCases:
+    def test_unknown_verbose_defaults_to_info(self):
+        """verbose=99 should fall back to INFO level."""
+        log = setup_logging(99)
+        assert log.level == logging.INFO
+
+    def test_negative_verbose_defaults_to_info(self):
+        log = setup_logging(-1)
+        assert log.level == logging.INFO
+
+
+# ---------------------------------------------------------------------------
+# parse_timeout — edge cases
+# ---------------------------------------------------------------------------
+
+class TestParseTimeoutEdgeCases:
+    def test_zero_string_returns_zero(self):
+        """'0' is a valid digit string, should return 0."""
+        assert parse_timeout("0") == 0
+
+    def test_zero_unit_returns_none(self):
+        """'0s' matches regex but total is 0, returns None."""
+        assert parse_timeout("0s") is None

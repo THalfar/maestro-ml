@@ -35,6 +35,178 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.WARNING)
 
 
+class PerFoldTracker:
+    """Track top-N predictions per CV fold during Optuna for per-fold selection.
+
+    During each trial's fold training, the model also predicts on test data.
+    This tracker maintains a bounded leaderboard per fold, keeping only
+    the n_top best (score, oof_slice, test_preds) entries.  Works with
+    pruned trials too — a trial pruned after fold 2 can still contribute
+    its completed folds.
+
+    After Optuna, ``assemble()`` builds composite prediction arrays where
+    each fold's slice comes from the k-th best trial for that fold.
+
+    Attributes:
+        n_top: Maximum entries to keep per fold.
+        n_folds: Number of CV folds.
+        maximize: True for metrics like AUC (higher=better), False for RMSE.
+        fold_data: ``{fold_idx: [(score, val_preds, val_idx, test_preds,
+                     trial_number, params), ...]}`` — sorted best-first.
+    """
+
+    def __init__(self, n_top: int, n_folds: int, maximize: bool) -> None:
+        self.n_top = n_top
+        self.n_folds = n_folds
+        self.maximize = maximize
+        self.fold_data: dict[int, list[tuple]] = {f: [] for f in range(n_folds)}
+
+    # ------------------------------------------------------------------
+    def update(
+        self,
+        fold_idx: int,
+        score: float,
+        val_preds: np.ndarray,
+        val_idx: np.ndarray,
+        test_preds: np.ndarray,
+        trial_number: int,
+        params: dict[str, Any],
+    ) -> None:
+        """Insert a fold result if it qualifies for the top-N leaderboard.
+
+        Keeps the per-fold list sorted (best first) and bounded to n_top.
+        All arrays are copied to avoid aliasing with trial-scope variables.
+        """
+        entry = (
+            score,
+            val_preds.copy(),
+            val_idx.copy(),
+            test_preds.copy(),
+            trial_number,
+            dict(params),
+        )
+        data = self.fold_data[fold_idx]
+
+        if len(data) < self.n_top:
+            data.append(entry)
+            data.sort(key=lambda x: x[0], reverse=self.maximize)
+        else:
+            worst_score = data[-1][0]
+            replace = (
+                (score > worst_score) if self.maximize else (score < worst_score)
+            )
+            if replace:
+                data[-1] = entry
+                data.sort(key=lambda x: x[0], reverse=self.maximize)
+
+    # ------------------------------------------------------------------
+    def assemble(
+        self,
+        n_samples: int,
+        n_test: int,
+        task_type: str = "binary_classification",
+    ) -> list[dict[str, Any]]:
+        """Build composite OOF + test arrays from per-fold bests.
+
+        For the k-th composite:
+        - OOF: ``oof[val_idx] = k-th best trial's val_preds`` for each fold.
+        - Test: average of per-fold test predictions (``+= fold_test / n_folds``).
+
+        Returns:
+            List of dicts, each with keys: ``oof_preds``, ``test_preds``,
+            ``fold_trials``, ``fold_scores``, ``avg_score``.
+        """
+        n_composites = min(
+            self.n_top,
+            min(len(d) for d in self.fold_data.values()) if self.fold_data else 0,
+        )
+
+        is_multiclass = task_type == "multiclass"
+
+        results: list[dict[str, Any]] = []
+        for k in range(n_composites):
+            if is_multiclass:
+                # Infer n_classes from stored predictions
+                sample_preds = self.fold_data[0][k][1]
+                n_classes = sample_preds.shape[1] if sample_preds.ndim > 1 else 1
+                oof = np.zeros((n_samples, n_classes))
+                test_preds = np.zeros((n_test, n_classes))
+            else:
+                oof = np.zeros(n_samples)
+                test_preds = np.zeros(n_test)
+
+            fold_trials: list[int] = []
+            fold_scores: list[float] = []
+
+            for fold_idx in range(self.n_folds):
+                score, val_preds, val_idx, fold_test, trial_num, _ = (
+                    self.fold_data[fold_idx][k]
+                )
+                oof[val_idx] = val_preds
+                test_preds += fold_test / self.n_folds
+                fold_trials.append(trial_num)
+                fold_scores.append(score)
+
+            results.append({
+                "oof_preds": oof,
+                "test_preds": test_preds,
+                "fold_trials": fold_trials,
+                "fold_scores": fold_scores,
+                "avg_score": float(np.mean(fold_scores)),
+            })
+
+        return results
+
+    # ------------------------------------------------------------------
+    def log_summary(self, model_name: str) -> None:
+        """Log per-fold best/worst scores and composite statistics."""
+        if not self.fold_data or not self.fold_data[0]:
+            return
+
+        n_composites = min(
+            self.n_top,
+            min(len(d) for d in self.fold_data.values()),
+        )
+
+        # Count unique trials contributed
+        all_trial_nums: set[int] = set()
+        total_entries = 0
+        for data in self.fold_data.values():
+            for entry in data:
+                all_trial_nums.add(entry[4])  # trial_number
+                total_entries += 1
+
+        logger.info(
+            f"[{model_name}] Per-fold selection: "
+            f"{n_composites} composites from {len(all_trial_nums)} unique trials"
+        )
+
+        # Per-fold stats
+        all_scores: list[float] = []
+        for fold_idx in range(self.n_folds):
+            data = self.fold_data[fold_idx]
+            if not data:
+                continue
+            best = data[0]
+            worst = data[-1]
+            all_scores.extend(e[0] for e in data)
+            logger.info(
+                f"[{model_name}]   Fold {fold_idx:2d}: "
+                f"best={best[0]:.6f} (trial #{best[4]}), "
+                f"{len(data)}th={worst[0]:.6f} (trial #{worst[4]})"
+            )
+
+        if all_scores:
+            logger.info(
+                f"[{model_name}] Per-fold score range: "
+                f"best={max(all_scores):.6f}, worst={min(all_scores):.6f}"
+            )
+        logger.info(
+            f"[{model_name}] Unique trials across all composites: "
+            f"{len(all_trial_nums)}"
+        )
+
+
 def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -> float:
     """Compute the cross-validation metric for a given task type."""
     if task_type == "binary_classification":
@@ -71,12 +243,19 @@ def run_optuna_study(
     strategy: dict,
     gpu: bool = False,
     timeout_override: int | None = None,
-) -> optuna.Study:
+    test: pd.DataFrame | None = None,
+) -> tuple[optuna.Study, PerFoldTracker | None]:
     """Run a complete Optuna study for a single model.
 
     Creates an Optuna study with the model's configured pruner, runs
     QMC warmup trials followed by TPE trials, and returns the study
     with all trial results.
+
+    When the model's ``selection_mode`` is ``per_fold``, a
+    :class:`PerFoldTracker` is created and passed into the objective.
+    During each trial's fold training the model also predicts on test
+    data and the tracker records per-fold results (including from
+    pruned trials).
 
     Args:
         model_name: Name of the model (must be registered in registry).
@@ -87,9 +266,12 @@ def run_optuna_study(
         pipeline_config: Pipeline configuration for CV settings, etc.
         strategy: Strategy dict (may contain per-model overrides).
         gpu: Whether to use GPU for this model.
+        timeout_override: Optional timeout in seconds.
+        test: Test DataFrame (required for ``selection_mode: per_fold``).
 
     Returns:
-        Completed optuna.Study object with all trials.
+        Tuple of (study, tracker).  ``tracker`` is None when the model
+        uses global selection mode.
 
     Steps:
         1. Get the model's Optuna config from registry.get_optuna_config.
@@ -97,16 +279,17 @@ def run_optuna_study(
            any LLM overrides from strategy['overrides'].get(model_name).
         3. Create the CV splitter (StratifiedKFold or KFold) using
            pipeline_config.cv settings.
-        4. Create the objective function via _create_objective.
-        5. Configure the pruner based on model's optuna.pruner settings:
+        4. If selection_mode == 'per_fold', create a PerFoldTracker.
+        5. Create the objective function via _create_objective.
+        6. Configure the pruner based on model's optuna.pruner settings:
            - 'median' → optuna.pruners.MedianPruner
            - 'hyperband' → optuna.pruners.HyperbandPruner
            - 'none' → optuna.pruners.NopPruner
-        6. Create the study with direction='maximize' (for AUC-ROC)
+        7. Create the study with direction='maximize' (for AUC-ROC)
            or 'minimize' (for RMSE) based on task_type.
-        7. Call _run_two_phase_study to execute QMC + TPE trials.
-        8. Log the best trial value and parameters.
-        9. Return the study.
+        8. Call _run_two_phase_study to execute QMC + TPE trials.
+        9. Log the best trial value and parameters.
+        10. Return (study, tracker).
     """
     optuna_cfg = registry.get_optuna_config(model_name)
 
@@ -125,6 +308,23 @@ def run_optuna_study(
 
     results_dir = Path(pipeline_config.output.results_dir)
 
+    # Per-fold selection: create tracker if enabled
+    selection_mode = optuna_cfg.get("selection_mode", "global")
+    tracker: PerFoldTracker | None = None
+    if selection_mode == "per_fold":
+        maximize = task_type != "regression"
+        tracker = PerFoldTracker(
+            n_top=optuna_cfg["n_top_trials"],
+            n_folds=cv_cfg.n_folds,
+            maximize=maximize,
+        )
+        logger.info(
+            f"[{model_name}] Per-fold selection enabled: "
+            f"tracking top {optuna_cfg['n_top_trials']} per fold"
+        )
+
+    fold_timeout = optuna_cfg.get("fold_timeout")
+
     objective = _create_objective(
         model_name=model_name,
         train=train,
@@ -136,6 +336,9 @@ def run_optuna_study(
         task_type=task_type,
         gpu=gpu,
         results_dir=results_dir,
+        test=test,
+        per_fold_tracker=tracker,
+        fold_timeout=fold_timeout,
     )
 
     # Configure pruner
@@ -178,7 +381,7 @@ def run_optuna_study(
         f"value={best.value:.6f}, params={display_params}"
     )
 
-    return study
+    return study, tracker
 
 
 def _create_objective(
@@ -192,12 +395,24 @@ def _create_objective(
     task_type: str,
     gpu: bool,
     results_dir: Path,
+    test: pd.DataFrame | None = None,
+    per_fold_tracker: PerFoldTracker | None = None,
+    fold_timeout: int | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Create an Optuna objective function for a model.
 
     The returned callable samples hyperparameters from the search space,
     runs cross-validation, optionally prunes early, and stores OOF
     predictions as a trial user attribute.
+
+    When ``per_fold_tracker`` is provided (per-fold selection mode), each
+    fold also predicts on the test set immediately after training, and the
+    tracker records per-fold (score, oof_slice, test_preds).  This happens
+    **before** the prune check, so pruned trials still contribute their
+    completed folds to the leaderboard.
+
+    When ``fold_timeout`` is set, each fold's training time is measured.
+    If a single fold exceeds the timeout, the trial is pruned immediately.
 
     Args:
         model_name: Name of the model.
@@ -210,6 +425,9 @@ def _create_objective(
         task_type: 'binary_classification', 'multiclass', or 'regression'.
         gpu: Whether to use GPU.
         results_dir: Directory for saving model artifacts.
+        test: Test DataFrame (required when per_fold_tracker is set).
+        per_fold_tracker: PerFoldTracker for per-fold selection mode.
+        fold_timeout: Max seconds per fold; exceeding triggers TrialPruned.
 
     Returns:
         Callable that takes an optuna.Trial and returns the CV score.
@@ -233,6 +451,7 @@ def _create_objective(
               - Store predictions in oof[val_idx].
               - Compute fold metric. Report to trial for pruning:
                 trial.report(fold_metric, fold_idx).
+              - If per_fold_tracker: predict on test, update tracker.
               - Check if trial should be pruned:
                 if trial.should_prune(): raise TrialPruned.
            e. Compute overall CV metric from OOF predictions.
@@ -242,8 +461,15 @@ def _create_objective(
     """
     X = train[feature_cols]
     y = train[target_col].values
+    X_test = test[feature_cols] if test is not None else None
 
     training_cfg = registry.get_training_config(model_name)
+
+    # Compute CV splits once — deterministic (fixed seed), same every trial.
+    try:
+        cv_splits = list(cv.split(X, y))
+    except Exception:
+        cv_splits = list(cv.split(X))
 
     def objective(trial: optuna.Trial) -> float:
         # Sample hyperparameters
@@ -320,12 +546,7 @@ def _create_objective(
         else:
             oof = np.zeros(len(X))
 
-        try:
-            splits = list(cv.split(X, y))
-        except Exception:
-            splits = list(cv.split(X))
-
-        for fold_idx, (train_idx, val_idx) in enumerate(splits):
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
 
@@ -340,6 +561,8 @@ def _create_objective(
                 model_name, hparams=model_hparams, task_type=task_type,
                 gpu=gpu, results_dir=results_dir
             )
+
+            fold_start = time.monotonic()
 
             if needs_eval_set:
                 fit_params: dict[str, Any] = {
@@ -362,6 +585,8 @@ def _create_objective(
             else:
                 model.fit(X_train, y_train)
 
+            fold_elapsed = time.monotonic() - fold_start
+
             if task_type == "binary_classification":
                 fold_preds = model.predict_proba(X_val)[:, 1]
             elif task_type == "multiclass":
@@ -373,6 +598,34 @@ def _create_objective(
 
             fold_metric = _compute_cv_metric(y_val, fold_preds, task_type)
             trial.report(fold_metric, fold_idx)
+
+            # Per-fold tracking: predict test and update leaderboard.
+            # Runs BEFORE prune check so pruned trials still contribute.
+            if per_fold_tracker is not None and X_test is not None:
+                if task_type == "binary_classification":
+                    test_fold_preds = model.predict_proba(X_test)[:, 1]
+                elif task_type == "multiclass":
+                    test_fold_preds = model.predict_proba(X_test)
+                else:
+                    test_fold_preds = model.predict(X_test)
+                per_fold_tracker.update(
+                    fold_idx=fold_idx,
+                    score=fold_metric,
+                    val_preds=fold_preds,
+                    val_idx=val_idx,
+                    test_preds=test_fold_preds,
+                    trial_number=trial.number,
+                    params=hparams,
+                )
+
+            # Fold timeout: if this fold took too long, prune to skip
+            # remaining folds.  Completed fold's predictions are already saved.
+            if fold_timeout is not None and fold_elapsed > fold_timeout:
+                logger.warning(
+                    f"[{model_name}] Trial #{trial.number} fold {fold_idx} "
+                    f"exceeded fold_timeout ({fold_elapsed:.0f}s > {fold_timeout}s) — pruning"
+                )
+                raise optuna.exceptions.TrialPruned()
 
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
@@ -420,7 +673,8 @@ def _run_two_phase_study(
            Run study.optimize(objective, n_trials=n_tpe, timeout=remaining).
         5. Log phase completion summaries.
     """
-    n_qmc = max(1, qmc_warmup_trials)
+    # Cap QMC so QMC + TPE = n_trials exactly (docstring contract).
+    n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
     n_tpe = max(1, n_trials - n_qmc)
 
     start_time = time.time()
@@ -430,7 +684,10 @@ def _run_two_phase_study(
 
     def _progress_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         n_done = len(study.trials)
-        best_val = study.best_value if study.best_trial else float("nan")
+        try:
+            best_val = study.best_value
+        except ValueError:
+            best_val = float("nan")
         elapsed = time.time() - start_time
         if verbose >= 2:
             # Show every trial with its own score — check state, not value,
@@ -808,7 +1065,7 @@ def run_all_studies(
         model_timeout = pipeline_config.optuna.model_timeouts.get(model_name)
 
         try:
-            study = run_optuna_study(
+            study, tracker = run_optuna_study(
                 model_name=model_name,
                 train=train,
                 feature_cols=feature_cols,
@@ -818,6 +1075,7 @@ def run_all_studies(
                 strategy=strategy,
                 gpu=gpu,
                 timeout_override=model_timeout,
+                test=test,
             )
             optuna_elapsed = time.time() - model_start
 
@@ -859,46 +1117,78 @@ def run_all_studies(
             n_top = optuna_cfg["n_top_trials"]
             n_seeds = optuna_cfg["n_seeds"]
             seeds = [global_seed + i for i in range(n_seeds)]
-
-            top_configs = get_top_configs(study, n_top=n_top)
+            selection_mode = optuna_cfg.get("selection_mode", "global")
 
             all_oof: list[np.ndarray] = []
             all_test: list[np.ndarray] = []
             labels: np.ndarray | None = None
+            retrain_elapsed = 0.0
 
-            retrain_start = time.time()
-            total_retrain_fits = len(top_configs) * n_seeds * cv_cfg.n_folds
-            logger.info(
-                f"[{model_name}] Retraining top {len(top_configs)} configs "
-                f"x {n_seeds} seeds x {cv_cfg.n_folds} folds = "
-                f"{total_retrain_fits} fits"
-            )
-
-            for cfg_idx, cfg in enumerate(top_configs, 1):
-                logger.debug(
-                    f"[{model_name}] Retrain config {cfg_idx}/{len(top_configs)} "
-                    f"(score={cfg['value']:.6f})"
-                )
-                oof_list, test_list, y = train_with_config(
-                    model_name=model_name,
-                    hparams=cfg["params"],
-                    feature_cols=feature_cols,
-                    train=train,
-                    test=test,
-                    target_col=pipeline_config.target_column,
-                    cv=cv,
-                    registry=registry,
+            if selection_mode == "per_fold" and tracker is not None:
+                # --- Per-fold path: OOF + test from tracker, no retraining ---
+                composites = tracker.assemble(
+                    n_samples=len(train),
+                    n_test=len(test),
                     task_type=task_type,
-                    gpu=gpu,
-                    seeds=seeds,
-                    results_dir=results_dir,
                 )
-                all_oof.extend(oof_list)
-                all_test.extend(test_list)
-                if labels is None:
-                    labels = y
+                tracker.log_summary(model_name)
 
-            retrain_elapsed = time.time() - retrain_start
+                all_oof = [c["oof_preds"] for c in composites]
+                all_test = [c["test_preds"] for c in composites]
+                labels = train[pipeline_config.target_column].values
+
+                top_configs = [
+                    {
+                        "params": "per_fold_composite",
+                        "value": c["avg_score"],
+                        "trial_number": c["fold_trials"],
+                    }
+                    for c in composites
+                ]
+
+                logger.info(
+                    f"[{model_name}] Per-fold assembly: "
+                    f"{len(all_oof)} composites (no retraining needed)"
+                )
+
+            else:
+                # --- Global path: retrain top configs (existing behaviour) ---
+                top_configs = get_top_configs(study, n_top=n_top)
+
+                retrain_start = time.time()
+                total_retrain_fits = len(top_configs) * n_seeds * cv_cfg.n_folds
+                logger.info(
+                    f"[{model_name}] Retraining top {len(top_configs)} configs "
+                    f"x {n_seeds} seeds x {cv_cfg.n_folds} folds = "
+                    f"{total_retrain_fits} fits"
+                )
+
+                for cfg_idx, cfg in enumerate(top_configs, 1):
+                    logger.debug(
+                        f"[{model_name}] Retrain config {cfg_idx}/{len(top_configs)} "
+                        f"(score={cfg['value']:.6f})"
+                    )
+                    oof_list, test_list, y = train_with_config(
+                        model_name=model_name,
+                        hparams=cfg["params"],
+                        feature_cols=feature_cols,
+                        train=train,
+                        test=test,
+                        target_col=pipeline_config.target_column,
+                        cv=cv,
+                        registry=registry,
+                        task_type=task_type,
+                        gpu=gpu,
+                        seeds=seeds,
+                        results_dir=results_dir,
+                    )
+                    all_oof.extend(oof_list)
+                    all_test.extend(test_list)
+                    if labels is None:
+                        labels = y
+
+                retrain_elapsed = time.time() - retrain_start
+
             model_elapsed = time.time() - model_start
 
             results[model_name] = {

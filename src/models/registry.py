@@ -10,9 +10,11 @@ This is the bridge between YAML configs and Python model objects.
 
 from __future__ import annotations
 
+import atexit
 import copy
 import importlib
 import logging
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,8 @@ import numpy as np
 from src.utils.io import ModelConfig, load_model_config
 
 logger = logging.getLogger("maestro")
+
+_TASK_TYPES = {"binary_classification", "multiclass", "regression"}
 
 
 class ModelRegistry:
@@ -53,6 +57,7 @@ class ModelRegistry:
         """
         self._configs: dict[str, ModelConfig] = {}
         self._gpu_status: dict[str, bool] = {}
+        self._catboost_tmp: str | None = None
 
         configs_dir = Path(configs_dir)
         if configs_dir.exists():
@@ -122,6 +127,8 @@ class ModelRegistry:
         # Select class_path for task_type
         class_path = config.class_path.get(task_type)
         if class_path is None:
+            if not config.class_path:
+                raise KeyError(f"Model '{name}' has empty class_path")
             # Fallback to first available
             class_path = next(iter(config.class_path.values()))
             logger.warning(
@@ -142,7 +149,6 @@ class ModelRegistry:
 
         # Handle task-type-specific fixed_params (e.g., ridge.yaml).
         # Detection: all top-level keys are known task_type strings.
-        _TASK_TYPES = {"binary_classification", "multiclass", "regression"}
         if fixed and isinstance(fixed, dict) and set(fixed.keys()) <= _TASK_TYPES:
             fixed = fixed.get(task_type, {}) or {}
 
@@ -162,7 +168,10 @@ class ModelRegistry:
             if results_dir is not None:
                 catboost_dir = Path(results_dir) / "catboost_info"
             else:
-                catboost_dir = Path(tempfile.mkdtemp()) / "catboost_info"
+                if self._catboost_tmp is None:
+                    self._catboost_tmp = tempfile.mkdtemp()
+                    atexit.register(shutil.rmtree, self._catboost_tmp, ignore_errors=True)
+                catboost_dir = Path(self._catboost_tmp) / "catboost_info"
             catboost_dir.mkdir(parents=True, exist_ok=True)
             params["train_dir"] = str(catboost_dir)
 
@@ -185,6 +194,8 @@ class ModelRegistry:
             overrides: Optional dict of parameter overrides from the LLM
                        strategy. Each key is a param name, value is a dict
                        with 'low', 'high', and/or 'choices' to override.
+            task_type: Task type to select correct sub-dict for models with
+                       task-type-keyed hyperparameters (e.g., ridge).
 
         Returns:
             Dictionary of {param_name: param_spec} where param_spec has
@@ -207,7 +218,6 @@ class ModelRegistry:
         # Handle task-type-specific hyperparameters (e.g., ridge.yaml).
         # Same detection logic as fixed_params: if all top-level keys are
         # known task_type strings, select the sub-dict for this task.
-        _TASK_TYPES = {"binary_classification", "multiclass", "regression"}
         if space and isinstance(space, dict) and set(space.keys()) <= _TASK_TYPES:
             space = space.get(task_type, {}) or {}
 
@@ -249,9 +259,11 @@ class ModelRegistry:
             "pruner": optuna_cfg.pruner,
             "n_top_trials": optuna_cfg.n_top_trials,
             "n_seeds": optuna_cfg.n_seeds,
+            "selection_mode": optuna_cfg.selection_mode,
+            "fold_timeout": optuna_cfg.fold_timeout,
         }
 
-    def get_training_config(self, name: str) -> dict:
+    def get_training_config(self, name: str) -> dict[str, Any]:
         """Get the training configuration dict for a model.
 
         Args:
@@ -262,7 +274,7 @@ class ModelRegistry:
         """
         if name not in self._configs:
             raise KeyError(f"Model '{name}' not registered.")
-        return self._configs[name].training
+        return copy.deepcopy(self._configs[name].training)
 
     def list_models(self) -> list[str]:
         """Return a sorted list of all registered model names.
@@ -307,14 +319,17 @@ class ModelRegistry:
             return False
 
         config = self._configs[name]
-        if not config.gpu.get("supported", False):
+        if not (config.gpu or {}).get("supported", False):
             self._gpu_status[cache_key] = False
             return False
 
         # Tiny synthetic dataset
         rng = np.random.default_rng(0)
         X = rng.random((20, 3)).astype(np.float32)
-        y = (rng.random(20) > 0.5).astype(np.int32)
+        if task_type == "regression":
+            y = rng.random(20).astype(np.float32)
+        else:
+            y = (rng.random(20) > 0.5).astype(np.int32)
 
         try:
             model = self.get_model(name, hparams={}, task_type=task_type, gpu=True)

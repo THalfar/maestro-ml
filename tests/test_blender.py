@@ -58,6 +58,27 @@ class TestScore:
         preds = np.array([1.0, 2.0, 3.0])
         assert _score(y, preds, "neg_rmse") == 0.0
 
+    def test_neg_rmse_with_error(self):
+        """neg_rmse should return a negative value when predictions have error."""
+        y = np.array([1.0, 2.0, 3.0])
+        preds = np.array([1.5, 2.5, 3.5])
+        score = _score(y, preds, "neg_rmse")
+        assert score < 0.0
+
+    def test_unknown_metric_fallback(self):
+        """Unknown metric falls back to roc_auc when data is suitable."""
+        y = np.array([0, 0, 1, 1])
+        preds = np.array([0.1, 0.2, 0.8, 0.9])
+        score = _score(y, preds, "some_unknown_metric")
+        assert score == 1.0  # perfect roc_auc
+
+    def test_unknown_metric_fallback_to_neg_rmse(self):
+        """Unknown metric falls back to neg_rmse when roc_auc fails (continuous y)."""
+        y = np.array([1.5, 2.5, 3.5])
+        preds = np.array([1.5, 2.5, 3.5])
+        score = _score(y, preds, "unknown_metric")
+        assert score == 0.0  # perfect predictions → neg_rmse=0
+
 
 # ---------------------------------------------------------------------------
 # optimize_blend_weights
@@ -81,6 +102,37 @@ class TestOptimizeBlendWeights:
         # This is probabilistic but should hold with enough trials
         assert weights[0] >= weights[2] * 0.5  # lenient check
 
+    def test_regression_metric(self):
+        """optimize_blend_weights should work with neg_rmse metric."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.normal(0, 1, n)
+        oof1 = y + rng.normal(0, 0.3, n)
+        oof2 = y + rng.normal(0, 0.5, n)
+        weights = optimize_blend_weights(
+            [oof1, oof2], y, n_trials=20, metric="neg_rmse", seed=42,
+        )
+        assert len(weights) == 2
+        np.testing.assert_almost_equal(sum(weights), 1.0, decimal=5)
+
+    def test_single_model(self):
+        """With a single model, the weight must be 1.0."""
+        rng = np.random.default_rng(42)
+        n = 100
+        y = rng.choice([0, 1], n)
+        oof = y * 0.7 + rng.normal(0, 0.2, n)
+        oof = np.clip(oof, 0.01, 0.99)
+        weights = optimize_blend_weights([oof], y, n_trials=10, seed=42)
+        assert len(weights) == 1
+        np.testing.assert_almost_equal(weights[0], 1.0)
+
+    def test_deterministic_same_seed(self, binary_oof_data):
+        """Same seed must produce identical weights (determinism principle)."""
+        oof_list, y = binary_oof_data
+        w1 = optimize_blend_weights(oof_list, y, n_trials=30, seed=7)
+        w2 = optimize_blend_weights(oof_list, y, n_trials=30, seed=7)
+        np.testing.assert_array_equal(w1, w2)
+
 
 # ---------------------------------------------------------------------------
 # apply_blend
@@ -99,8 +151,15 @@ class TestApplyBlend:
         np.testing.assert_array_almost_equal(result, p1)
 
     def test_length_mismatch_raises(self):
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             apply_blend([np.array([1.0])], [0.5, 0.5])
+
+    def test_zero_weight_ignores_model(self):
+        """Model with weight=0 should not contribute to blend."""
+        p1 = np.array([0.1, 0.2])
+        p2 = np.array([0.9, 0.8])
+        result = apply_blend([p1, p2], [1.0, 0.0])
+        np.testing.assert_array_almost_equal(result, p1)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +187,31 @@ class TestRankAverage:
         result = rank_average(preds)
         assert result.min() > 0
         assert result.max() < 1
+
+    def test_single_model(self):
+        """rank_average with a single model preserves order."""
+        p = np.array([0.9, 0.1, 0.5])
+        result = rank_average([p])
+        assert result[1] < result[2] < result[0]
+
+    def test_handles_tied_predictions(self):
+        """rank_average should handle tied predictions — tied values get same rank."""
+        p = np.array([0.5, 0.5, 0.5, 0.1])
+        result = rank_average([p])
+        assert result.shape == (4,)
+        # Three tied values should get the same normalized rank
+        assert result[0] == result[1] == result[2]
+        assert result[3] < result[0]
+
+    def test_scale_invariance(self):
+        """rank_average must be invariant to prediction scale (its key property)."""
+        p_small = np.array([0.01, 0.02, 0.03, 0.04])
+        p_large = np.array([100.0, 200.0, 300.0, 400.0])
+        result = rank_average([p_small, p_large])
+        # Both arrays have same rank order, so result should be identical
+        # to rank_average of either alone
+        result_single = rank_average([p_small])
+        np.testing.assert_array_almost_equal(result, result_single)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +272,64 @@ class TestTrainMetaModel:
         with pytest.raises(ValueError, match="not be empty"):
             rank_average([])
 
+    def test_oof_all_indices_filled(self, binary_oof_data, test_preds):
+        """Every OOF index must be filled by meta-model CV — no leftover zeros."""
+        oof_list, y = binary_oof_data
+        meta_oof, _ = train_meta_model(
+            oof_list, test_preds, y, n_folds=3, seed=42,
+        )
+        # LogisticRegression probabilities are never exactly 0.0 on
+        # non-trivial data, so any zero means an index was missed.
+        assert np.count_nonzero(meta_oof) == len(y)
+
+    def test_regression_oof_all_indices_filled(self):
+        """Regression meta-model must also fill all OOF indices."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.normal(5.0, 2.0, n)  # offset from zero so zeros indicate gaps
+        oof1 = y + rng.normal(0, 0.3, n)
+        oof2 = y + rng.normal(0, 0.5, n)
+        test1 = rng.normal(5.0, 2.0, 50)
+        test2 = rng.normal(5.0, 2.0, 50)
+        meta_oof, meta_test = train_meta_model(
+            [oof1, oof2], [test1, test2], y,
+            n_folds=3, seed=42, task_type="regression",
+        )
+        assert np.all(np.isfinite(meta_oof))
+        assert np.all(np.isfinite(meta_test))
+        # Ridge on correlated data centered around 5.0 should not produce exact zeros
+        assert np.count_nonzero(meta_oof) == n
+
+    def test_deterministic_with_same_seed(self, binary_oof_data, test_preds):
+        """Same seed should produce identical meta-model OOF predictions."""
+        oof_list, y = binary_oof_data
+        oof_a, test_a = train_meta_model(
+            oof_list, test_preds, y, n_folds=3, seed=42,
+        )
+        oof_b, test_b = train_meta_model(
+            oof_list, test_preds, y, n_folds=3, seed=42,
+        )
+        np.testing.assert_array_equal(oof_a, oof_b)
+        np.testing.assert_array_equal(test_a, test_b)
+
+    def test_extreme_probabilities_logit_clipping(self):
+        """Predictions at 0.0 and 1.0 must not produce NaN/Inf via logit transform."""
+        rng = np.random.default_rng(42)
+        n = 100
+        y = rng.choice([0, 1], n)
+        # Model with extreme predictions (exactly 0.0 and 1.0)
+        oof_extreme = np.where(y == 1, 1.0, 0.0).astype(float)
+        oof_noisy = y * 0.6 + rng.normal(0, 0.2, n)
+        oof_noisy = np.clip(oof_noisy, 0.01, 0.99)
+        test_extreme = rng.choice([0.0, 1.0], 30)
+        test_noisy = rng.random(30)
+        meta_oof, meta_test = train_meta_model(
+            [oof_extreme, oof_noisy], [test_extreme, test_noisy], y,
+            n_folds=3, seed=42,
+        )
+        assert np.all(np.isfinite(meta_oof))
+        assert np.all(np.isfinite(meta_test))
+
 
 # ---------------------------------------------------------------------------
 # pick_best_strategy
@@ -216,6 +358,17 @@ class TestPickBestStrategy:
         assert name == "a"
         np.testing.assert_array_equal(result_preds, test_a)
 
+    def test_regression_metric(self):
+        """pick_best_strategy should work with neg_rmse."""
+        y = np.array([1.0, 2.0, 3.0])
+        candidates = {
+            "good": (np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0])),
+            "bad": (np.array([3.0, 1.0, 2.0]), np.array([0.5, 0.5])),
+        }
+        _, name, score = pick_best_strategy(candidates, y, metric="neg_rmse")
+        assert name == "good"
+        assert score == 0.0  # perfect predictions → RMSE=0 → neg_rmse=0
+
     def test_empty_candidates_does_not_silently_return_none(self):
         """pick_best_strategy with empty candidates should raise, not silently
         return (None, None, -inf) which would crash any caller that uses result."""
@@ -229,3 +382,15 @@ class TestPickBestStrategy:
             )
         except (ValueError, KeyError):
             pass  # raising is also acceptable behavior
+
+    def test_single_candidate(self):
+        """Single candidate should be returned as the winner."""
+        y = np.array([0, 0, 1, 1])
+        test_preds = np.array([0.3, 0.7])
+        candidates = {
+            "only": (np.array([0.2, 0.3, 0.7, 0.8]), test_preds),
+        }
+        result_preds, name, score = pick_best_strategy(candidates, y)
+        assert name == "only"
+        np.testing.assert_array_equal(result_preds, test_preds)
+        assert score > 0.5  # decent predictions should beat random

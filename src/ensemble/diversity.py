@@ -23,6 +23,7 @@ for principled knee-point selection on the Pareto front.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -301,7 +302,13 @@ def greedy_diverse_select(
         6. Return the list of selected indices.
     """
     max_score = max(scores)
-    min_score = max_score * min_score_ratio
+    # Use abs(max_score) so the formula works for both positive and negative
+    # metrics (e.g. neg_rmse). The multiplicative form `max_score * ratio`
+    # is incorrect for negative scores: multiplying a negative value by 0.95
+    # yields a LESS negative (higher) threshold, cutting out the best model
+    # itself. With abs(), the drop is always at most (1-ratio) * |best_score|
+    # below the best, matching the intended semantics for both cases.
+    min_score = max_score - abs(max_score) * (1 - min_score_ratio)
 
     # Filter candidates meeting quality threshold
     candidates = [i for i, s in enumerate(scores) if s >= min_score]
@@ -815,8 +822,7 @@ def run_nsga2_ensemble(
     _labels = labels or [f"model[{i}]" for i in range(n_models)]
     n_gen = max(n_trials // pop_size, 2)
 
-    import time as _time
-    nsga2_start = _time.time()
+    nsga2_start = time.time()
 
     # --- Input diagnostics ---
     logger.info("=" * 60)
@@ -895,7 +901,7 @@ def run_nsga2_ensemble(
             gen = algorithm.n_gen
             if gen % log_every == 0 or gen == n_gen:
                 n_evals_so_far = gen * pop_size
-                elapsed = _time.time() - nsga2_start
+                elapsed = time.time() - nsga2_start
                 best_F = algorithm.pop.get("F").min(axis=0)
                 logger.info(
                     f"  NSGA-II gen {gen}/{n_gen} | "
@@ -913,7 +919,7 @@ def run_nsga2_ensemble(
         callback=_ProgressCallback(),
     )
 
-    nsga2_elapsed = _time.time() - nsga2_start
+    nsga2_elapsed = time.time() - nsga2_start
 
     # Extract Pareto front
     pareto_F = result.F  # (n_pareto, 2)  negated objectives

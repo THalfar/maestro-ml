@@ -36,6 +36,10 @@ def run_eda(
         test_path: Path to the test CSV file.
         target_col: Name of the target variable column.
         id_col: Optional name of the ID column to exclude from analysis.
+        target_mapping: Optional dict mapping string labels to numeric values
+            (e.g. ``{"Yes": 1, "No": 0}``). Applied to the target column
+            before analysis so that correlation and distribution stats are
+            computed on the mapped numeric values.
 
     Returns:
         Tuple of (report, train_df, test_df) where report is a dictionary
@@ -131,7 +135,7 @@ def run_eda(
 
     # Generate recommendations
     recommendations = _generate_recommendations(
-        columns_analysis, target_correlations, feature_clusters, weak_features, train
+        columns_analysis, target_correlations, feature_clusters, weak_features
     )
 
     report = {
@@ -146,13 +150,11 @@ def run_eda(
     return report, train, test
 
 
-# REVIEW:STYLE — `train` parameter is accepted but never used in function body; remove it or use it
 def _generate_recommendations(
     columns_analysis: dict,
     target_correlations: dict,
     feature_clusters: list,
     weak_features: list,
-    train: pd.DataFrame,
 ) -> list[str]:
     """Generate LLM-readable recommendation strings from EDA results."""
     recs = []
@@ -264,10 +266,9 @@ def _compute_correlations(
         target_corrs = numeric_df.corrwith(numeric_df[target_col])
         target_corrs = target_corrs.drop(target_col, errors="ignore")
     else:
-        # Target might be non-numeric; convert for correlation
-        target_series = df[target_col]
-        if target_series.dtype == object:
-            target_series = pd.Categorical(target_series).codes
+        # Target is non-numeric (not in numeric_df); encode as category codes for correlation.
+        # Unconditional: covers object, StringDtype (pandas 2.x), CategoricalDtype, etc.
+        target_series = pd.Categorical(df[target_col]).codes
         feature_numeric = numeric_df.drop(columns=[target_col], errors="ignore")
         target_corrs = feature_numeric.corrwith(pd.Series(target_series, name=target_col))
 
@@ -369,8 +370,7 @@ def _detect_column_types(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
                 else "high_cardinality_categorical"
             )
         elif is_numeric and cardinality <= 20:
-            # Check if all values are integers
-            non_null = series.dropna()
+            # non_null already computed above in the stats block (is_numeric is True here)
             if len(non_null) > 0 and (non_null == non_null.round()).all():
                 detected_type = "ordinal"
             else:

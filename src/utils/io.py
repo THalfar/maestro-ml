@@ -141,6 +141,8 @@ class OptunaModelConfig:
     })
     n_top_trials: int = 5
     n_seeds: int = 3
+    selection_mode: str = "global"  # "global" | "per_fold"
+    fold_timeout: Optional[int] = None  # per-fold training timeout in seconds
 
 
 @dataclass
@@ -303,13 +305,14 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
 
     raw_timeouts = optuna_raw.get("model_timeouts", {}) or {}
     model_timeouts = {
-        name: parse_timeout(val) for name, val in raw_timeouts.items()
-        if parse_timeout(val) is not None
+        name: parsed
+        for name, val in raw_timeouts.items()
+        if (parsed := parse_timeout(val)) is not None
     }
 
     optuna = OptunaGlobalConfig(
         global_seed=optuna_raw.get("global_seed", 42),
-        global_timeout=optuna_raw.get("global_timeout", None),
+        global_timeout=parse_timeout(optuna_raw.get("global_timeout", None)),
         model_timeouts=model_timeouts,
     )
 
@@ -382,6 +385,8 @@ def load_model_config(path: str | Path) -> ModelConfig:
         pruner=optuna_raw.get("pruner", {"type": "median", "n_warmup_steps": 3, "n_startup_trials": 10}),
         n_top_trials=optuna_raw.get("n_top_trials", 5),
         n_seeds=optuna_raw.get("n_seeds", 3),
+        selection_mode=optuna_raw.get("selection_mode", "global"),
+        fold_timeout=optuna_raw.get("fold_timeout", None),
     )
 
     return ModelConfig(

@@ -12,7 +12,6 @@ All strategies work with OOF predictions to evaluate without leakage.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import numpy as np
 import optuna
@@ -33,7 +32,11 @@ def _score(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
     elif metric == "neg_rmse":
         return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
     else:
-        # Default: try roc_auc
+        logger.warning(
+            "Unknown metric %r — falling back to roc_auc (classification) "
+            "or neg_rmse (regression). Pass 'roc_auc' or 'neg_rmse' explicitly.",
+            metric,
+        )
         try:
             return float(roc_auc_score(y_true, y_pred))
         except Exception:
@@ -121,10 +124,10 @@ def apply_blend(
         2. Compute weighted sum: np.sum(w * p for w, p in zip).
         3. Return the blended array.
     """
-    # REVIEW:STYLE — assert is stripped by `python -O`; use `if … raise ValueError(…)` for runtime validation
-    assert len(preds_list) == len(weights), (
-        f"preds_list ({len(preds_list)}) and weights ({len(weights)}) must have same length"
-    )
+    if len(preds_list) != len(weights):
+        raise ValueError(
+            f"preds_list ({len(preds_list)}) and weights ({len(weights)}) must have same length"
+        )
     blended = sum(w * p for w, p in zip(weights, preds_list))
     return np.array(blended)
 

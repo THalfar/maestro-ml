@@ -648,3 +648,208 @@ class TestNSGA2DiversityMetrics:
 
         # They should give different values (Spearman detects rank-order)
         assert pearson_neff != pytest.approx(spearman_neff, abs=0.001)
+
+
+# ---------------------------------------------------------------------------
+# log_fold_diversity
+# ---------------------------------------------------------------------------
+
+from src.ensemble.diversity import log_fold_diversity
+
+
+class TestLogFoldDiversity:
+    def test_returns_expected_keys(self, diverse_preds):
+        oof_list, y = diverse_preds
+        # Simulate 5-fold CV indices
+        n = len(y)
+        fold_size = n // 5
+        fold_indices = [
+            np.arange(i * fold_size, (i + 1) * fold_size) for i in range(5)
+        ]
+        weights = [1.0 / 3] * 3
+
+        result = log_fold_diversity(
+            oof_list, y, fold_indices, weights, metric="roc_auc"
+        )
+        assert "fold_neffs" in result
+        assert "fold_blend_scores" in result
+        assert "mean" in result
+        assert "std" in result
+        assert "min" in result
+        assert "max" in result
+        assert "worst_fold" in result
+
+    def test_fold_neffs_length_matches_folds(self, diverse_preds):
+        oof_list, y = diverse_preds
+        n = len(y)
+        fold_indices = [np.arange(i * 40, (i + 1) * 40) for i in range(5)]
+        weights = [1.0 / 3] * 3
+
+        result = log_fold_diversity(
+            oof_list, y, fold_indices, weights, metric="roc_auc"
+        )
+        assert len(result["fold_neffs"]) == 5
+        assert len(result["fold_blend_scores"]) == 5
+
+    def test_neff_values_positive(self, diverse_preds):
+        oof_list, y = diverse_preds
+        fold_indices = [np.arange(i * 40, (i + 1) * 40) for i in range(5)]
+        weights = [1.0 / 3] * 3
+
+        result = log_fold_diversity(
+            oof_list, y, fold_indices, weights, metric="roc_auc"
+        )
+        for neff in result["fold_neffs"]:
+            assert neff >= 1.0
+
+    def test_single_model_returns_empty(self):
+        """Single model → early return with empty fold_neffs."""
+        rng = np.random.default_rng(42)
+        preds = [rng.random(100)]
+        y = rng.choice([0, 1], 100).astype(float)
+        fold_indices = [np.arange(i * 20, (i + 1) * 20) for i in range(5)]
+
+        result = log_fold_diversity(preds, y, fold_indices, [1.0])
+        assert result["fold_neffs"] == []
+        assert result["mean"] == 0.0
+
+    def test_mean_std_consistency(self, diverse_preds):
+        oof_list, y = diverse_preds
+        fold_indices = [np.arange(i * 40, (i + 1) * 40) for i in range(5)]
+        weights = [1.0 / 3] * 3
+
+        result = log_fold_diversity(
+            oof_list, y, fold_indices, weights, metric="roc_auc"
+        )
+        np.testing.assert_almost_equal(
+            result["mean"], np.mean(result["fold_neffs"])
+        )
+        np.testing.assert_almost_equal(
+            result["std"], np.std(result["fold_neffs"])
+        )
+
+    def test_worst_fold_is_min_neff(self, diverse_preds):
+        oof_list, y = diverse_preds
+        fold_indices = [np.arange(i * 40, (i + 1) * 40) for i in range(5)]
+        weights = [1.0 / 3] * 3
+
+        result = log_fold_diversity(
+            oof_list, y, fold_indices, weights, metric="roc_auc"
+        )
+        assert result["worst_fold"] == int(np.argmin(result["fold_neffs"]))
+
+    def test_works_with_neg_rmse(self):
+        """log_fold_diversity works for regression metric."""
+        rng = np.random.default_rng(42)
+        n = 100
+        y = rng.random(n) * 10
+        a = y + rng.normal(0, 1, n)
+        b = y + rng.normal(0, 2, n)
+        fold_indices = [np.arange(i * 20, (i + 1) * 20) for i in range(5)]
+
+        result = log_fold_diversity(
+            [a, b], y, fold_indices, [0.6, 0.4], metric="neg_rmse"
+        )
+        assert len(result["fold_neffs"]) == 5
+        for score in result["fold_blend_scores"]:
+            assert score <= 0  # neg_rmse is always <= 0
+
+
+# ---------------------------------------------------------------------------
+# print_diversity_report
+# ---------------------------------------------------------------------------
+
+from src.ensemble.diversity import print_diversity_report
+
+
+class TestPrintDiversityReport:
+    def test_prints_output(self, capsys):
+        corr = np.array([
+            [1.0, 0.8, 0.2],
+            [0.8, 1.0, 0.3],
+            [0.2, 0.3, 1.0],
+        ])
+        labels = ["CatBoost", "XGBoost", "LightGBM"]
+        print_diversity_report(corr, labels)
+
+        captured = capsys.readouterr()
+        assert "ENSEMBLE DIVERSITY REPORT" in captured.out
+        assert "N_eff" in captured.out
+        assert "CatBoost" in captured.out
+        assert "XGBoost" in captured.out
+
+    def test_redundant_ensemble_warning(self, capsys):
+        """All-ones corr matrix → N_eff ≈ 1 → redundancy warning."""
+        corr = np.ones((3, 3))
+        labels = ["A", "B", "C"]
+        print_diversity_report(corr, labels)
+
+        captured = capsys.readouterr()
+        assert "redundant" in captured.out.lower()
+
+    def test_good_diversity_message(self, capsys):
+        """Identity corr matrix → N_eff = N → good diversity."""
+        corr = np.eye(4)
+        labels = ["A", "B", "C", "D"]
+        print_diversity_report(corr, labels)
+
+        captured = capsys.readouterr()
+        assert "Good diversity" in captured.out
+
+    def test_most_least_correlated_pairs(self, capsys):
+        corr = np.array([
+            [1.0, 0.9, 0.1],
+            [0.9, 1.0, 0.3],
+            [0.1, 0.3, 1.0],
+        ])
+        labels = ["A", "B", "C"]
+        print_diversity_report(corr, labels)
+
+        captured = capsys.readouterr()
+        assert "Most correlated pair" in captured.out
+        assert "Least correlated pair" in captured.out
+        # Most correlated should be A & B (r=0.9)
+        assert "A" in captured.out and "B" in captured.out
+
+    def test_single_model(self, capsys):
+        """Single model → no pair info, just N_eff."""
+        corr = np.array([[1.0]])
+        labels = ["Solo"]
+        print_diversity_report(corr, labels)
+
+        captured = capsys.readouterr()
+        assert "N_eff" in captured.out
+        assert "Most correlated pair" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# greedy_diverse_select edge cases
+# ---------------------------------------------------------------------------
+
+class TestGreedyDiverseSelectEdgeCases:
+    def test_negative_scores_min_score_ratio(self):
+        """REGRESSION BUG: min_score_ratio breaks for negative metrics.
+
+        When best score is negative (e.g., neg_rmse = -0.5),
+        min_score = -0.5 * 0.95 = -0.475 > -0.5, filtering out the
+        best model itself. Falls back to all models, ignoring the ratio.
+        """
+        rng = np.random.default_rng(42)
+        a = rng.random(100)
+        b = rng.random(100)
+        c = rng.random(100)
+        oof_list = [a, b, c]
+        # Negative scores (neg_rmse-style): -0.5 is best, -2.0 is worst
+        scores = [-0.5, -0.8, -2.0]
+
+        selected = greedy_diverse_select(
+            oof_list, scores, n_select=2, min_score_ratio=0.95
+        )
+        # With correct implementation: model 2 (score=-2.0) should be excluded
+        # because it's far worse than -0.5.
+        # BUG: min_score = -0.5 * 0.95 = -0.475, which is HIGHER than -0.5,
+        # so ALL models fail the threshold and fallback includes all.
+        # This test documents the bug — model 2 SHOULD be excluded.
+        assert 2 not in selected, (
+            "Model with score=-2.0 should be excluded at 95% ratio of best=-0.5"
+        )

@@ -1,6 +1,8 @@
 """Tests for src/models/registry.py — Model factory and search space."""
 from __future__ import annotations
 
+import importlib
+import types
 from pathlib import Path
 
 import numpy as np
@@ -248,3 +250,404 @@ class TestCheckGpu:
 
     def test_unknown_model_returns_false(self, registry: ModelRegistry):
         assert registry.check_gpu("nonexistent") is False
+
+    def test_cache_differentiates_task_type(self, registry: ModelRegistry):
+        """Cache key includes task_type, so different task types are cached separately."""
+        registry.check_gpu("ridge", task_type="binary_classification")
+        registry.check_gpu("ridge", task_type="regression")
+        assert "ridge_binary_classification" in registry._gpu_status
+        assert "ridge_regression" in registry._gpu_status
+
+    def test_gpu_supported_but_fails_micro_trial(self, tmp_path: Path):
+        """GPU-supporting model whose micro-trial fails should return False."""
+        configs_dir = tmp_path / "gpu_models"
+        configs_dir.mkdir()
+        fake_gpu_cfg = {
+            "name": "FakeGPU",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {
+                "supported": True,
+                "params": {"INVALID_PARAM_XYZ": True},
+                "fallback": {},
+            },
+            "hyperparameters": {},
+            "fixed_params": {},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {
+                "needs_scaling": False,
+                "handles_categorical": False,
+                "handles_missing": False,
+            },
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "fakegpu.yaml").write_text(
+            yaml.dump(fake_gpu_cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+        result = reg.check_gpu("fakegpu")
+        assert result is False
+        assert reg._gpu_status["fakegpu_binary_classification"] is False
+
+
+# ---------------------------------------------------------------------------
+# get_model — edge cases
+# ---------------------------------------------------------------------------
+
+class TestGetModelEdgeCases:
+    def test_class_path_fallback_for_unknown_task_type(self, registry: ModelRegistry):
+        """When task_type not in class_path, falls back to first available."""
+        model = registry.get_model(
+            "ridge", hparams={"C": 1.0},
+            task_type="multiclass",  # not in ridge's class_path
+        )
+        # Should fall back to binary_classification (first key)
+        from sklearn.linear_model import LogisticRegression
+        assert isinstance(model, LogisticRegression)
+
+    def test_import_error_bad_class_path(self, tmp_path: Path):
+        """Bad class_path should raise ImportError."""
+        configs_dir = tmp_path / "bad_models"
+        configs_dir.mkdir()
+        bad_cfg = {
+            "name": "BadModel",
+            "class_path": {
+                "binary_classification": "nonexistent.module.FakeClass",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {},
+            "fixed_params": {},
+            "training": {},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "bad.yaml").write_text(
+            yaml.dump(bad_cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+        with pytest.raises(ImportError, match="Could not import"):
+            reg.get_model("bad", hparams={})
+
+    def test_gpu_params_merged(self, tmp_path: Path):
+        """GPU params should be merged into model params when gpu=True."""
+        configs_dir = tmp_path / "gpu_models2"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "RFwithGPU",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {
+                "supported": True,
+                "params": {"n_jobs": 1},  # GPU param: single job
+                "fallback": {"n_jobs": -1},  # CPU param: all cores
+            },
+            "hyperparameters": {},
+            "fixed_params": {"random_state": 0},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {
+                "needs_scaling": False,
+                "handles_categorical": False,
+                "handles_missing": False,
+            },
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "rf_gpu.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+
+        model_gpu = reg.get_model("rf_gpu", hparams={}, gpu=True)
+        assert model_gpu.n_jobs == 1
+
+        model_cpu = reg.get_model("rf_gpu", hparams={}, gpu=False)
+        assert model_cpu.n_jobs == -1
+
+    def test_catboost_train_dir_with_results_dir(self, tmp_path: Path):
+        """CatBoost models should get train_dir set from results_dir."""
+        configs_dir = tmp_path / "cb_models"
+        configs_dir.mkdir()
+        cb_cfg = {
+            "name": "FakeCatBoost",
+            "class_path": {
+                # Use a class whose import path contains "catboost" but is actually
+                # a simple sklearn model — we just want to test the train_dir logic
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {},
+            "fixed_params": {"random_state": 0},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "catboost_fake.yaml").write_text(
+            yaml.dump(cb_cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+
+        # The class_path doesn't contain "catboost" so train_dir won't be set.
+        # This tests the negative case — non-catboost models get no train_dir.
+        model = reg.get_model("catboost_fake", hparams={}, results_dir=tmp_path)
+        assert not hasattr(model, "train_dir")
+
+    def test_catboost_train_dir_detection(self, tmp_path: Path):
+        """Verify train_dir logic triggers when class_path contains 'catboost'."""
+        configs_dir = tmp_path / "cb_models2"
+        configs_dir.mkdir()
+        # Use a class_path that contains "catboost" in it but resolves to sklearn
+        # We'll test via the params dict instead
+        cb_cfg = {
+            "name": "CatBoostTest",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {},
+            "fixed_params": {"random_state": 0},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "test_cb.yaml").write_text(
+            yaml.dump(cb_cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+        # class_path = "sklearn.ensemble.RandomForestClassifier" doesn't contain "catboost"
+        # So train_dir param should NOT be passed — RF would reject unknown params
+        model = reg.get_model("test_cb", hparams={})
+        # Model created successfully without train_dir error
+        assert model.random_state == 0
+
+
+# ---------------------------------------------------------------------------
+# get_search_space — edge cases
+# ---------------------------------------------------------------------------
+
+class TestGetSearchSpaceEdgeCases:
+    def test_task_type_keyed_hyperparameters(self, tmp_path: Path):
+        """Ridge-like models with task-type-keyed hyperparameters."""
+        configs_dir = tmp_path / "ridge_hp_models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "RidgeStyleHP",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+                "regression": "sklearn.linear_model.Ridge",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "binary_classification": {
+                    "C": {"type": "float", "low": 0.001, "high": 100.0, "log": True},
+                },
+                "regression": {
+                    "alpha": {"type": "float", "low": 0.001, "high": 100.0, "log": True},
+                },
+            },
+            "fixed_params": {},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 15,
+                "qmc_warmup_trials": 5,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge_hp.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        reg = ModelRegistry(configs_dir)
+
+        space_bin = reg.get_search_space("ridge_hp", task_type="binary_classification")
+        assert "C" in space_bin
+        assert "alpha" not in space_bin
+
+        space_reg = reg.get_search_space("ridge_hp", task_type="regression")
+        assert "alpha" in space_reg
+        assert "C" not in space_reg
+
+    def test_scalar_override_creates_fixed(self, registry: ModelRegistry):
+        """Scalar override should create a fixed-type param."""
+        space = registry.get_search_space(
+            "random_forest",
+            overrides={"max_depth": 7},
+        )
+        assert space["max_depth"] == {"type": "fixed", "value": 7}
+
+    def test_override_adds_new_param(self, registry: ModelRegistry):
+        """Overrides can add params not in the original space."""
+        space = registry.get_search_space(
+            "random_forest",
+            overrides={"min_samples_leaf": {"type": "int", "low": 1, "high": 20}},
+        )
+        assert "min_samples_leaf" in space
+        assert space["min_samples_leaf"]["type"] == "int"
+
+    def test_unknown_model_raises(self, registry: ModelRegistry):
+        with pytest.raises(KeyError, match="not registered"):
+            registry.get_search_space("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# get_training_config
+# ---------------------------------------------------------------------------
+
+class TestGetTrainingConfig:
+    def test_returns_training_dict(self, registry: ModelRegistry):
+        cfg = registry.get_training_config("ridge")
+        assert isinstance(cfg, dict)
+        assert cfg["needs_eval_set"] is False
+
+    def test_unknown_model_raises(self, registry: ModelRegistry):
+        with pytest.raises(KeyError):
+            registry.get_training_config("nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# get_feature_requirements — edge case
+# ---------------------------------------------------------------------------
+
+class TestGetFeatureRequirementsEdge:
+    def test_unknown_model_raises(self, registry: ModelRegistry):
+        with pytest.raises(KeyError):
+            registry.get_feature_requirements("nonexistent")
+
+    def test_returned_dict_is_copy(self, registry: ModelRegistry):
+        """Mutating the returned dict should not affect internal config."""
+        req1 = registry.get_feature_requirements("ridge")
+        req1["needs_scaling"] = False  # mutate
+        req2 = registry.get_feature_requirements("ridge")
+        assert req2["needs_scaling"] is True  # original unchanged
+
+
+# ---------------------------------------------------------------------------
+# CatBoost train_dir — positive case
+# ---------------------------------------------------------------------------
+
+class TestCatBoostTrainDir:
+    """Verify train_dir IS set when class_path contains 'catboost'."""
+
+    @pytest.fixture
+    def catboost_registry(self, tmp_path: Path, monkeypatch):
+        """Registry with a fake CatBoost model using monkeypatched import."""
+        configs_dir = tmp_path / "cb_pos"
+        configs_dir.mkdir()
+        cb_cfg = {
+            "name": "CatBoost",
+            "class_path": {
+                "binary_classification": "catboost.CatBoostClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {},
+            "fixed_params": {"verbose": 0},
+            "training": {"needs_eval_set": True},
+            "feature_requirements": {},
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "catboost.yaml").write_text(
+            yaml.dump(cb_cfg), encoding="utf-8"
+        )
+
+        # Fake CatBoost class that records constructor params
+        self.received_params: dict = {}
+        parent = self
+
+        class FakeCatBoostClassifier:
+            def __init__(self, **kwargs):
+                parent.received_params.update(kwargs)
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        fake_module = types.ModuleType("catboost")
+        fake_module.CatBoostClassifier = FakeCatBoostClassifier  # type: ignore[attr-defined]
+
+        original_import = importlib.import_module
+
+        def patched_import(name, *args, **kwargs):
+            if name == "catboost":
+                return fake_module
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib, "import_module", patched_import)
+        return ModelRegistry(configs_dir)
+
+    def test_train_dir_set_with_results_dir(self, catboost_registry, tmp_path):
+        """train_dir should point inside results_dir/catboost_info."""
+        results = tmp_path / "results"
+        results.mkdir()
+        model = catboost_registry.get_model(
+            "catboost", hparams={}, results_dir=results,
+        )
+        assert "train_dir" in self.received_params
+        assert str(results / "catboost_info") == self.received_params["train_dir"]
+
+    def test_train_dir_set_without_results_dir(self, catboost_registry):
+        """train_dir should use a temp directory when results_dir=None."""
+        self.received_params.clear()
+        catboost_registry.get_model("catboost", hparams={})
+        assert "train_dir" in self.received_params
+        assert "catboost_info" in self.received_params["train_dir"]
+
+
+# ---------------------------------------------------------------------------
+# get_training_config — mutation safety
+# ---------------------------------------------------------------------------
+
+class TestGetTrainingConfigMutation:
+    def test_returned_dict_is_copy(self, registry: ModelRegistry):
+        """Mutating the returned dict should not affect internal config."""
+        cfg1 = registry.get_training_config("ridge")
+        cfg1["needs_eval_set"] = True  # mutate
+        cfg2 = registry.get_training_config("ridge")
+        assert cfg2["needs_eval_set"] is False  # original unchanged
+
+
+# ---------------------------------------------------------------------------
+# list_models — sort order
+# ---------------------------------------------------------------------------
+
+class TestListModelsSorted:
+    def test_returns_sorted(self, registry: ModelRegistry):
+        """list_models must return alphabetically sorted names."""
+        models = registry.list_models()
+        assert models == sorted(models)
+        assert models == ["random_forest", "ridge"]
