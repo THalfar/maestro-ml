@@ -176,13 +176,20 @@ Review this file: ${FILE}" \
         fi
 
         # --- Näytä löydökset värikoodattuna ---
-        REVIEW_COUNT=$(grep -c "# REVIEW:" "$FILE" 2>/dev/null)
-        BUG_N=$(grep -c "REVIEW:BUG" "$FILE" 2>/dev/null || echo 0)
-        LEAK_N=$(grep -c "REVIEW:LEAK" "$FILE" 2>/dev/null || echo 0)
-        API_N=$(grep -c "REVIEW:API" "$FILE" 2>/dev/null || echo 0)
-        PERF_N=$(grep -c "REVIEW:PERF" "$FILE" 2>/dev/null || echo 0)
-        STYLE_N=$(grep -c "REVIEW:STYLE" "$FILE" 2>/dev/null || echo 0)
-        TODO_N=$(grep -c "REVIEW:TODO" "$FILE" 2>/dev/null || echo 0)
+            DISPUTE_COUNT=$(grep -c "# DISPUTE:" "$FILE" 2>/dev/null)
+            DISPUTE_COUNT=${DISPUTE_COUNT:-0}
+            BUG_N=$(grep -c "REVIEW:BUG" "$FILE" 2>/dev/null)
+            BUG_N=${BUG_N:-0}
+            LEAK_N=$(grep -c "REVIEW:LEAK" "$FILE" 2>/dev/null)
+            LEAK_N=${LEAK_N:-0}
+            API_N=$(grep -c "REVIEW:API" "$FILE" 2>/dev/null)
+            API_N=${API_N:-0}
+            PERF_N=$(grep -c "REVIEW:PERF" "$FILE" 2>/dev/null)
+            PERF_N=${PERF_N:-0}
+            STYLE_N=$(grep -c "REVIEW:STYLE" "$FILE" 2>/dev/null)
+            STYLE_N=${STYLE_N:-0}
+            TODO_N=$(grep -c "REVIEW:TODO" "$FILE" 2>/dev/null)
+            TODO_N=${TODO_N:-0}
 
         echo ""
         echo -e "  ${WHITE}${BOLD}${REVIEW_COUNT} kommenttia:${NC}"

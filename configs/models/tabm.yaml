@@ -1,0 +1,154 @@
+# =============================================================================
+# TabM (Parameter-Efficient Ensemble) Configuration — maestro-ml
+# =============================================================================
+# Modern tabular MLP with parameter-efficient ensembling via pytabkit.
+# Each "ensemble member" shares most weights but has unique lightweight
+# components, giving ensemble diversity at a fraction of the cost.
+# Uses the same sklearn-compatible API as RealMLP (TabM_D_Classifier).
+#
+# Uses per-fold selection (selection_mode: per_fold) with rank-based
+# assembly — simpler than RealMLP's NSGA-II assembly but still captures
+# neural network stochasticity across folds.
+# =============================================================================
+
+name: TabM
+class_path:
+  binary_classification: pytabkit.TabM_D_Classifier
+  regression: pytabkit.TabM_D_Regressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: true
+  params:
+    device: cuda
+  fallback:
+    device: cpu
+  install_notes: >
+    Requires PyTorch with CUDA support. pytabkit auto-detects GPU.
+    Install: pip install pytabkit torch --index-url https://download.pytorch.org/whl/cu121
+
+# ---------------------------------------------------------------------------
+# Hyperparameters — Optuna search space
+# ---------------------------------------------------------------------------
+# Based on pytabkit's TabM HPO ranges and TabM paper (ICLR 2025).
+# arch_type controls the ensemble variant; tabm_k controls member count.
+# num_emb_type='pwl' (piecewise linear) often helps with numerical features.
+# ---------------------------------------------------------------------------
+hyperparameters:
+  # --- Architecture ---
+  arch_type:
+    type: categorical
+    choices: [tabm, tabm-mini]
+  tabm_k:
+    type: categorical
+    choices: [8, 16, 32, 64]
+  n_blocks:
+    type: int
+    low: 1
+    high: 5
+  d_block:
+    type: int
+    low: 64
+    high: 1024
+    step: 16
+  dropout:
+    type: float
+    low: 0.0
+    high: 0.5
+
+  # --- Numerical embeddings (PWL = Piecewise Linear) ---
+  num_emb_type:
+    type: categorical
+    choices: [none, pwl]
+  d_embedding:
+    type: int
+    low: 8
+    high: 32
+    step: 4
+  num_emb_n_bins:
+    type: int
+    low: 16
+    high: 128
+
+  # --- Learning rate & regularization ---
+  lr:
+    type: float
+    low: 0.0001
+    high: 0.01
+    log: true
+  weight_decay:
+    type: float
+    low: 0.000001
+    high: 0.1
+    log: true
+  batch_size:
+    type: int
+    low: 4096
+    high: 64768
+    log: true
+
+  # --- Ensemble (pytabkit internal) ---
+  n_ens:
+    type: int
+    low: 1
+    high: 3
+
+# ---------------------------------------------------------------------------
+# Fixed params — task-type keyed
+# ---------------------------------------------------------------------------
+# n_epochs is very high because TabM uses early stopping (patience=16).
+# tfms: ['quantile_tabr'] applies the RTDL quantile transformation.
+# ---------------------------------------------------------------------------
+fixed_params:
+  binary_classification:
+    n_epochs: 1000000000
+    patience: 16
+    n_cv: 1
+    n_refit: 0
+    tfms:
+      - quantile_tabr
+    val_metric_name: 1-auc_ovr
+    verbosity: 0
+    random_state: 42
+  regression:
+    n_epochs: 1000000000
+    patience: 16
+    n_cv: 1
+    n_refit: 0
+    tfms:
+      - quantile_tabr
+    val_metric_name: rmse
+    verbosity: 0
+    random_state: 42
+
+training:
+  early_stopping: false                          # TabM handles early stopping internally
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_state
+  eval_metric_param: null
+  needs_eval_set: false
+
+feature_requirements:
+  needs_scaling: false                           # TabM preprocesses internally (quantile_tabr)
+  handles_categorical: true                      # auto-detects from DataFrame dtype
+  handles_missing: false
+
+optuna:
+  n_trials: 1000
+  qmc_warmup_trials: 30
+  timeout: null
+  pruner:
+    type: median
+    n_warmup_steps: 1
+    n_startup_trials: 30
+  n_top_trials: 20
+  n_seeds: 1
+  selection_mode: per_fold
+  fold_timeout: 180
+  assembly:
+    mode: rank                                   # rank-based assembly (deterministic, simple)
+    n_composites: 20

@@ -33,6 +33,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 
 - **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
 - **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression) and compared against the linear blend — the best wins automatically.
+- **Per-fold selection for neural nets** — RealMLP uses per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
 - **GPU auto-detection** — Per-model micro-trial detects CUDA availability at startup, with automatic CPU fallback.
@@ -197,7 +198,8 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - Per-model independent studies
 - Phase 1: QMC warmup (space-filling exploration)
 - Phase 2: TPE (Bayesian optimization)
-- Top configs retrained with multiple seeds for stability
+- **Global mode** (default): Top configs retrained with multiple seeds for stability
+- **Per-fold mode** (RealMLP): `PerFoldTracker` keeps top-N predictions per fold during Optuna (including pruned trials). After Optuna, composites assembled via rank or NSGA-II — no retraining needed. Per-fold timeout prunes slow trials while saving completed fold predictions.
 - OOF predictions stored for ensemble
 
 **Ensemble** (`src/ensemble/blender.py`, `src/ensemble/diversity.py`)
@@ -217,7 +219,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 | CatBoost | CUDA | eval_set | Native categoricals, ordered boosting |
 | XGBoost | CUDA | eval_set | `device="cuda"` (v2.0+) |
 | LightGBM | Special build | callbacks | CPU-only by default |
-| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, dynamic layer depth, label smoothing |
+| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, rectangular architecture with searchable depth/width, per-fold selection (no retraining), NSGA-II fold-level assembly |
 | Ridge / LogReg | CPU | — | Fast linear baseline |
 | Elastic Net | CPU | — | L1+L2 linear regression |
 | KNN | CPU | — | Instance-based, adds diversity |
@@ -276,7 +278,7 @@ maestro-ml/
 │   └── ps-s6e3/              # Kaggle PS S6E3 Customer Churn
 │       ├── pipeline.yaml
 │       └── strategy_output.yaml
-├── tests/                    # 264 tests
+├── tests/                    # 479 tests
 ├── requirements.txt
 └── CLAUDE.md                 # AI-assisted development instructions
 ```
@@ -290,10 +292,10 @@ pytest tests/ -v
 ```
 
 ```
-264 passed, 5 skipped in ~4s
+479 passed, 5 skipped in ~6s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including dynamic_int_list for neural net architecture search), ensemble blending, all three diversity metrics (Pearson/Spearman/ambiguity), NSGA-II→meta-model stacking chain, LLM strategy parsing, and end-to-end pipeline integration.
+Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training, per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending, NSGA-II→meta-model stacking chain, LLM strategy parsing, and end-to-end pipeline integration.
 
 ---
 
@@ -321,7 +323,7 @@ Each model config in `configs/models/` defines:
 - `fixed_params` — Always-on parameters (can be task-type-keyed)
 - `gpu` — GPU params and CPU fallback
 - `training` — Early stopping, eval metric, seed parameter name
-- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings
+- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings, `selection_mode` (`global`/`per_fold`), `fold_timeout`, `assembly` (mode, diversity_metric, diversity_weight)
 
 ---
 
@@ -366,8 +368,12 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] NSGA-II → meta-model stacking chain (diversity selection + non-linear stacking)
 - [x] Configurable diversity metrics (Pearson N_eff, Spearman N_eff, ambiguity decomposition)
 - [x] Dynamic neural net architecture search (Optuna chooses layer count + widths)
+- [x] Per-fold selection for neural nets (no retraining, pruned trials contribute)
+- [x] Two-layer NSGA-II: fold-level assembly + model-level ensemble
+- [x] Greedy Pareto selection with real diversity metrics (pearson/spearman/ambiguity)
+- [x] Per-fold timeout (saves completed folds before pruning)
 - [x] End-to-end pipeline orchestrator
-- [x] 264 tests with full coverage
+- [x] 479 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [ ] Feature importance analysis and selection
@@ -379,7 +385,8 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 
 - **[CatBoost](https://catboost.ai/)** / **[XGBoost](https://xgboost.readthedocs.io/)** / **[LightGBM](https://lightgbm.readthedocs.io/)** — Gradient boosting
 - **[scikit-learn](https://scikit-learn.org/)** — Linear models, KNN, Random Forest, Extra Trees
-- **[Optuna](https://optuna.org/)** — Bayesian hyperparameter optimization with QMC and NSGA-II
+- **[Optuna](https://optuna.org/)** — Bayesian hyperparameter optimization with QMC
+- **[pymoo](https://pymoo.org/)** — Multi-objective optimization (NSGA-II for ensemble diversity and fold-level assembly)
 - **[Anthropic Claude API](https://docs.anthropic.com/)** — LLM-powered strategy generation
 - **[pandas](https://pandas.pydata.org/)** / **[NumPy](https://numpy.org/)** / **[SciPy](https://scipy.org/)** — Data and scientific computing
 

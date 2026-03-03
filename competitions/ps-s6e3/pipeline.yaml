@@ -41,11 +41,8 @@ models:
   - xgboost
   - lightgbm
   - realmlp
+  - tabm
   - ridge
-  - elastic_net
-  - knn
-  - gaussian_nb
-  - adaboost
 
 features:
   interactions: []
@@ -66,15 +63,12 @@ optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    realmlp: "5h"
-    catboost: "1h30m"
+    realmlp: "4h"
+    tabm: "3h"
+    catboost: "1h"
     xgboost: "45m"
     lightgbm: "45m"
-    adaboost: "20m"
     ridge: "8m"
-    elastic_net: "8m"
-    knn: "8m"
-    gaussian_nb: "4m"
 
 runtime:
   gpu_check: true
