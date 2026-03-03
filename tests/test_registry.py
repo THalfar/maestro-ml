@@ -215,11 +215,12 @@ class TestGetOptunaConfig:
         assert cfg["n_seeds"] == 1
 
     def test_all_eight_fields_present(self, registry: ModelRegistry):
-        """get_optuna_config must return all 8 fields including selection_mode and fold_timeout."""
+        """get_optuna_config must return all fields including selection_mode, fold_timeout, assembly."""
         cfg = registry.get_optuna_config("ridge")
         expected_keys = {
             "n_trials", "qmc_warmup_trials", "timeout", "pruner",
             "n_top_trials", "n_seeds", "selection_mode", "fold_timeout",
+            "assembly",
         }
         assert set(cfg.keys()) == expected_keys
         assert cfg["qmc_warmup_trials"] == 6
@@ -227,6 +228,7 @@ class TestGetOptunaConfig:
         assert cfg["pruner"] == {"type": "none"}
         assert cfg["selection_mode"] == "global"  # default
         assert cfg["fold_timeout"] is None  # default
+        assert cfg["assembly"]["mode"] == "rank"  # default
 
     def test_unknown_model_raises(self, registry: ModelRegistry):
         with pytest.raises(KeyError):

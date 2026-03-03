@@ -125,11 +125,12 @@ def compute_spearman_correlation_matrix(oof_list: list[np.ndarray]) -> np.ndarra
         Spearman correlation matrix of shape (n_models, n_models).
     """
     mat = np.column_stack(oof_list)  # (n_samples, n_models)
+    # Guard: spearmanr requires ≥2 variables
+    if mat.shape[1] == 1:
+        return np.array([[1.0]])
     corr, _ = spearmanr(mat)         # (n_models, n_models)
     # spearmanr returns a scalar for 2 variables — force to 2D
-    if mat.shape[1] == 1:
-        corr = np.array([[1.0]])
-    elif mat.shape[1] == 2:
+    if mat.shape[1] == 2:
         corr = np.array([[1.0, corr], [corr, 1.0]])
     corr = np.nan_to_num(corr, nan=0.0)
     np.fill_diagonal(corr, 1.0)
@@ -290,7 +291,9 @@ def greedy_diverse_select(
 
     Steps:
         1. Compute the minimum acceptable score:
-           min_score = max(scores) * min_score_ratio.
+           min_score = max(scores) - abs(max(scores)) * (1 - min_score_ratio).
+           Using abs() makes the formula correct for both positive (AUC) and
+           negative (neg_rmse) metrics.
         2. Filter to models meeting the quality threshold.
         3. Start with the model that has the highest score.
         4. Iteratively add the model that maximizes effective_ensemble_size
@@ -653,7 +656,7 @@ def log_fold_diversity(
     """
     n_models = len(selected_oofs)
     if n_models < 2:
-        return {"fold_neffs": [], "mean": 0.0, "std": 0.0}
+        return {"fold_neffs": [], "fold_blend_scores": [], "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "worst_fold": 0}
 
     _labels = labels or [f"model[{i}]" for i in range(n_models)]
     n_folds = len(fold_indices)

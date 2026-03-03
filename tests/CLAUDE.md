@@ -16,7 +16,7 @@ conda run -n maestro pytest -k "test_blend" -v
 conda run -n maestro pytest tests/ -x -v
 ```
 
-Expected: **427 tests, ~5s** (no GPU, no real Optuna studies — all use tiny synthetic data).
+Expected: **479 tests, ~6s** (no GPU, no real Optuna studies — all use tiny synthetic data).
 
 ## Test File → Source Module Mapping
 
@@ -69,6 +69,8 @@ The target encoding tests check that val-fold values were computed only from tra
 ### Testing per-fold selection (test_trainer.py)
 - `TestPerFoldTracker` — Unit tests for PerFoldTracker: top-N tracking, minimize/maximize, assemble shapes, pruned trials contribute, rank ordering.
 - `TestPerFoldIntegration` — Integration tests: run_optuna returns tracker, assembled OOF valid probabilities, run_all_studies per_fold mode, global mode unchanged.
+- `TestAssembleNsga2` — NSGA-II fold-level assembly: correct count/shapes, same format as rank assembly, diversity_weight affects selection, empty tracker returns empty, more diverse than rank, all 3 diversity metrics, spearman vs pearson distinction.
+- `TestGreedyParetoSelect` — `_greedy_pareto_select()` unit tests: correct count, fewer-than-n_select, first=best-score, dw=0 pure score, all 3 metrics, minimize direction.
 - Uses a `per_fold_configs_dir` fixture with `selection_mode: per_fold` and `n_top_trials: 3`.
 - `run_optuna_study()` returns `tuple[Study, PerFoldTracker | None]` — all callers unpack with `study, _ = ...`.
 

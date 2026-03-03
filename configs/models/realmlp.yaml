@@ -191,4 +191,11 @@ optuna:
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold                       # per-fold best selection (no retraining)
-  fold_timeout: 180                              # max 5 min per fold — kill extreme configs
+  fold_timeout: 180
+  assembly:
+    mode: nsga2                                  # "rank" (deterministic) | "nsga2" (diversity-optimized)
+    n_composites: 20                             # how many composites from Pareto front
+    n_generations: 50                            # NSGA-II generations (each eval = array lookup, <1s total)
+    pop_size: 100                                # NSGA-II population size
+    diversity_metric: spearman_neff               # pearson_neff | spearman_neff | ambiguity
+    diversity_weight: 0.3                          # 0=pure score, 1=pure diversity (Pareto front selection)

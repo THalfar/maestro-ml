@@ -61,10 +61,24 @@ Implement in this order (each module depends on the ones above it):
 Neural networks benefit from stochasticity — a trial may excel on one fold but not others. Per-fold selection exploits this:
 
 - **During Optuna**: Each fold's trained model immediately predicts on test data. `PerFoldTracker` maintains a bounded per-fold leaderboard (top `n_top_trials` per fold), including predictions from pruned trials.
-- **After Optuna**: `tracker.assemble()` builds composite prediction arrays. Composite k uses the k-th best trial per fold (each fold may come from a different trial). **No retraining needed.**
+- **After Optuna — Assembly**: Two modes build composite prediction arrays from per-fold bests. **No retraining needed.**
+  - `mode: rank` (default) — Composite k uses the k-th best trial per fold. Deterministic, fast.
+  - `mode: nsga2` — Two-phase approach: (1) NSGA-II explores fold combinations using a fast trial-source diversity proxy, (2) greedy selection from Pareto front using the **actual** `diversity_metric` (pearson_neff, spearman_neff, or ambiguity). Each step adds the composite maximising `(1-dw)*score + dw*diversity`.
+- **Assembly NSGA-II config** (in model YAML `optuna.assembly`):
+  ```yaml
+  assembly:
+    mode: nsga2               # "rank" | "nsga2"
+    n_composites: 20          # how many composites from Pareto front
+    n_generations: 50         # NSGA-II generations
+    pop_size: 100             # NSGA-II population size
+    diversity_metric: spearman_neff  # actual metric used in greedy selection
+    diversity_weight: 0.3     # 0=pure score, 1=pure diversity
+  ```
+- **Assembly speed**: NSGA-II phase: 5000 evals × O(n_folds) each → <1s. Greedy phase: pre-ranks OOFs once (spearman_neff) then pairwise Pearson on ranks → <1s. Total <2s.
 - **fold_timeout**: Per-fold time limit (seconds). If a single fold exceeds this, the trial is pruned (but completed folds' predictions are still saved to the tracker).
 - **Config**: Set `selection_mode: per_fold` and `fold_timeout: 180` in the model YAML's `optuna` section.
-- **NSGA-II integration**: Per-fold composites have the same format as global-mode arrays — `(n_train,)` OOF + `(n_test,)` test. NSGA-II doesn't know or care about the difference.
+- **NSGA-II integration**: Per-fold composites have the same format as global-mode arrays — `(n_train,)` OOF + `(n_test,)` test. The outer model-level NSGA-II (in `run.py`) doesn't know or care about the difference.
+- **Two-layer NSGA-II**: Inner (fold-level, in `trainer.py`) optimizes fold combinations into composites. Outer (model-level, in `run.py/diversity.py`) optimizes model weights across all prediction arrays.
 - **Global mode** (`selection_mode: global`, default): Existing behaviour — retrain top N configs with multiple seeds. All other models use this.
 
 ## Ensemble & Diversity
@@ -85,6 +99,7 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - **`diversity_metric`**: Selects NSGA-II diversity objective per competition (`pearson_neff`, `spearman_neff`, `ambiguity`).
 - **`selection_mode`**: Per-model in model YAML (`global` or `per_fold`). Controls whether top configs are retrained (global) or per-fold composites are assembled (per_fold).
 - **`fold_timeout`**: Per-model in model YAML. Max seconds per CV fold — exceeding prunes the trial.
+- **`assembly`**: Per-model in model YAML. Dict with `mode` (`rank`/`nsga2`), `n_composites`, `n_generations`, `pop_size`, `diversity_metric`, `diversity_weight`. Controls how per-fold composites are built.
 
 ## CV and OOF Predictions
 
@@ -133,7 +148,7 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
-- Expected: **427 passed, 5 skipped, ~5s**
+- Expected: **479 passed, 5 skipped, ~6s**
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
 - `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds

@@ -143,6 +143,9 @@ class OptunaModelConfig:
     n_seeds: int = 3
     selection_mode: str = "global"  # "global" | "per_fold"
     fold_timeout: Optional[int] = None  # per-fold training timeout in seconds
+    assembly: dict[str, Any] = field(default_factory=lambda: {
+        "mode": "rank",  # "rank" | "nsga2"
+    })
 
 
 @dataclass
@@ -387,6 +390,7 @@ def load_model_config(path: str | Path) -> ModelConfig:
         n_seeds=optuna_raw.get("n_seeds", 3),
         selection_mode=optuna_raw.get("selection_mode", "global"),
         fold_timeout=optuna_raw.get("fold_timeout", None),
+        assembly=optuna_raw.get("assembly", {"mode": "rank"}),
     )
 
     return ModelConfig(

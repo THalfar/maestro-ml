@@ -262,6 +262,7 @@ class ModelRegistry:
             "n_seeds": optuna_cfg.n_seeds,
             "selection_mode": optuna_cfg.selection_mode,
             "fold_timeout": optuna_cfg.fold_timeout,
+            "assembly": optuna_cfg.assembly,
         }
 
     def get_training_config(self, name: str) -> dict[str, Any]:

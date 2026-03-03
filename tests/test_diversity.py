@@ -853,3 +853,133 @@ class TestGreedyDiverseSelectEdgeCases:
         assert 2 not in selected, (
             "Model with score=-2.0 should be excluded at 95% ratio of best=-0.5"
         )
+
+
+# ---------------------------------------------------------------------------
+# _score_metric
+# ---------------------------------------------------------------------------
+
+from src.ensemble.diversity import _score_metric
+
+
+class TestScoreMetric:
+    def test_roc_auc(self):
+        y = np.array([0, 0, 1, 1])
+        preds = np.array([0.1, 0.2, 0.8, 0.9])
+        score = _score_metric(y, preds, "roc_auc")
+        assert score == pytest.approx(1.0)
+
+    def test_neg_rmse(self):
+        y = np.array([1.0, 2.0, 3.0])
+        preds = np.array([1.0, 2.0, 3.0])
+        score = _score_metric(y, preds, "neg_rmse")
+        assert score == pytest.approx(0.0)
+
+    def test_neg_rmse_nonzero(self):
+        y = np.array([1.0, 2.0, 3.0])
+        preds = np.array([1.5, 2.5, 3.5])
+        score = _score_metric(y, preds, "neg_rmse")
+        assert score < 0.0
+
+    def test_unknown_metric_fallback_classification(self):
+        """Unknown metric falls back to roc_auc for binary data."""
+        y = np.array([0, 0, 1, 1])
+        preds = np.array([0.1, 0.2, 0.8, 0.9])
+        score = _score_metric(y, preds, "unknown_metric")
+        assert score == pytest.approx(1.0)
+
+    def test_unknown_metric_fallback_regression(self):
+        """Unknown metric falls back to neg_rmse when roc_auc fails."""
+        y = np.array([1.0, 2.5, 3.7, 4.2])
+        preds = np.array([1.1, 2.4, 3.8, 4.1])
+        score = _score_metric(y, preds, "unknown_metric")
+        # y values not binary, roc_auc fails → neg_rmse
+        assert score <= 0.0
+
+
+# ---------------------------------------------------------------------------
+# compute_spearman_correlation_matrix — single model edge case
+# ---------------------------------------------------------------------------
+
+class TestSpearmanSingleModel:
+    def test_single_model_returns_1x1(self):
+        """Single model returns 1x1 matrix with 1.0 on diagonal."""
+        preds = np.random.default_rng(0).random(100)
+        corr = compute_spearman_correlation_matrix([preds])
+        assert corr.shape == (1, 1)
+        assert corr[0, 0] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# select_from_pareto — two-solution edge case (< 3 → no knee)
+# ---------------------------------------------------------------------------
+
+class TestSelectFromParetoTwoSolutions:
+    def test_two_solutions_no_knee(self, diverse_preds):
+        """With < 3 solutions, knee selection is skipped → linear weighting."""
+        oof_list, y = diverse_preds
+        test_list = [np.random.default_rng(i).random(50) for i in range(3)]
+        pareto_F = np.array([[-0.90, -1.0], [-0.80, -3.0]])
+        pareto_X = np.array([[0.8, 0.1, 0.1], [0.33, 0.33, 0.34]])
+
+        test_preds, info = select_from_pareto(
+            pareto_F, pareto_X,
+            oof_list, test_list, y,
+            n_models=3,
+            diversity_weight=0.5,
+            metric="roc_auc",
+            use_knee=True,  # should be ignored since < 3 solutions
+        )
+        assert test_preds.shape == (50,)
+        assert len(info["selected_models"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# _EnsembleProblem — direct evaluation
+# ---------------------------------------------------------------------------
+
+from src.ensemble.diversity import _EnsembleProblem, _WEIGHT_THRESHOLD
+
+
+class TestEnsembleProblem:
+    def test_evaluate_normal(self):
+        """Normal evaluation produces two negative objectives."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = np.clip(y * 0.7 + rng.normal(0, 0.2, 100), 0.01, 0.99)
+        b = np.clip(y * 0.6 + rng.normal(0, 0.25, 100), 0.01, 0.99)
+
+        problem = _EnsembleProblem([a, b], y, "roc_auc")
+        out = {}
+        problem._evaluate(np.array([0.6, 0.4]), out)
+        assert "F" in out
+        assert out["F"].shape == (2,)
+        assert out["F"][0] < 0  # negated AUC
+        assert out["F"][1] < 0  # negated N_eff
+
+    def test_evaluate_all_below_threshold(self):
+        """All weights below threshold → penalty output."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 50).astype(float)
+        a = rng.random(50)
+
+        problem = _EnsembleProblem([a], y, "roc_auc")
+        out = {}
+        problem._evaluate(np.array([_WEIGHT_THRESHOLD / 2]), out)
+        assert "F" in out
+        np.testing.assert_array_equal(out["F"], [1e6, 1e6])
+
+
+# ---------------------------------------------------------------------------
+# greedy_diverse_select — request more than available
+# ---------------------------------------------------------------------------
+
+class TestGreedyDiverseSelectRequestMore:
+    def test_n_select_exceeds_candidates(self, diverse_preds):
+        """When n_select > number of candidates, returns all available."""
+        oof_list, y = diverse_preds
+        scores = [0.8, 0.78, 0.79]
+        selected = greedy_diverse_select(
+            oof_list, scores, n_select=10, y_true=y,
+        )
+        assert len(selected) == 3  # only 3 models available
