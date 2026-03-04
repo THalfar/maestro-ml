@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from run import main, _parse_args
+from run import main, _parse_args, _concat_extra_data
 
 
 # ---------------------------------------------------------------------------
@@ -666,3 +666,177 @@ class TestNSGA2MetaChain:
         assert len(sub) == nsga2_env["n_test"]
         assert sub["target"].min() >= 0.0
         assert sub["target"].max() <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# _concat_extra_data — unit tests
+# ---------------------------------------------------------------------------
+
+class TestConcatExtraData:
+    """Test extra data loading and concatenation."""
+
+    def test_basic_concat(self, tmp_path: Path):
+        """Extra data rows are appended to train."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        # Train data
+        train = pd.DataFrame({
+            "id": [1, 2, 3],
+            "feat": [0.1, 0.2, 0.3],
+            "target": [0, 1, 0],
+        })
+
+        # Extra data CSV (no id column, same features)
+        extra = pd.DataFrame({
+            "feat": [0.4, 0.5],
+            "target": [1, 0],
+        })
+        extra_path = tmp_path / "extra.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            extra_data=[{"path": str(extra_path)}],
+        )
+        logger = logging.getLogger("test")
+        result = _concat_extra_data(train, cfg, logger)
+
+        assert len(result) == 5  # 3 + 2
+        assert "id" in result.columns
+        assert "feat" in result.columns
+
+    def test_target_mapping_applied(self, tmp_path: Path):
+        """Target mapping converts string targets in extra data."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({
+            "id": [1], "feat": [0.1], "target": [1],
+        })
+        extra = pd.DataFrame({
+            "feat": [0.5], "target": ["Yes"],
+        })
+        extra_path = tmp_path / "extra_tm.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            target_mapping={"Yes": 1, "No": 0},
+            extra_data=[{"path": str(extra_path)}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert result.iloc[-1]["target"] == 1
+
+    def test_drop_columns(self, tmp_path: Path):
+        """drop_columns removes specified columns before concat."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "feat": [0.1], "target": [0]})
+        extra = pd.DataFrame({
+            "customerID": ["abc"], "feat": [0.5], "target": [1],
+        })
+        extra_path = tmp_path / "extra_drop.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            extra_data=[{"path": str(extra_path), "drop_columns": ["customerID"]}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert "customerID" not in result.columns
+        assert len(result) == 2
+
+    def test_column_mapping(self, tmp_path: Path):
+        """column_mapping renames columns before concat."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "price": [100.0], "target": [0]})
+        extra = pd.DataFrame({
+            "cost": [200.0], "target": [1],
+        })
+        extra_path = tmp_path / "extra_map.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            extra_data=[{
+                "path": str(extra_path),
+                "column_mapping": {"cost": "price"},
+            }],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert len(result) == 2
+        assert result.iloc[-1]["price"] == 200.0
+
+    def test_dtype_coercion(self, tmp_path: Path):
+        """String columns in extra are coerced to numeric if train has numeric."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "amount": [100.0], "target": [0]})
+        # Extra has amount as string (like TotalCharges in Telco)
+        extra = pd.DataFrame({"amount": ["200.5"], "target": [1]})
+        extra_path = tmp_path / "extra_dtype.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            extra_data=[{"path": str(extra_path)}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert result["amount"].dtype == np.float64
+        assert result.iloc[-1]["amount"] == 200.5
+
+    def test_missing_file_skipped(self, tmp_path: Path):
+        """Non-existent extra file is skipped with warning."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "target": [0]})
+        cfg = PipelineConfig(
+            target_column="target",
+            extra_data=[{"path": str(tmp_path / "nonexistent.csv")}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert len(result) == 1  # unchanged
+
+    def test_multiple_extra_files(self, tmp_path: Path):
+        """Multiple extra_data entries are concatenated sequentially."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "feat": [0.1], "target": [0]})
+
+        extra1 = pd.DataFrame({"feat": [0.2], "target": [1]})
+        extra2 = pd.DataFrame({"feat": [0.3], "target": [0]})
+        (tmp_path / "e1.csv").write_text(extra1.to_csv(index=False))
+        (tmp_path / "e2.csv").write_text(extra2.to_csv(index=False))
+
+        cfg = PipelineConfig(
+            target_column="target",
+            id_column="id",
+            extra_data=[
+                {"path": str(tmp_path / "e1.csv")},
+                {"path": str(tmp_path / "e2.csv")},
+            ],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert len(result) == 3  # 1 + 1 + 1
+
+    def test_no_extra_data_returns_original(self):
+        """Empty extra_data returns train unchanged."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "target": [0]})
+        cfg = PipelineConfig(target_column="target", extra_data=[])
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert len(result) == 1

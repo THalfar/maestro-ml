@@ -97,6 +97,100 @@ from src.ensemble.diversity import (
 from src.strategy.llm_strategist import generate_strategy
 
 
+def _concat_extra_data(
+    train: pd.DataFrame,
+    pipeline_config: "PipelineConfig",
+    logger: "logging.Logger",
+) -> pd.DataFrame:
+    """Concat extra datasets (e.g., original competition data) into train.
+
+    Each entry in pipeline_config.extra_data is a dict with:
+      - path (str): CSV file path (required)
+      - target_column (str): target column name in this file (default: same as pipeline)
+      - column_mapping (dict): rename columns {original_name: pipeline_name}
+      - drop_columns (list): columns to drop before concat
+
+    Handles:
+      - Column name differences via column_mapping
+      - Target mapping (same as pipeline's target_mapping)
+      - Missing id_column (original data usually doesn't have it)
+      - Numeric conversion for columns that are strings in original (e.g. TotalCharges)
+      - Only keeps columns that exist in train (drops extras, ignores missing)
+
+    Returns:
+        New DataFrame with extra data appended.
+    """
+    target_col = pipeline_config.target_column
+    id_col = pipeline_config.id_column
+    target_mapping = pipeline_config.target_mapping
+
+    original_len = len(train)
+    result = train
+
+    for entry in pipeline_config.extra_data:
+        path = entry.get("path", "")
+        if not path:
+            continue
+        p = Path(path)
+        if not p.exists():
+            logger.warning(f"Extra data file not found: {path}, skipping")
+            continue
+
+        extra = pd.read_csv(p)
+        extra_target = entry.get("target_column", target_col)
+        col_mapping = entry.get("column_mapping", {}) or {}
+        drop_cols = entry.get("drop_columns", []) or []
+
+        logger.info(f"Loading extra data: {path} ({len(extra)} rows, {len(extra.columns)} cols)")
+
+        # Drop specified columns
+        if drop_cols:
+            extra = extra.drop(columns=[c for c in drop_cols if c in extra.columns])
+
+        # Rename columns
+        if col_mapping:
+            extra = extra.rename(columns=col_mapping)
+
+        # Rename target column if different
+        if extra_target != target_col and extra_target in extra.columns:
+            extra = extra.rename(columns={extra_target: target_col})
+
+        # Apply target mapping
+        if target_mapping and target_col in extra.columns:
+            extra[target_col] = extra[target_col].map(
+                lambda v: target_mapping.get(str(v), v)
+            )
+
+        # Add id column if missing (use negative IDs to distinguish)
+        if id_col and id_col not in extra.columns:
+            extra[id_col] = range(-len(extra), 0)
+
+        # Keep only columns that exist in train
+        common_cols = [c for c in result.columns if c in extra.columns]
+        missing_cols = [c for c in result.columns if c not in extra.columns]
+        if missing_cols:
+            logger.debug(f"  Columns missing in extra data (filled NaN): {missing_cols}")
+        extra = extra[common_cols]
+
+        # Coerce dtypes to match train (e.g., TotalCharges: str → float)
+        for col in common_cols:
+            if col == id_col or col == target_col:
+                continue
+            if result[col].dtype != extra[col].dtype:
+                try:
+                    extra[col] = pd.to_numeric(extra[col], errors="coerce")
+                except Exception:
+                    pass
+
+        result = pd.concat([result, extra], ignore_index=True)
+        logger.info(
+            f"  +{len(extra)} rows from {Path(path).name} → "
+            f"train: {original_len} → {len(result)} rows"
+        )
+
+    return result
+
+
 def main(pipeline_yaml_path: str | Path) -> None:
     """Run the complete Maestro pipeline from config to submission.
 
@@ -236,7 +330,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # Step 3b: Load and concat extra data (original datasets)
     # -------------------------------------------------------------------------
     if pipeline_config.extra_data:
-        _concat_extra_data(train, pipeline_config, logger)
+        train = _concat_extra_data(train, pipeline_config, logger)
 
     # Log top 5 correlated features
     sorted_cols = sorted(

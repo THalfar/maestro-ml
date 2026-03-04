@@ -499,6 +499,62 @@ class TestPipelineConfigExtended:
         cfg = load_pipeline_config(path)
         assert cfg.models == []
 
+    def test_extra_data_list_of_dicts(self, tmp_dir: Path):
+        """extra_data as list of dicts should be parsed correctly."""
+        content = {
+            "data": {
+                "train_path": "t.csv",
+                "extra_data": [
+                    {"path": "orig.csv", "drop_columns": ["customerID"]},
+                    {"path": "extra2.csv", "target_column": "label"},
+                ],
+            },
+        }
+        path = tmp_dir / "ed.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert len(cfg.extra_data) == 2
+        assert cfg.extra_data[0]["path"] == "orig.csv"
+        assert cfg.extra_data[0]["drop_columns"] == ["customerID"]
+        assert cfg.extra_data[1]["target_column"] == "label"
+
+    def test_extra_data_single_string(self, tmp_dir: Path):
+        """extra_data as a single string shorthand."""
+        content = {
+            "data": {
+                "train_path": "t.csv",
+                "extra_data": "orig.csv",
+            },
+        }
+        path = tmp_dir / "ed_str.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert len(cfg.extra_data) == 1
+        assert cfg.extra_data[0]["path"] == "orig.csv"
+
+    def test_extra_data_list_of_strings(self, tmp_dir: Path):
+        """extra_data as list of strings (normalized to dicts)."""
+        content = {
+            "data": {
+                "train_path": "t.csv",
+                "extra_data": ["a.csv", "b.csv"],
+            },
+        }
+        path = tmp_dir / "ed_strs.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert len(cfg.extra_data) == 2
+        assert cfg.extra_data[0] == {"path": "a.csv"}
+        assert cfg.extra_data[1] == {"path": "b.csv"}
+
+    def test_extra_data_default_empty(self, tmp_dir: Path):
+        """Missing extra_data defaults to empty list."""
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "no_ed.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.extra_data == []
+
 
 # ---------------------------------------------------------------------------
 # load_model_config — edge cases
