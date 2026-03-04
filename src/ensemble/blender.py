@@ -209,11 +209,11 @@ def train_meta_model(
 
     X_meta = np.column_stack(oof_list)  # (n_samples, n_models)
 
-    if not is_regression:
-        def _logit_transform(arr: np.ndarray) -> np.ndarray:
-            p = np.clip(arr, 1e-6, 1 - 1e-6)
-            return np.clip(np.log(p / (1 - p)), -5, 5)
+    def _logit_transform(arr: np.ndarray) -> np.ndarray:
+        p = np.clip(arr, 1e-6, 1 - 1e-6)
+        return np.clip(np.log(p / (1 - p)), -5, 5)
 
+    if not is_regression:
         logit_meta = np.column_stack([_logit_transform(col) for col in oof_list])
         X_meta = np.hstack([X_meta, logit_meta])
 

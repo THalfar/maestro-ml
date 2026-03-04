@@ -1,4 +1,5 @@
 #!/bin/bash
+trap "echo 'Keskeytetty!'; taskkill /F /IM node.exe 2>/dev/null; exit 1" INT TERM
 # pompottelu.sh — Opus reviewaa, Sonnet korjaa, kunnes puhdas
 #
 # Käyttö:
@@ -152,7 +153,8 @@ Review this file: ${FILE}" \
         echo -e "$(timestamp) ${DIM}  Review valmis ($(elapsed $STEP_START))${NC}"
 
         # --- Tarkista disputet ---
-        DISPUTE_COUNT=$(grep -c "# DISPUTE:" "$FILE" 2>/dev/null || echo 0)
+        DISPUTE_COUNT=$(grep -c "# DISPUTE:" "$FILE" 2>/dev/null)
+        DISPUTE_COUNT=${DISPUTE_COUNT:-0}
         if [ "$DISPUTE_COUNT" -gt 0 ]; then
             DISPUTES=$((DISPUTES + DISPUTE_COUNT))
             echo ""

@@ -43,15 +43,15 @@ hyperparameters:
     choices: [tabm, tabm-mini]
   tabm_k:
     type: categorical
-    choices: [8, 16, 32, 64]
+    choices: [8, 16]
   n_blocks:
     type: int
     low: 1
-    high: 5
+    high: 3
   d_block:
     type: int
     low: 64
-    high: 1024
+    high: 256
     step: 16
   dropout:
     type: float
@@ -70,7 +70,7 @@ hyperparameters:
   num_emb_n_bins:
     type: int
     low: 16
-    high: 128
+    high: 64
 
   # --- Learning rate & regularization ---
   lr:
@@ -85,15 +85,9 @@ hyperparameters:
     log: true
   batch_size:
     type: int
-    low: 4096
-    high: 64768
+    low: 256
+    high: 2048
     log: true
-
-  # --- Ensemble (pytabkit internal) ---
-  n_ens:
-    type: int
-    low: 1
-    high: 3
 
 # ---------------------------------------------------------------------------
 # Fixed params — task-type keyed
@@ -139,16 +133,16 @@ feature_requirements:
 
 optuna:
   n_trials: 1000
-  qmc_warmup_trials: 30
+  qmc_warmup_trials: 20
   timeout: null
   pruner:
     type: median
     n_warmup_steps: 1
-    n_startup_trials: 30
+    n_startup_trials: 10
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold
-  fold_timeout: 180
+  fold_timeout: 120
   assembly:
     mode: rank                                   # rank-based assembly (deterministic, simple)
     n_composites: 20

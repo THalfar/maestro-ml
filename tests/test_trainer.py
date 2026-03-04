@@ -1658,3 +1658,158 @@ class TestPerFoldTrackerEdgeCases:
         assert stored[1][0] == 0.9  # val_preds not aliased
         assert stored[2][0] == 0    # val_idx not aliased
         assert stored[3][0] == 0.5  # test_preds not aliased
+
+
+# ---------------------------------------------------------------------------
+# step param support in search space (int/float)
+# ---------------------------------------------------------------------------
+
+class TestStepParamSupport:
+    """Test that the 'step' field in int/float search space specs is respected."""
+
+    @pytest.fixture
+    def step_configs_dir(self, tmp_path: Path) -> Path:
+        """Model config with int params that have step values (like TabM)."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
+                "max_iter": {"type": "int", "low": 100, "high": 1000, "step": 100},
+            },
+            "fixed_params": {
+                "binary_classification": {"solver": "lbfgs"},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "eval_metric_param": None,
+            },
+            "feature_requirements": {"needs_scaling": True},
+            "optuna": {
+                "n_trials": 10,
+                "qmc_warmup_trials": 3,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_int_step_respected(self, step_configs_dir, binary_data):
+        """int params with step should only produce multiples of step."""
+        train, test = binary_data
+        registry = ModelRegistry(step_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(step_configs_dir.parent / "results")),
+        )
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+        # All trials' max_iter should be multiples of 100
+        for trial in study.trials:
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                max_iter = trial.params.get("max_iter")
+                if max_iter is not None:
+                    assert max_iter % 100 == 0, (
+                        f"max_iter={max_iter} is not a multiple of step=100. "
+                        f"The 'step' field in the search space spec is being ignored."
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Multiclass path in PerFoldTracker.assemble
+# ---------------------------------------------------------------------------
+
+class TestPerFoldTrackerMulticlass:
+    """Test multiclass path in PerFoldTracker.assemble."""
+
+    def test_assemble_multiclass_shapes(self):
+        """Assembled multiclass composites should have 2D OOF and test arrays."""
+        from src.models.trainer import PerFoldTracker
+
+        n_samples = 6
+        n_test = 4
+        n_folds = 2
+        n_classes = 3
+        n_top = 2
+
+        tracker = PerFoldTracker(n_top=n_top, n_folds=n_folds, maximize=True)
+
+        val_idx_0 = np.array([0, 1, 2])
+        val_idx_1 = np.array([3, 4, 5])
+
+        # 2D predictions for multiclass
+        for k in range(n_top):
+            rng = np.random.RandomState(k)
+            tracker.update(
+                0, 0.90 - k * 0.05,
+                rng.rand(3, n_classes),  # val_preds: (n_val, n_classes)
+                val_idx_0,
+                rng.rand(n_test, n_classes),  # test_preds: (n_test, n_classes)
+                k + 1, {},
+            )
+            tracker.update(
+                1, 0.88 - k * 0.05,
+                rng.rand(3, n_classes),
+                val_idx_1,
+                rng.rand(n_test, n_classes),
+                k + 10, {},
+            )
+
+        composites = tracker.assemble(
+            n_samples=n_samples, n_test=n_test, task_type="multiclass"
+        )
+
+        assert len(composites) == n_top
+        for c in composites:
+            assert c["oof_preds"].shape == (n_samples, n_classes)
+            assert c["test_preds"].shape == (n_test, n_classes)
+
+    def test_assemble_multiclass_oof_filled(self):
+        """All OOF positions should be filled (no zeros in val slices)."""
+        from src.models.trainer import PerFoldTracker
+
+        n_samples = 4
+        n_test = 2
+        n_classes = 3
+
+        tracker = PerFoldTracker(n_top=1, n_folds=2, maximize=True)
+
+        val_preds_0 = np.array([[0.7, 0.2, 0.1], [0.1, 0.8, 0.1]])
+        val_preds_1 = np.array([[0.2, 0.2, 0.6], [0.3, 0.3, 0.4]])
+        test_preds = np.array([[0.5, 0.3, 0.2], [0.4, 0.4, 0.2]])
+
+        tracker.update(0, 0.90, val_preds_0, np.array([0, 1]), test_preds, 1, {})
+        tracker.update(1, 0.85, val_preds_1, np.array([2, 3]), test_preds, 2, {})
+
+        composites = tracker.assemble(
+            n_samples=n_samples, n_test=n_test, task_type="multiclass"
+        )
+
+        oof = composites[0]["oof_preds"]
+        np.testing.assert_array_almost_equal(oof[0], [0.7, 0.2, 0.1])
+        np.testing.assert_array_almost_equal(oof[1], [0.1, 0.8, 0.1])
+        np.testing.assert_array_almost_equal(oof[2], [0.2, 0.2, 0.6])
+        np.testing.assert_array_almost_equal(oof[3], [0.3, 0.3, 0.4])

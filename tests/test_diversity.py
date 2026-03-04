@@ -983,3 +983,93 @@ class TestGreedyDiverseSelectRequestMore:
             oof_list, scores, n_select=10, y_true=y,
         )
         assert len(selected) == 3  # only 3 models available
+
+
+# ---------------------------------------------------------------------------
+# Pre-ranked Spearman optimization in _EnsembleProblem
+# ---------------------------------------------------------------------------
+
+class TestPrerankedSpearman:
+    """Verify that pre-ranking errors in _EnsembleProblem produces correct
+    Spearman-based diversity (Pearson on ranks == Spearman)."""
+
+    def test_preranked_errors_created_for_spearman(self):
+        """_EnsembleProblem should pre-rank errors when diversity_metric=spearman_neff."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = np.clip(y * 0.7 + rng.normal(0, 0.2, 100), 0.01, 0.99)
+        b = np.clip(y * 0.6 + rng.normal(0, 0.25, 100), 0.01, 0.99)
+
+        problem = _EnsembleProblem([a, b], y, "roc_auc", diversity_metric="spearman_neff")
+        assert problem._preranked_errors is not None
+        assert len(problem._preranked_errors) == 2
+        assert problem._preranked_errors[0].shape == (100,)
+
+    def test_no_preranking_for_pearson(self):
+        """_EnsembleProblem should NOT pre-rank for pearson_neff."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = rng.random(100)
+
+        problem = _EnsembleProblem([a], y, "roc_auc", diversity_metric="pearson_neff")
+        assert problem._preranked_errors is None
+
+    def test_no_preranking_for_ambiguity(self):
+        """_EnsembleProblem should NOT pre-rank for ambiguity."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = rng.random(100)
+
+        problem = _EnsembleProblem([a], y, "roc_auc", diversity_metric="ambiguity")
+        assert problem._preranked_errors is None
+
+    def test_preranked_diversity_matches_direct_spearman(self):
+        """Pre-ranked Pearson should give the same N_eff as direct Spearman."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.choice([0, 1], n).astype(float)
+        a = np.clip(y * 0.7 + rng.normal(0, 0.2, n), 0.01, 0.99)
+        b = np.clip(y * 0.6 + rng.normal(0, 0.25, n), 0.01, 0.99)
+        c = np.clip(rng.random(n), 0.01, 0.99)
+
+        # Direct Spearman N_eff via _compute_diversity
+        direct_neff = _compute_diversity([a, b, c], y, np.array([1/3]*3), "spearman_neff")
+
+        # Pre-ranked approach (what _EnsembleProblem does internally)
+        from scipy.stats import rankdata
+        errors = [oof - y for oof in [a, b, c]]
+        ranked = [rankdata(err) for err in errors]
+        corr = compute_correlation_matrix(ranked)
+        preranked_neff = effective_ensemble_size(corr)
+
+        np.testing.assert_almost_equal(preranked_neff, direct_neff, decimal=4)
+
+    def test_nsga2_evaluate_spearman_uses_preranked(self):
+        """Evaluate with spearman_neff should use pre-ranked path and return valid F."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = np.clip(y * 0.7 + rng.normal(0, 0.2, 100), 0.01, 0.99)
+        b = np.clip(y * 0.6 + rng.normal(0, 0.25, 100), 0.01, 0.99)
+
+        problem = _EnsembleProblem([a, b], y, "roc_auc", diversity_metric="spearman_neff")
+        out = {}
+        problem._evaluate(np.array([0.6, 0.4]), out)
+
+        assert "F" in out
+        assert out["F"].shape == (2,)
+        assert out["F"][0] < 0  # negated AUC
+        assert out["F"][1] < 0  # negated N_eff
+
+    def test_nsga2_spearman_single_model_returns_neff_one(self):
+        """Single model in spearman_neff should return N_eff=1.0."""
+        rng = np.random.default_rng(42)
+        y = rng.choice([0, 1], 100).astype(float)
+        a = np.clip(y * 0.7 + rng.normal(0, 0.2, 100), 0.01, 0.99)
+        b = np.clip(y * 0.6 + rng.normal(0, 0.25, 100), 0.01, 0.99)
+
+        problem = _EnsembleProblem([a, b], y, "roc_auc", diversity_metric="spearman_neff")
+        out = {}
+        # Only model 0 above threshold
+        problem._evaluate(np.array([0.5, 0.005]), out)
+
+        assert out["F"][1] == -1.0  # negated N_eff for single model

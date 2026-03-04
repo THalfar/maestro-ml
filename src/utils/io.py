@@ -112,6 +112,7 @@ class PipelineConfig:
 
     train_path: str = ""
     test_path: str = ""
+    extra_data: list[dict[str, Any]] = field(default_factory=list)
     target_column: str = ""
     id_column: str = ""
     task_type: str = "binary_classification"
@@ -339,9 +340,24 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         else None
     )
 
+    # Parse extra_data: supports both single path and list of dicts
+    extra_data_raw = data.get("extra_data", [])
+    if isinstance(extra_data_raw, str):
+        # Shorthand: just a path string → wrap in list with defaults
+        extra_data_raw = [{"path": extra_data_raw}]
+    elif isinstance(extra_data_raw, list):
+        # Normalize: strings in list → dicts
+        extra_data_raw = [
+            {"path": item} if isinstance(item, str) else item
+            for item in extra_data_raw
+        ]
+    else:
+        extra_data_raw = []
+
     return PipelineConfig(
         train_path=data.get("train_path", ""),
         test_path=data.get("test_path", ""),
+        extra_data=extra_data_raw,
         target_column=data.get("target_column", ""),
         id_column=data.get("id_column", ""),
         task_type=data.get("task_type", "binary_classification"),
@@ -460,7 +476,9 @@ def save_eda_report(report: dict, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def _convert(obj: Any) -> Any:
-        if isinstance(obj, np.integer):
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.integer):
             return int(obj)
         elif isinstance(obj, np.floating):
             return float(obj)

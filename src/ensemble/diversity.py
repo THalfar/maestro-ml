@@ -35,7 +35,7 @@ from pymoo.operators.mutation.pm import PM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.core.callback import Callback
 from pymoo.optimize import minimize as pymoo_minimize
-from scipy.stats import spearmanr
+from scipy.stats import rankdata, spearmanr
 from sklearn.metrics import roc_auc_score, mean_squared_error
 
 logger = logging.getLogger("maestro")
@@ -387,6 +387,15 @@ class _EnsembleProblem(ElementwiseProblem):
         self._metric = metric
         self._diversity_metric = diversity_metric
 
+        # Pre-compute ranked errors for spearman_neff (rank once, Pearson on
+        # ranks = Spearman).  Avoids O(k * n * log n) scipy.stats.spearmanr()
+        # per evaluation — replaced by O(k^2 * n) np.corrcoef on pre-ranked
+        # arrays.  For 594k samples this is ~500x faster per eval.
+        self._preranked_errors: list[np.ndarray] | None = None
+        if diversity_metric == "spearman_neff":
+            errors = [oof - y for oof in oof_list]
+            self._preranked_errors = [rankdata(err) for err in errors]
+
     def _evaluate(self, x: np.ndarray, out: dict, *args, **kwargs) -> None:
         included = [i for i in range(self.n_var) if x[i] >= _WEIGHT_THRESHOLD]
 
@@ -406,9 +415,18 @@ class _EnsembleProblem(ElementwiseProblem):
             out["F"] = np.array([1e6, 1e6])
             return
 
-        diversity_val = _compute_diversity(
-            selected_oofs, self._y, norm_w, self._diversity_metric
-        )
+        # Fast diversity: use pre-ranked Pearson for spearman_neff
+        if self._preranked_errors is not None:
+            selected_ranked = [self._preranked_errors[i] for i in included]
+            if len(selected_ranked) == 1:
+                diversity_val = 1.0
+            else:
+                corr = compute_correlation_matrix(selected_ranked)
+                diversity_val = effective_ensemble_size(corr)
+        else:
+            diversity_val = _compute_diversity(
+                selected_oofs, self._y, norm_w, self._diversity_metric
+            )
 
         # Negate both — pymoo minimises
         out["F"] = np.array([-metric_val, -diversity_val])
@@ -885,7 +903,12 @@ def run_nsga2_ensemble(
     logger.info("=" * 60)
 
     # --- pymoo NSGA-II ---
+    if diversity_metric == "spearman_neff":
+        rank_start = time.time()
+        logger.info("  Pre-ranking errors for spearman_neff (one-time cost)...")
     problem = _EnsembleProblem(oof_list, y, metric, diversity_metric=diversity_metric)
+    if diversity_metric == "spearman_neff":
+        logger.info(f"  Pre-ranking done in {time.time() - rank_start:.2f}s")
 
     algorithm = NSGA2(
         pop_size=pop_size,

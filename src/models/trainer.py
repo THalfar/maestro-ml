@@ -815,13 +815,25 @@ def _create_objective(
             if param_type == "fixed":
                 hparams[param_name] = spec["value"]
             elif param_type == "int":
-                hparams[param_name] = trial.suggest_int(
-                    param_name, int(spec["low"]), int(spec["high"]), log=use_log
-                )
+                int_step = spec.get("step")
+                if int_step is not None and not use_log:
+                    hparams[param_name] = trial.suggest_int(
+                        param_name, int(spec["low"]), int(spec["high"]), step=int(int_step)
+                    )
+                else:
+                    hparams[param_name] = trial.suggest_int(
+                        param_name, int(spec["low"]), int(spec["high"]), log=use_log
+                    )
             elif param_type == "float":
-                hparams[param_name] = trial.suggest_float(
-                    param_name, float(spec["low"]), float(spec["high"]), log=use_log
-                )
+                float_step = spec.get("step")
+                if float_step is not None and not use_log:
+                    hparams[param_name] = trial.suggest_float(
+                        param_name, float(spec["low"]), float(spec["high"]), step=float(float_step)
+                    )
+                else:
+                    hparams[param_name] = trial.suggest_float(
+                        param_name, float(spec["low"]), float(spec["high"]), log=use_log
+                    )
             elif param_type == "categorical":
                 raw_choices = spec["choices"]
                 # Optuna categorical only supports None/bool/int/float/str.
@@ -880,6 +892,13 @@ def _create_objective(
             oof = np.zeros((len(X), n_classes))
         else:
             oof = np.zeros(len(X))
+
+        # Suppress pytabkit PWL embedding warnings for binary features
+        warnings.filterwarnings(
+            "ignore",
+            message=".*has just two bin edges.*",
+            module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
+        )
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -966,11 +985,7 @@ def _create_objective(
                 raise optuna.exceptions.TrialPruned()
 
         overall_metric = _compute_cv_metric(y, oof, task_type)
-        # REVIEW:PERF — stores full OOF array (n_samples × 8 bytes) per completed trial.
-        # For 1000 trials × 100K samples = ~800MB. Acceptable for typical competition
-        # datasets (<100K rows) but could be gated on a debug/save_oof flag for large-scale use.
-        # Current tests (test_oof_preds_stored, test_oof_alignment) depend on this attribute.
-        trial.set_user_attr("oof_preds", oof)  # numpy array: ~13x less memory than list
+        trial.set_user_attr("oof_preds", oof)
         return overall_metric
 
     return objective
@@ -1189,6 +1204,13 @@ def train_with_config(
         else:
             oof_preds = np.zeros(len(X_train))
             test_preds = np.zeros(len(X_test))
+
+        # Suppress pytabkit PWL embedding warnings for binary features
+        warnings.filterwarnings(
+            "ignore",
+            message=".*has just two bin edges.*",
+            module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
+        )
 
         seed_start = time.time()
         for fold_idx, (train_idx, val_idx) in enumerate(splits):

@@ -42,7 +42,6 @@ models:
   - lightgbm
   - realmlp
   - tabm
-  - ridge
 
 features:
   interactions: []
@@ -55,20 +54,19 @@ features:
 
 ensemble:
   strategy: "nsga2"
-  nsga2_trials: 2500
+  nsga2_trials: 3000
   diversity_weight: 0.3
-  diversity_metric: "spearman_neff"        # Spearman rank correlation — better for AUC (ranking metric)
+  diversity_metric: "ambiguity"             # Weighted prediction variance — directly measures ensemble benefit
 
 optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    realmlp: "4h"
-    tabm: "3h"
-    catboost: "1h"
-    xgboost: "45m"
-    lightgbm: "45m"
-    ridge: "8m"
+    catboost: "2h"
+    xgboost: "1h30m"
+    lightgbm: "1h30m"
+    realmlp: "2h30m"
+    tabm: "2h"
 
 runtime:
   gpu_check: true

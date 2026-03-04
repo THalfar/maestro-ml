@@ -232,6 +232,12 @@ def main(pipeline_yaml_path: str | Path) -> None:
         logger.info(f"Applying log1p transform to target '{target_col}'")
         train[target_col] = np.log1p(train[target_col])
 
+    # -------------------------------------------------------------------------
+    # Step 3b: Load and concat extra data (original datasets)
+    # -------------------------------------------------------------------------
+    if pipeline_config.extra_data:
+        _concat_extra_data(train, pipeline_config, logger)
+
     # Log top 5 correlated features
     sorted_cols = sorted(
         eda_report.get("columns", {}).items(),

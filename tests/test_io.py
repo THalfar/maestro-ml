@@ -575,3 +575,88 @@ class TestParseTimeoutEdgeCases:
     def test_zero_unit_returns_none(self):
         """'0s' matches regex but total is 0, returns None."""
         assert parse_timeout("0s") is None
+
+
+# ---------------------------------------------------------------------------
+# load_model_config — per-fold selection fields
+# ---------------------------------------------------------------------------
+
+class TestLoadModelConfigPerFold:
+    def test_selection_mode_parsed(self, tmp_dir: Path):
+        """selection_mode: per_fold should be parsed from optuna section."""
+        content = {
+            "name": "PerFoldModel",
+            "optuna": {
+                "selection_mode": "per_fold",
+                "fold_timeout": 180,
+            },
+        }
+        path = tmp_dir / "perfold.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.selection_mode == "per_fold"
+
+    def test_fold_timeout_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "FoldTimeout",
+            "optuna": {"fold_timeout": 300},
+        }
+        path = tmp_dir / "ft.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.fold_timeout == 300
+
+    def test_assembly_nsga2_parsed(self, tmp_dir: Path):
+        """Full assembly config with nsga2 mode should be parsed."""
+        content = {
+            "name": "AssemblyModel",
+            "optuna": {
+                "selection_mode": "per_fold",
+                "assembly": {
+                    "mode": "nsga2",
+                    "n_composites": 20,
+                    "n_generations": 50,
+                    "pop_size": 100,
+                    "diversity_metric": "spearman_neff",
+                    "diversity_weight": 0.3,
+                },
+            },
+        }
+        path = tmp_dir / "asm.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.assembly["mode"] == "nsga2"
+        assert cfg.optuna.assembly["n_composites"] == 20
+        assert cfg.optuna.assembly["diversity_metric"] == "spearman_neff"
+
+    def test_selection_mode_default_global(self, tmp_dir: Path):
+        """Missing selection_mode should default to 'global'."""
+        content = {"name": "DefaultModel"}
+        path = tmp_dir / "default.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.selection_mode == "global"
+        assert cfg.optuna.fold_timeout is None
+        assert cfg.optuna.assembly == {"mode": "rank"}
+
+
+# ---------------------------------------------------------------------------
+# save_eda_report — np.bool_ handling (NumPy 2.x)
+# ---------------------------------------------------------------------------
+
+class TestSaveEdaReportNpBool:
+    def test_numpy_bool_in_report(self, tmp_dir: Path):
+        """np.bool_ must be converted to native bool for JSON serialization.
+
+        With NumPy 2.x, np.bool_ is no longer a subclass of int, so
+        json.dump raises TypeError if _convert doesn't handle it.
+        """
+        report = {
+            "flag": np.bool_(True),
+            "nested": {"active": np.bool_(False)},
+        }
+        path = tmp_dir / "bool_report.json"
+        save_eda_report(report, path)
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded["flag"] is True
+        assert loaded["nested"]["active"] is False
