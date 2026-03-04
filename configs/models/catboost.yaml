@@ -81,6 +81,7 @@ training:
       cpu: RMSE
       gpu: RMSE
   needs_eval_set: true
+  supports_sample_weight: true
 
 feature_requirements:
   needs_scaling: false

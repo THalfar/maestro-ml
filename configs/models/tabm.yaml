@@ -125,6 +125,7 @@ training:
   seed_param: random_state
   eval_metric_param: null
   needs_eval_set: false
+  supports_sample_weight: false
 
 feature_requirements:
   needs_scaling: false                           # TabM preprocesses internally (quantile_tabr)

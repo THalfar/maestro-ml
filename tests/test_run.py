@@ -840,3 +840,84 @@ class TestConcatExtraData:
         cfg = PipelineConfig(target_column="target", extra_data=[])
         result = _concat_extra_data(train, cfg, logging.getLogger("test"))
         assert len(result) == 1
+
+    def test_is_original_column(self, tmp_path: Path):
+        """Extra data rows marked _is_original=True, train rows False."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1, 2], "feat": [0.1, 0.2], "target": [0, 1]})
+        extra = pd.DataFrame({"feat": [0.4], "target": [1]})
+        extra_path = tmp_path / "extra.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target", id_column="id",
+            extra_data=[{"path": str(extra_path)}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+
+        assert "_is_original" in result.columns
+        assert result["_is_original"].iloc[0] == False
+        assert result["_is_original"].iloc[1] == False
+        assert result["_is_original"].iloc[2] == True
+
+    def test_sample_weight_column(self, tmp_path: Path):
+        """Extra data rows get configured sample_weight, train rows get 1.0."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1, 2], "feat": [0.1, 0.2], "target": [0, 1]})
+        extra = pd.DataFrame({"feat": [0.4], "target": [1]})
+        extra_path = tmp_path / "extra.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target", id_column="id",
+            extra_data=[{"path": str(extra_path), "sample_weight": 3.0}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+
+        assert "_sample_weight" in result.columns
+        assert result["_sample_weight"].iloc[0] == 1.0
+        assert result["_sample_weight"].iloc[1] == 1.0
+        assert result["_sample_weight"].iloc[2] == 3.0
+
+    def test_sample_weight_default_is_one(self, tmp_path: Path):
+        """When sample_weight not specified, extra rows get 1.0."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "feat": [0.1], "target": [0]})
+        extra = pd.DataFrame({"feat": [0.4], "target": [1]})
+        extra_path = tmp_path / "extra.csv"
+        extra.to_csv(extra_path, index=False)
+
+        cfg = PipelineConfig(
+            target_column="target", id_column="id",
+            extra_data=[{"path": str(extra_path)}],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert result["_sample_weight"].iloc[-1] == 1.0
+
+    def test_multiple_sources_different_weights(self, tmp_path: Path):
+        """Each extra source gets its own sample_weight."""
+        import logging
+        from src.utils.io import PipelineConfig
+
+        train = pd.DataFrame({"id": [1], "feat": [0.1], "target": [0]})
+        e1 = pd.DataFrame({"feat": [0.2], "target": [1]})
+        e2 = pd.DataFrame({"feat": [0.3], "target": [0]})
+        (tmp_path / "e1.csv").write_text(e1.to_csv(index=False))
+        (tmp_path / "e2.csv").write_text(e2.to_csv(index=False))
+
+        cfg = PipelineConfig(
+            target_column="target", id_column="id",
+            extra_data=[
+                {"path": str(tmp_path / "e1.csv"), "sample_weight": 2.0},
+                {"path": str(tmp_path / "e2.csv"), "sample_weight": 5.0},
+            ],
+        )
+        result = _concat_extra_data(train, cfg, logging.getLogger("test"))
+        assert result["_sample_weight"].tolist() == [1.0, 2.0, 5.0]
+        assert result["_is_original"].tolist() == [False, True, True]

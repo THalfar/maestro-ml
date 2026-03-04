@@ -71,6 +71,7 @@ training:
     binary_classification: binary_logloss
     regression: rmse
   needs_eval_set: true
+  supports_sample_weight: true
 
 feature_requirements:
   needs_scaling: false

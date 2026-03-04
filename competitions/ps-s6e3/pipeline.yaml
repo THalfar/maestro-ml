@@ -16,6 +16,7 @@ data:
   extra_data:
     - path: "data/ps-s6e3/original/WA_Fn-UseC_-Telco-Customer-Churn.csv"
       drop_columns: [customerID]
+      sample_weight: 10.0
   target_column: "Churn"
   id_column: "id"
   task_type: "binary_classification"

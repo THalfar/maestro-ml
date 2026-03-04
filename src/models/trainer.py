@@ -540,6 +540,25 @@ def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -
         return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def _extract_sample_weights(
+    train: pd.DataFrame,
+    training_cfg: dict[str, Any],
+) -> np.ndarray | None:
+    """Extract sample_weight array from train if the model supports it.
+
+    Returns None if the model does not support sample_weight, if the
+    _sample_weight column is missing, or if all weights are uniform (1.0).
+    """
+    if not training_cfg.get("supports_sample_weight", False):
+        return None
+    if "_sample_weight" not in train.columns:
+        return None
+    sw = train["_sample_weight"].values.astype(np.float64)
+    if np.all(sw == 1.0):
+        return None
+    return sw
+
+
 def _get_eval_metric_value(training: dict, task_type: str, gpu: bool) -> str | None:
     """Extract the eval metric value from training config for a given task/device."""
     em = training.get("eval_metric")
@@ -799,6 +818,7 @@ def _create_objective(
     X_test = test[feature_cols] if test is not None else None
 
     training_cfg = registry.get_training_config(model_name)
+    sample_weights = _extract_sample_weights(train, training_cfg)
 
     # Compute CV splits once — deterministic (fixed seed), same every trial.
     try:
@@ -903,6 +923,7 @@ def _create_objective(
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
+            fold_weights = sample_weights[train_idx] if sample_weights is not None else None
 
             # Early stopping via constructor (XGBoost v2.0+)
             model_hparams = dict(hparams)
@@ -923,6 +944,8 @@ def _create_objective(
                     "eval_set": [(X_val, y_val)],
                     "verbose": False,  # suppress per-iteration eval output
                 }
+                if fold_weights is not None:
+                    fit_params["sample_weight"] = fold_weights
                 if is_lgbm:
                     import lightgbm as lgb
                     del fit_params["verbose"]  # LightGBM uses callbacks instead
@@ -937,7 +960,10 @@ def _create_objective(
                     fit_params["early_stopping_rounds"] = early_stopping_rounds
                 model.fit(X_train, y_train, **fit_params)
             else:
-                model.fit(X_train, y_train)
+                if fold_weights is not None:
+                    model.fit(X_train, y_train, sample_weight=fold_weights)
+                else:
+                    model.fit(X_train, y_train)
 
             fold_elapsed = time.monotonic() - fold_start
 
@@ -1170,6 +1196,7 @@ def train_with_config(
     early_stopping_rounds = training_cfg.get("early_stopping_rounds")
     is_lgbm = training_cfg.get("uses_callbacks_for_early_stopping", False)
     es_in_constructor = training_cfg.get("early_stopping_in_constructor", False)
+    sample_weights = _extract_sample_weights(train, training_cfg)
 
     # Eval metric for constructor
     eval_metric_val = _get_eval_metric_value(training_cfg, task_type, gpu)
@@ -1217,6 +1244,7 @@ def train_with_config(
             fold_start = time.time()
             X_fold_train, X_fold_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
             y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+            fold_weights = sample_weights[train_idx] if sample_weights is not None else None
 
             model = registry.get_model(
                 model_name, hparams=hparams_seeded,
@@ -1228,6 +1256,8 @@ def train_with_config(
                     "eval_set": [(X_fold_val, y_fold_val)],
                     "verbose": False,  # suppress per-iteration eval output
                 }
+                if fold_weights is not None:
+                    fit_params["sample_weight"] = fold_weights
                 if is_lgbm:
                     import lightgbm as lgb
                     del fit_params["verbose"]  # LightGBM uses callbacks instead
@@ -1242,7 +1272,10 @@ def train_with_config(
                     fit_params["early_stopping_rounds"] = early_stopping_rounds
                 model.fit(X_fold_train, y_fold_train, **fit_params)
             else:
-                model.fit(X_fold_train, y_fold_train)
+                if fold_weights is not None:
+                    model.fit(X_fold_train, y_fold_train, sample_weight=fold_weights)
+                else:
+                    model.fit(X_fold_train, y_fold_train)
 
             if task_type == "binary_classification":
                 val_preds = model.predict_proba(X_fold_val)[:, 1]

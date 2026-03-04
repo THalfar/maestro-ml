@@ -109,6 +109,7 @@ def _concat_extra_data(
       - target_column (str): target column name in this file (default: same as pipeline)
       - column_mapping (dict): rename columns {original_name: pipeline_name}
       - drop_columns (list): columns to drop before concat
+      - sample_weight (float): weight for these rows in model training (default: 1.0)
 
     Handles:
       - Column name differences via column_mapping
@@ -116,16 +117,19 @@ def _concat_extra_data(
       - Missing id_column (original data usually doesn't have it)
       - Numeric conversion for columns that are strings in original (e.g. TotalCharges)
       - Only keeps columns that exist in train (drops extras, ignores missing)
+      - Adds _is_original (bool) and _sample_weight (float) metadata columns
 
     Returns:
-        New DataFrame with extra data appended.
+        New DataFrame with extra data appended and metadata columns.
     """
     target_col = pipeline_config.target_column
     id_col = pipeline_config.id_column
     target_mapping = pipeline_config.target_mapping
 
     original_len = len(train)
-    result = train
+    result = train.copy()
+    result["_is_original"] = False
+    result["_sample_weight"] = 1.0
 
     for entry in pipeline_config.extra_data:
         path = entry.get("path", "")
@@ -182,10 +186,21 @@ def _concat_extra_data(
                 except Exception:
                     pass
 
+        old_len = len(result)
         result = pd.concat([result, extra], ignore_index=True)
+        sw = float(entry.get("sample_weight", 1.0))
+        result.loc[old_len:, "_is_original"] = True
+        result.loc[old_len:, "_sample_weight"] = sw
         logger.info(
-            f"  +{len(extra)} rows from {Path(path).name} → "
-            f"train: {original_len} → {len(result)} rows"
+            f"  +{len(extra)} rows from {Path(path).name} "
+            f"(weight={sw}) → train: {original_len} → {len(result)} rows"
+        )
+
+    n_original = int(result["_is_original"].sum())
+    if n_original > 0:
+        logger.info(
+            f"  Sample weights: {n_original} original rows, "
+            f"{len(result) - n_original} synthetic rows (weight=1.0)"
         )
 
     return result
@@ -400,6 +415,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
     # Determine feature columns
     original_cols = list(train.columns)
     exclude_cols = [c for c in [pipeline_config.target_column, pipeline_config.id_column] if c]
+    exclude_cols.extend(["_is_original", "_sample_weight"])
     feature_cols = get_feature_columns(strategy, original_cols, exclude=exclude_cols)
     # Ensure all feature cols exist in the engineered dataframe
     feature_cols = [c for c in feature_cols if c in train_feat.columns]

@@ -15,6 +15,7 @@ from sklearn.model_selection import StratifiedKFold
 from src.models.registry import ModelRegistry
 from src.models.trainer import (
     _compute_cv_metric,
+    _extract_sample_weights,
     _get_eval_metric_value,
     _reassemble_int_lists,
     get_top_configs,
@@ -1813,3 +1814,127 @@ class TestPerFoldTrackerMulticlass:
         np.testing.assert_array_almost_equal(oof[1], [0.1, 0.8, 0.1])
         np.testing.assert_array_almost_equal(oof[2], [0.2, 0.2, 0.6])
         np.testing.assert_array_almost_equal(oof[3], [0.3, 0.3, 0.4])
+
+
+# ---------------------------------------------------------------------------
+# _extract_sample_weights
+# ---------------------------------------------------------------------------
+
+class TestExtractSampleWeights:
+    """Test sample weight extraction from DataFrame."""
+
+    def test_returns_weights_when_supported(self):
+        """When model supports it and weights are non-uniform, return array."""
+        train = pd.DataFrame({"f1": [1, 2, 3], "_sample_weight": [1.0, 1.0, 3.0]})
+        cfg = {"supports_sample_weight": True}
+        result = _extract_sample_weights(train, cfg)
+        assert result is not None
+        np.testing.assert_array_equal(result, [1.0, 1.0, 3.0])
+
+    def test_returns_none_when_unsupported(self):
+        """When model does not support sample_weight, return None."""
+        train = pd.DataFrame({"f1": [1, 2], "_sample_weight": [1.0, 3.0]})
+        cfg = {"supports_sample_weight": False}
+        assert _extract_sample_weights(train, cfg) is None
+
+    def test_returns_none_when_no_column(self):
+        """When _sample_weight column missing, return None."""
+        train = pd.DataFrame({"f1": [1, 2]})
+        cfg = {"supports_sample_weight": True}
+        assert _extract_sample_weights(train, cfg) is None
+
+    def test_returns_none_when_all_uniform(self):
+        """When all weights are 1.0, return None (optimisation)."""
+        train = pd.DataFrame({"f1": [1, 2, 3], "_sample_weight": [1.0, 1.0, 1.0]})
+        cfg = {"supports_sample_weight": True}
+        assert _extract_sample_weights(train, cfg) is None
+
+    def test_returns_none_when_key_missing(self):
+        """When supports_sample_weight key absent, default to False."""
+        train = pd.DataFrame({"f1": [1], "_sample_weight": [3.0]})
+        cfg = {}
+        assert _extract_sample_weights(train, cfg) is None
+
+
+class TestSampleWeightIntegration:
+    """Test that sample_weight is correctly passed through Optuna studies."""
+
+    def test_optuna_study_with_sample_weight(self, ridge_configs_dir, binary_data, pipeline_config):
+        """run_optuna_study completes successfully with sample_weight column."""
+        train, test = binary_data
+        weights = np.ones(len(train))
+        weights[:20] = 3.0
+        train["_sample_weight"] = weights
+
+        # Add supports_sample_weight to ridge config
+        cfg_path = ridge_configs_dir / "ridge.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["training"]["supports_sample_weight"] = True
+        cfg_path.write_text(yaml.dump(cfg))
+
+        registry = ModelRegistry(ridge_configs_dir)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            test=test,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+        assert study.best_value > 0
+
+    def test_optuna_study_without_sample_weight(self, ridge_configs_dir, binary_data, pipeline_config):
+        """run_optuna_study works when model does not support sample_weight."""
+        train, test = binary_data
+        train["_sample_weight"] = 3.0  # column exists but not supported
+
+        registry = ModelRegistry(ridge_configs_dir)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            test=test,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+
+    def test_train_with_config_sample_weight(self, ridge_configs_dir, binary_data, pipeline_config):
+        """train_with_config passes sample_weight when supported."""
+        train, test = binary_data
+        weights = np.ones(len(train))
+        weights[:20] = 2.0
+        train["_sample_weight"] = weights
+
+        cfg_path = ridge_configs_dir / "ridge.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["training"]["supports_sample_weight"] = True
+        cfg_path.write_text(yaml.dump(cfg))
+
+        registry = ModelRegistry(ridge_configs_dir)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        results_dir = Path(pipeline_config.output.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        oof_list, test_list, y = train_with_config(
+            model_name="ridge",
+            hparams={"C": 1.0},
+            feature_cols=["f1", "f2", "f3"],
+            train=train,
+            test=test,
+            target_col="target",
+            cv=cv,
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            seeds=[42],
+            results_dir=results_dir,
+        )
+        assert len(oof_list) == 1
+        assert len(oof_list[0]) == len(train)
