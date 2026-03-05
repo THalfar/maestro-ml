@@ -247,6 +247,163 @@ class TestMain:
         assert sub_df["target"].min() >= 0.0
         assert sub_df["target"].max() <= 1.0
 
+    def test_extra_data_end_to_end(self, tmp_path: Path):
+        """Full pipeline with extra_data (original dataset) runs without errors.
+
+        Simulates ps-s6e3 scenario: synthetic competition data + original dataset
+        with higher sample_weight. Verifies that _is_original/_sample_weight
+        metadata columns don't leak into build_features.
+        """
+        rng = np.random.default_rng(42)
+        n_train, n_test = 60, 20
+
+        # Train data (synthetic competition data)
+        train = pd.DataFrame({
+            "id": range(n_train),
+            "num_f": rng.normal(0, 1, n_train),
+            "cat_f": rng.choice(["A", "B", "C"], n_train),
+            "target": rng.choice([0, 1], n_train),
+        })
+        test = pd.DataFrame({
+            "id": range(n_train, n_train + n_test),
+            "num_f": rng.normal(0, 1, n_test),
+            "cat_f": rng.choice(["A", "B", "C"], n_test),
+        })
+
+        # Extra "original" dataset (no id column, same features)
+        n_extra = 30
+        extra = pd.DataFrame({
+            "num_f": rng.normal(0, 1, n_extra),
+            "cat_f": rng.choice(["A", "B"], n_extra),
+            "target": rng.choice([0, 1], n_extra),
+        })
+
+        train_path = tmp_path / "train.csv"
+        test_path = tmp_path / "test.csv"
+        extra_path = tmp_path / "original.csv"
+        train.to_csv(train_path, index=False)
+        test.to_csv(test_path, index=False)
+        extra.to_csv(extra_path, index=False)
+
+        # Model config
+        models_dir = tmp_path / "configs" / "models"
+        models_dir.mkdir(parents=True)
+        ridge_cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.1, "high": 5.0, "log": True},
+            },
+            "fixed_params": {
+                "binary_classification": {"max_iter": 200, "solver": "lbfgs"},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "eval_metric_param": None,
+                "seed_param": "random_state",
+            },
+            "feature_requirements": {
+                "needs_scaling": True,
+                "handles_categorical": False,
+                "handles_missing": False,
+            },
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (models_dir / "ridge.yaml").write_text(
+            yaml.dump(ridge_cfg), encoding="utf-8"
+        )
+
+        # Strategy
+        results_dir = tmp_path / "results"
+        results_dir.mkdir()
+        strategy = {
+            "features": {
+                "interactions": [],
+                "ratios": [],
+                "target_encoding": {"columns": [], "pairs": [], "alpha": 15},
+                "custom": [],
+            },
+            "models": ["ridge"],
+            "overrides": {},
+            "reasoning": "Test with extra data.",
+        }
+        strategy_path = results_dir / "strategy.yaml"
+        strategy_path.write_text(yaml.dump(strategy), encoding="utf-8")
+
+        # Pipeline config WITH extra_data
+        pipeline_cfg = {
+            "data": {
+                "train_path": str(train_path),
+                "test_path": str(test_path),
+                "extra_data": [
+                    {
+                        "path": str(extra_path),
+                        "sample_weight": 5.0,
+                    }
+                ],
+                "target_column": "target",
+                "id_column": "id",
+                "task_type": "binary_classification",
+            },
+            "cv": {"n_folds": 3, "seed": 42, "stratified": True},
+            "strategy": {
+                "mode": "manual",
+                "manual": {"strategy_input_path": str(strategy_path)},
+            },
+            "models": ["ridge"],
+            "features": {},
+            "ensemble": {
+                "strategy": "blend",
+                "blend_trials": 10,
+                "meta_trials": 5,
+                "nsga2_trials": 10,
+                "diversity_weight": 0.3,
+            },
+            "optuna": {"global_seed": 42},
+            "runtime": {
+                "gpu_check": False,
+                "gpu_fallback": False,
+                "n_jobs": 1,
+                "verbose": 0,
+            },
+            "output": {
+                "submission_path": str(results_dir / "submission.csv"),
+                "results_dir": str(results_dir),
+                "save_oof": True,
+            },
+        }
+        pipeline_yaml = tmp_path / "pipeline.yaml"
+        pipeline_yaml.write_text(yaml.dump(pipeline_cfg), encoding="utf-8")
+
+        from src.models.registry import ModelRegistry
+        real_reg = ModelRegistry(models_dir)
+
+        with patch("builtins.input", return_value=""), \
+             patch("run.ModelRegistry", return_value=real_reg):
+            main(pipeline_yaml)
+
+        # Verify submission produced
+        sub_df = pd.read_csv(results_dir / "submission.csv")
+        assert len(sub_df) == n_test
+        assert "target" in sub_df.columns
+        assert sub_df["target"].min() >= 0.0
+        assert sub_df["target"].max() <= 1.0
+
+        # OOF should cover train + extra rows
+        oof = np.load(str(results_dir / "oof_predictions.npy"))
+        assert len(oof) == n_train + n_extra
+
 
 # ---------------------------------------------------------------------------
 # Regression + log_transform_target integration tests

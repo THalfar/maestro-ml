@@ -85,6 +85,8 @@ from src.ensemble.blender import (
     apply_blend,
     rank_average,
     train_meta_model,
+    optimize_meta_C,
+    optimize_meta_xgb,
     pick_best_strategy,
 )
 from src.ensemble.diversity import (
@@ -204,6 +206,13 @@ def _concat_extra_data(
         )
 
     return result
+
+
+def _score_fn(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
+    """Compute score (higher is better) for ensemble comparison."""
+    if metric == "roc_auc":
+        return float(roc_auc_score(y_true, y_pred))
+    return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
 def main(pipeline_yaml_path: str | Path) -> None:
@@ -404,18 +413,29 @@ def main(pipeline_yaml_path: str | Path) -> None:
             n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed
         )
 
+    # Strip metadata columns before feature engineering (they are not
+    # real features and _is_original can become object dtype after concat,
+    # which confuses the ordinal encoder in build_features).
+    meta_cols = ["_is_original", "_sample_weight"]
+    meta_backup = {c: train[c].copy() for c in meta_cols if c in train.columns}
+    train_for_feat = train.drop(columns=[c for c in meta_cols if c in train.columns])
+
     train_feat, test_feat = build_features(
-        train=train,
+        train=train_for_feat,
         test=test,
         strategy=strategy,
         cv_folds=cv_folds,
         target_col=pipeline_config.target_column,
     )
 
+    # Re-attach metadata columns to engineered train
+    for c, series in meta_backup.items():
+        train_feat[c] = series.values
+
     # Determine feature columns
     original_cols = list(train.columns)
     exclude_cols = [c for c in [pipeline_config.target_column, pipeline_config.id_column] if c]
-    exclude_cols.extend(["_is_original", "_sample_weight"])
+    exclude_cols.extend(meta_cols)
     feature_cols = get_feature_columns(strategy, original_cols, exclude=exclude_cols)
     # Ensure all feature cols exist in the engineered dataframe
     feature_cols = [c for c in feature_cols if c in train_feat.columns]
@@ -493,10 +513,37 @@ def main(pipeline_yaml_path: str | Path) -> None:
         final_test_preds = rank_average(all_test)
 
     elif ensemble_strategy == "meta":
-        final_oof, final_test_preds = train_meta_model(
-            all_oof, all_test, y_true,
-            n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type
-        )
+        meta_n_folds = 2 * cv_cfg.n_folds
+        best_meta_score = -np.inf
+        final_oof = None
+        final_test_preds = None
+        for meta_name in ensemble_cfg.meta_models:
+            n_trials_for = ensemble_cfg.get_meta_trials(meta_name)
+            try:
+                if meta_name == "logreg":
+                    m_oof, m_test, _ = optimize_meta_C(
+                        all_oof, all_test, y_true,
+                        n_folds=meta_n_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                elif meta_name == "xgboost":
+                    m_oof, m_test, _ = optimize_meta_xgb(
+                        all_oof, all_test, y_true,
+                        n_folds=meta_n_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                else:
+                    continue
+                m_score = _score_fn(y_true, m_oof, metric)
+                if m_score > best_meta_score:
+                    best_meta_score = m_score
+                    final_oof = m_oof
+                    final_test_preds = m_test
+                    chosen_strategy = f"meta+{meta_name}"
+            except Exception as exc:
+                logger.warning(f"Meta-model '{meta_name}' failed: {exc}")
+        if final_oof is None:
+            raise RuntimeError("All meta-models failed.")
 
     elif ensemble_strategy == "nsga2":
         # Normalize diversity_weight to list
@@ -529,42 +576,85 @@ def main(pipeline_yaml_path: str | Path) -> None:
             )
         )
 
-        # Chain: train meta-model on NSGA-II selected models
+        # Chain: train meta-models on NSGA-II selected models
+        # Meta-models use 2× pipeline folds for finer-grained OOF
+        meta_n_folds = 2 * cv_cfg.n_folds
         sel_oof = [all_oof[i] for i in sel]
         sel_test = [all_test[i] for i in sel]
         sel_labels = [model_labels[i] for i in sel]
-        try:
-            meta_oof, meta_test = train_meta_model(
-                sel_oof, sel_test, y_true,
-                n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type,
-            )
-            # Compare: NSGA-II linear blend vs meta-model stacking
-            if task_type != "regression":
-                blend_score = roc_auc_score(y_true, nsga2_blend_oof)
-                meta_score = roc_auc_score(y_true, meta_oof)
-            else:
-                blend_score = -float(np.sqrt(mean_squared_error(y_true, nsga2_blend_oof)))
-                meta_score = -float(np.sqrt(mean_squared_error(y_true, meta_oof)))
 
-            logger.info(
-                f"NSGA-II blend vs meta-stacking: "
-                f"blend={blend_score:.6f}, meta={meta_score:.6f}"
-            )
-            if meta_score > blend_score:
-                final_oof = meta_oof
-                final_test_preds = meta_test
-                chosen_strategy = "nsga2+meta"
-                logger.info("  -> Meta-stacking wins!")
-            else:
-                final_oof = nsga2_blend_oof
-                final_test_preds = nsga2_blend_test
-                chosen_strategy = "nsga2+blend"
-                logger.info("  -> Linear blend wins!")
-        except Exception as exc:
-            logger.warning(f"Meta-stacking on NSGA-II selection failed: {exc}")
-            final_oof = nsga2_blend_oof
-            final_test_preds = nsga2_blend_test
+        # Candidates: start with linear blend
+        blend_score = _score_fn(y_true, nsga2_blend_oof, metric)
+        best_meta_score = blend_score
+        best_meta_oof = nsga2_blend_oof
+        best_meta_test = nsga2_blend_test
+        best_meta_name = "blend"
+        logger.info(f"  NSGA-II linear blend: {metric}={blend_score:.6f}")
+
+        # Try each configured meta-model
+        meta_models = ensemble_cfg.meta_models
+        n_meta_features = len(sel_oof)
+        logger.info(
+            f"Meta-model stage: {len(meta_models)} meta-model(s) "
+            f"[{', '.join(meta_models)}], "
+            f"{n_meta_features} base predictions, "
+            f"{meta_n_folds}-fold meta-CV, "
+            f"{len(y_true)} samples"
+        )
+        for meta_idx, meta_name in enumerate(meta_models, 1):
+            try:
+                n_trials_for = ensemble_cfg.get_meta_trials(meta_name)
+                logger.info(
+                    f"  [{meta_idx}/{len(meta_models)}] Training meta-{meta_name} "
+                    f"({n_trials_for} Optuna trials)..."
+                )
+                meta_start = time.time()
+                if meta_name == "logreg":
+                    m_oof, m_test, best_C = optimize_meta_C(
+                        sel_oof, sel_test, y_true,
+                        n_folds=meta_n_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                    m_score = _score_fn(y_true, m_oof, metric)
+                    meta_elapsed = time.time() - meta_start
+                    logger.info(
+                        f"  Meta-logreg done: C={best_C:.6f}, "
+                        f"{metric}={m_score:.6f} ({meta_elapsed:.1f}s)"
+                    )
+                elif meta_name == "xgboost":
+                    m_oof, m_test, best_params = optimize_meta_xgb(
+                        sel_oof, sel_test, y_true,
+                        n_folds=meta_n_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                    m_score = _score_fn(y_true, m_oof, metric)
+                    meta_elapsed = time.time() - meta_start
+                    logger.info(
+                        f"  Meta-xgboost done: {metric}={m_score:.6f} ({meta_elapsed:.1f}s)"
+                    )
+                else:
+                    logger.warning(f"  Unknown meta-model '{meta_name}', skipping")
+                    continue
+
+                if m_score > best_meta_score:
+                    best_meta_score = m_score
+                    best_meta_oof = m_oof
+                    best_meta_test = m_test
+                    best_meta_name = meta_name
+            except Exception as exc:
+                logger.warning(f"  Meta-model '{meta_name}' failed: {exc}")
+
+        final_oof = best_meta_oof
+        final_test_preds = best_meta_test
+        if best_meta_name == "blend":
             chosen_strategy = "nsga2+blend"
+            logger.info("  -> Linear blend wins!")
+        else:
+            chosen_strategy = f"nsga2+{best_meta_name}"
+            logger.info(
+                f"  -> {best_meta_name} meta-stacking wins! "
+                f"({metric}={best_meta_score:.6f})"
+            )
 
         # Re-select from same Pareto front for additional weights
         nsga2_submissions: dict[float, tuple[np.ndarray, dict]] = {
@@ -607,14 +697,27 @@ def main(pipeline_yaml_path: str | Path) -> None:
         candidates["blend"] = (apply_blend(all_oof, weights), apply_blend(all_test, weights))
         candidates["rank"] = (rank_average(all_oof), rank_average(all_test))
 
-        try:
-            meta_oof, meta_test = train_meta_model(
-                all_oof, all_test, y_true,
-                n_folds=cv_cfg.n_folds, seed=seed, task_type=task_type
-            )
-            candidates["meta"] = (meta_oof, meta_test)
-        except Exception as exc:
-            logger.warning(f"Meta-model failed: {exc}")
+        auto_meta_folds = 2 * cv_cfg.n_folds
+        for meta_name in ensemble_cfg.meta_models:
+            n_trials_for = ensemble_cfg.get_meta_trials(meta_name)
+            try:
+                if meta_name == "logreg":
+                    m_oof, m_test, _ = optimize_meta_C(
+                        all_oof, all_test, y_true,
+                        n_folds=auto_meta_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                elif meta_name == "xgboost":
+                    m_oof, m_test, _ = optimize_meta_xgb(
+                        all_oof, all_test, y_true,
+                        n_folds=auto_meta_folds, seed=seed, task_type=task_type,
+                        metric=metric, n_trials=n_trials_for,
+                    )
+                else:
+                    continue
+                candidates[f"meta_{meta_name}"] = (m_oof, m_test)
+            except Exception as exc:
+                logger.warning(f"Meta-model '{meta_name}' failed: {exc}")
 
         try:
             _auto_dw = (
@@ -670,7 +773,8 @@ def main(pipeline_yaml_path: str | Path) -> None:
                 model_avg_labels.append(model_name[:15])
         if len(model_avg_oof) > 1:
             corr_mat = compute_correlation_matrix(model_avg_oof)
-            print_diversity_report(corr_mat, model_avg_labels)
+            diversity_report_path = Path(pipeline_config.output.results_dir) / "diversity_report.txt"
+            print_diversity_report(corr_mat, model_avg_labels, output_path=diversity_report_path)
 
     # -------------------------------------------------------------------------
     # Step 8: Output

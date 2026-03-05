@@ -688,6 +688,7 @@ def run_optuna_study(
         test=test,
         per_fold_tracker=tracker,
         fold_timeout=fold_timeout,
+        n_top_trials=optuna_cfg["n_top_trials"],
     )
 
     # Configure pruner
@@ -752,6 +753,7 @@ def _create_objective(
     test: pd.DataFrame | None = None,
     per_fold_tracker: PerFoldTracker | None = None,
     fold_timeout: int | None = None,
+    n_top_trials: int = 5,
 ) -> Callable[[optuna.Trial], float]:
     """Create an Optuna objective function for a model.
 
@@ -809,13 +811,26 @@ def _create_objective(
               - Check if trial should be pruned:
                 if trial.should_prune(): raise TrialPruned.
            e. Compute overall CV metric from OOF predictions.
-           f. Store OOF predictions as trial.set_user_attr('oof_preds', oof).
+           f. Store OOF predictions via trial.set_user_attr('oof_preds', oof)
+              only if this trial ranks in the top n_top_trials among all
+              completed trials so far (bounds memory usage).
            g. Return the overall CV metric.
         2. Return the objective function.
     """
     X = train[feature_cols]
     y = train[target_col].values
     X_test = test[feature_cols] if test is not None else None
+
+    # Impute NaN for models that don't handle missing values (e.g. RealMLP, TabM).
+    # Fit median on train, apply to both train and test.
+    feat_reqs = registry.get_feature_requirements(model_name)
+    if not feat_reqs.get("handles_missing", False) and X.isna().any().any():
+        from sklearn.impute import SimpleImputer
+        imputer = SimpleImputer(strategy="median")
+        X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns, index=X.index)
+        if X_test is not None:
+            X_test = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns, index=X_test.index)
+        logger.info(f"Imputed NaN values (median) for {model_name}")
 
     training_cfg = registry.get_training_config(model_name)
     sample_weights = _extract_sample_weights(train, training_cfg)
@@ -825,6 +840,13 @@ def _create_objective(
         cv_splits = list(cv.split(X, y))
     except Exception:
         cv_splits = list(cv.split(X))
+
+    # Suppress pytabkit PWL embedding warnings for binary features (once per study)
+    warnings.filterwarnings(
+        "ignore",
+        message=".*has just two bin edges.*",
+        module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
+    )
 
     def objective(trial: optuna.Trial) -> float:
         # Sample hyperparameters
@@ -912,13 +934,6 @@ def _create_objective(
             oof = np.zeros((len(X), n_classes))
         else:
             oof = np.zeros(len(X))
-
-        # Suppress pytabkit PWL embedding warnings for binary features
-        warnings.filterwarnings(
-            "ignore",
-            message=".*has just two bin edges.*",
-            module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
-        )
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -1011,7 +1026,21 @@ def _create_objective(
                 raise optuna.exceptions.TrialPruned()
 
         overall_metric = _compute_cv_metric(y, oof, task_type)
-        trial.set_user_attr("oof_preds", oof)
+        # Store OOF only for top-N trials to bound memory usage.
+        # At the time of completion, the current trial is RUNNING, so
+        # study.trials only returns previously completed trials — making
+        # this an accurate, race-free rank check.
+        maximize = task_type != "regression"
+        prior_values = [
+            t.value for t in trial.study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if len(prior_values) < n_top_trials:
+            trial.set_user_attr("oof_preds", oof)
+        else:
+            cutoff = sorted(prior_values, reverse=maximize)[n_top_trials - 1]
+            if (maximize and overall_metric >= cutoff) or (not maximize and overall_metric <= cutoff):
+                trial.set_user_attr("oof_preds", oof)
         return overall_metric
 
     return objective
@@ -1191,6 +1220,14 @@ def train_with_config(
     y_train = train[target_col].values
     X_test = test[feature_cols]
 
+    # Impute NaN for models that don't handle missing values.
+    feat_reqs = registry.get_feature_requirements(model_name)
+    if not feat_reqs.get("handles_missing", False) and X_train.isna().any().any():
+        from sklearn.impute import SimpleImputer
+        imputer = SimpleImputer(strategy="median")
+        X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns, index=X_train.index)
+        X_test = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns, index=X_test.index)
+
     training_cfg = registry.get_training_config(model_name)
     needs_eval_set = training_cfg.get("needs_eval_set", False)
     early_stopping_rounds = training_cfg.get("early_stopping_rounds")
@@ -1218,6 +1255,13 @@ def train_with_config(
     if task_type == "multiclass":
         n_classes = len(np.unique(y_train))
 
+    # Suppress pytabkit PWL embedding warnings for binary features (once per call)
+    warnings.filterwarnings(
+        "ignore",
+        message=".*has just two bin edges.*",
+        module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
+    )
+
     for seed_idx, seed in enumerate(seeds):
         hparams_seeded = {**hparams, seed_param: seed} if seed_param else dict(hparams)
         if eval_metric_val and eval_metric_param:
@@ -1231,13 +1275,6 @@ def train_with_config(
         else:
             oof_preds = np.zeros(len(X_train))
             test_preds = np.zeros(len(X_test))
-
-        # Suppress pytabkit PWL embedding warnings for binary features
-        warnings.filterwarnings(
-            "ignore",
-            message=".*has just two bin edges.*",
-            module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
-        )
 
         seed_start = time.time()
         for fold_idx, (train_idx, val_idx) in enumerate(splits):

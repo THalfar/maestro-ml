@@ -12,6 +12,7 @@ All strategies work with OOF predictions to evaluate without leakage.
 from __future__ import annotations
 
 import logging
+import time
 
 import numpy as np
 import optuna
@@ -172,9 +173,10 @@ def train_meta_model(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Train a meta-model (stacking) on OOF predictions.
 
-    Uses LogisticRegression as the meta-learner. Input features are
-    the OOF predictions from base models, optionally with logit
-    transforms appended for richer representation.
+    Uses LogisticRegression as the meta-learner for classification and
+    Ridge regression for regression. Input features are the OOF
+    predictions from base models; for classification, logit transforms
+    are appended for richer representation.
 
     The meta-model itself uses cross-validation on the OOF predictions
     to produce its own OOF predictions — preventing leakage.
@@ -185,7 +187,11 @@ def train_meta_model(
         y: True target values.
         n_folds: Number of CV folds for the meta-model.
         seed: Random seed.
-        C: Regularization strength for LogisticRegression.
+        C: Regularization strength. For LogisticRegression this is C
+           directly; for Ridge, alpha = 1.0 / C.
+        task_type: 'binary_classification' or 'regression'. Controls
+                   which meta-learner is used and whether logit
+                   transforms are added to X_meta.
 
     Returns:
         Tuple of (meta_oof_preds, meta_test_preds):
@@ -194,13 +200,16 @@ def train_meta_model(
 
     Steps:
         1. Stack OOF predictions into a matrix: X_meta = np.column_stack(oof_list).
-        2. Add logit transforms: for each OOF column, append
-           log(p / (1 - p)) clipped to [-5, 5] to X_meta.
-        3. Stack test predictions similarly: X_test_meta.
-        4. Create StratifiedKFold(n_folds, seed).
+        2. Classification only — add logit transforms: for each OOF column,
+           append log(p / (1 - p)) clipped to [-5, 5] to X_meta.
+        3. Stack test predictions similarly: X_test_meta (with logits for
+           classification).
+        4. Create StratifiedKFold(n_folds, seed) for classification or
+           KFold(n_folds, seed) for regression.
         5. Initialize meta_oof (len(y),) and meta_test (len(test),).
         6. For each fold:
-           a. Fit LogisticRegression(C=C) on training fold of X_meta.
+           a. Classification: fit LogisticRegression(C=C), predict_proba[:,1].
+              Regression: fit Ridge(alpha=1/C), predict().
            b. Predict on validation fold → meta_oof[val_idx].
            c. Predict on X_test_meta → meta_test += preds / n_folds.
         7. Return (meta_oof, meta_test).
@@ -249,6 +258,204 @@ def train_meta_model(
             meta_test += meta_model.predict_proba(X_test_meta)[:, 1] / n_folds
 
     return meta_oof, meta_test
+
+
+def optimize_meta_C(
+    oof_list: list[np.ndarray],
+    test_list: list[np.ndarray],
+    y: np.ndarray,
+    n_folds: int = 10,
+    seed: int = 42,
+    task_type: str = "binary_classification",
+    n_trials: int = 50,
+    metric: str = "roc_auc",
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Search optimal regularization C for meta-model using Optuna.
+
+    Uses Optuna to find the best C (inverse regularization strength) for
+    the meta-model on a log scale from 0.001 to 100. Each trial trains
+    the full meta-model CV and evaluates on OOF predictions.
+
+    Args:
+        oof_list: List of OOF prediction arrays from base models.
+        test_list: List of test prediction arrays from base models.
+        y: True target values.
+        n_folds: Number of CV folds for meta-model (typically 2× pipeline folds).
+        seed: Random seed.
+        task_type: 'binary_classification' or 'regression'.
+        n_trials: Number of Optuna trials for C search.
+        metric: Metric to optimize ('roc_auc' or 'neg_rmse').
+
+    Returns:
+        Tuple of (meta_oof_preds, meta_test_preds, best_C).
+    """
+    t0 = time.time()
+
+    def objective(trial: optuna.Trial) -> float:
+        C = trial.suggest_float("C", 0.001, 100.0, log=True)
+        meta_oof, _ = train_meta_model(
+            oof_list, test_list, y,
+            n_folds=n_folds, seed=seed, C=C, task_type=task_type,
+        )
+        return _score(y, meta_oof, metric)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best_C = study.best_params["C"]
+    elapsed = time.time() - t0
+    logger.info(
+        f"Meta-model C search: best_C={best_C:.6f}, "
+        f"best_{metric}={study.best_value:.6f} "
+        f"({n_trials} trials, {n_folds}-fold CV, {elapsed:.1f}s)"
+    )
+
+    meta_oof, meta_test = train_meta_model(
+        oof_list, test_list, y,
+        n_folds=n_folds, seed=seed, C=best_C, task_type=task_type,
+    )
+    return meta_oof, meta_test, best_C
+
+
+def train_meta_model_xgb(
+    oof_list: list[np.ndarray],
+    test_list: list[np.ndarray],
+    y: np.ndarray,
+    n_folds: int = 10,
+    seed: int = 42,
+    task_type: str = "binary_classification",
+    xgb_params: dict | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Train an XGBoost meta-model (stacking) on OOF predictions.
+
+    Non-linear meta-learner that can capture interactions between
+    base model predictions. No early stopping — n_estimators is
+    controlled via xgb_params (tuned by Optuna externally).
+
+    Args:
+        oof_list: List of OOF prediction arrays from base models.
+        test_list: List of test prediction arrays from base models.
+        y: True target values.
+        n_folds: Number of CV folds for the meta-model.
+        seed: Random seed.
+        task_type: 'binary_classification' or 'regression'.
+        xgb_params: XGBoost hyperparameters (from Optuna search).
+
+    Returns:
+        Tuple of (meta_oof_preds, meta_test_preds).
+    """
+    from xgboost import XGBClassifier, XGBRegressor
+
+    is_regression = task_type == "regression"
+    params = xgb_params or {}
+
+    X_meta = np.column_stack(oof_list)
+    X_test_meta = np.column_stack(test_list)
+
+    n_test = X_test_meta.shape[0]
+    meta_oof = np.zeros(len(y))
+    meta_test = np.zeros(n_test)
+
+    if is_regression:
+        cv_splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        splits = cv_splitter.split(X_meta)
+    else:
+        cv_splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        splits = cv_splitter.split(X_meta, y)
+
+    for train_idx, val_idx in splits:
+        X_tr, X_val = X_meta[train_idx], X_meta[val_idx]
+        y_tr = y[train_idx]
+
+        if is_regression:
+            model = XGBRegressor(random_state=seed, verbosity=0, **params)
+            model.fit(X_tr, y_tr)
+            meta_oof[val_idx] = model.predict(X_val)
+            meta_test += model.predict(X_test_meta) / n_folds
+        else:
+            model = XGBClassifier(
+                random_state=seed, verbosity=0,
+                eval_metric="logloss", **params,
+            )
+            model.fit(X_tr, y_tr)
+            meta_oof[val_idx] = model.predict_proba(X_val)[:, 1]
+            meta_test += model.predict_proba(X_test_meta)[:, 1] / n_folds
+
+    return meta_oof, meta_test
+
+
+def optimize_meta_xgb(
+    oof_list: list[np.ndarray],
+    test_list: list[np.ndarray],
+    y: np.ndarray,
+    n_folds: int = 10,
+    seed: int = 42,
+    task_type: str = "binary_classification",
+    n_trials: int = 50,
+    metric: str = "roc_auc",
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Search optimal XGBoost meta-model hyperparameters using Optuna.
+
+    Searches learning_rate, max_depth, n_estimators, regularization,
+    and subsampling on a log/uniform scale.
+
+    Args:
+        oof_list: List of OOF prediction arrays from base models.
+        test_list: List of test prediction arrays from base models.
+        y: True target values.
+        n_folds: Number of CV folds for meta-model (typically 2× pipeline folds).
+        seed: Random seed.
+        task_type: 'binary_classification' or 'regression'.
+        n_trials: Number of Optuna trials.
+        metric: Metric to optimize ('roc_auc' or 'neg_rmse').
+
+    Returns:
+        Tuple of (meta_oof_preds, meta_test_preds, best_params).
+    """
+    t0 = time.time()
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 6),
+            "n_estimators": trial.suggest_int("n_estimators", 50, 500),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+        }
+        meta_oof, _ = train_meta_model_xgb(
+            oof_list, test_list, y,
+            n_folds=n_folds, seed=seed, task_type=task_type,
+            xgb_params=params,
+        )
+        return _score(y, meta_oof, metric)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    best_params = study.best_params
+    elapsed = time.time() - t0
+    logger.info(
+        f"Meta-XGBoost search: best_{metric}={study.best_value:.6f} "
+        f"(lr={best_params['learning_rate']:.4f}, depth={best_params['max_depth']}, "
+        f"n_est={best_params['n_estimators']}, "
+        f"{n_trials} trials, {n_folds}-fold CV, {elapsed:.1f}s)"
+    )
+
+    meta_oof, meta_test = train_meta_model_xgb(
+        oof_list, test_list, y,
+        n_folds=n_folds, seed=seed, task_type=task_type,
+        xgb_params=best_params,
+    )
+    return meta_oof, meta_test, best_params
 
 
 def pick_best_strategy(

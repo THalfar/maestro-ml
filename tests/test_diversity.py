@@ -821,6 +821,26 @@ class TestPrintDiversityReport:
         assert "N_eff" in captured.out
         assert "Most correlated pair" not in captured.out
 
+    def test_output_to_file(self, tmp_path, capsys):
+        """When output_path is given, full report goes to file, console is concise."""
+        corr = np.array([[1.0, 0.8], [0.8, 1.0]])
+        labels = ["A", "B"]
+        report_path = tmp_path / "diversity_report.txt"
+        print_diversity_report(corr, labels, output_path=report_path)
+
+        # File has full correlation matrix
+        content = report_path.read_text()
+        assert "ENSEMBLE DIVERSITY REPORT" in content
+        assert "N_eff" in content
+        assert "0.800" in content  # correlation value
+
+        # Console has concise summary
+        captured = capsys.readouterr()
+        assert "N_eff" in captured.out
+        assert "Full report:" in captured.out
+        # Full matrix NOT on console
+        assert "ENSEMBLE DIVERSITY REPORT" not in captured.out
+
 
 # ---------------------------------------------------------------------------
 # greedy_diverse_select edge cases

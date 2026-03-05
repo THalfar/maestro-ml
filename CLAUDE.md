@@ -83,7 +83,11 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 
 ## Ensemble & Diversity
 
-- **NSGA-II → meta-model chain** (in `run.py`): NSGA-II selects diverse models, then trains a LogisticRegression/Ridge meta-model on selected OOFs. Compares linear blend vs meta-stacking on OOF score — picks the winner automatically.
+- **NSGA-II → meta-model chain** (in `run.py`): NSGA-II selects diverse models, then trains meta-models on selected OOFs. Compares linear blend vs each meta-model on OOF score — picks the winner automatically.
+- **Meta-model C optimization**: `optimize_meta_C()` in `blender.py` uses Optuna to search LogisticRegression/Ridge C on log scale (0.001–100). Never hardcode C=1.0.
+- **XGBoost meta-learner**: `optimize_meta_xgb()` in `blender.py` searches 8 hyperparameters via Optuna for non-linear meta-stacking. Can capture model interaction effects that linear meta-learners miss.
+- **Configurable meta-models**: `EnsembleConfig.meta_models` (list, default `["logreg"]`) and `meta_trials` (int or dict per meta-model). Pipeline tries all configured meta-models and picks the best.
+- **Meta-model CV**: Uses 2× pipeline CV folds (e.g., 5-fold pipeline → 10-fold meta-CV) for finer-grained OOF predictions.
 - **Three diversity metrics** (`diversity_metric` in pipeline YAML):
   - `pearson_neff` — Effective ensemble size from Pearson error correlation eigenvalues (default).
   - `spearman_neff` — Same but Spearman rank correlation. Better for AUC (ranking metric).
@@ -91,8 +95,25 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - **`diversity_weight`** can be a single float or a list of floats. Multiple weights re-select from the same Pareto front without re-running NSGA-II.
 - **`select_from_pareto()`** in `diversity.py` re-selects from cached Pareto data with different `diversity_weight`.
 
+## Extra Data (Original Datasets)
+
+- **`extra_data`** in pipeline YAML: List of original datasets to concatenate with train data.
+- Each entry: `path`, optional `drop_columns`, `column_mapping`, `sample_weight`, `target_column`.
+- `_concat_extra_data()` in `run.py` handles column matching, target mapping, dtype coercion, missing id columns.
+- Adds `_is_original` (bool) and `_sample_weight` (float) metadata columns to train.
+- **Metadata columns are stripped before `build_features()`** and re-attached after — prevents dtype leakage into ordinal encoder (test doesn't have these columns).
+- Sample weights are passed to models that support them (CatBoost, XGBoost, LightGBM).
+- Kaggle Playground Series uses synthetic data generated from real datasets — weighting the original data higher (e.g., `sample_weight: 10.0`) improves signal quality.
+
+## NaN Imputation
+
+- Models with `handles_missing: false` (RealMLP, TabM, Ridge, KNN, etc.) get automatic median imputation in `run_optuna_study()` and `train_with_config()`.
+- Fitted on train, applied to both train and test via `sklearn.impute.SimpleImputer`.
+- Models with `handles_missing: true` (CatBoost, XGBoost, LightGBM) handle NaN natively — no imputation applied.
+
 ## Pipeline YAML Key Features
 
+- **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).
 - **`target_mapping`**: Converts string labels to numeric (`{Yes: 1, No: 0}`).
 - **`log_transform_target`**: Applies `log1p()` to regression targets (for RMSLE optimization).
 - **Timeout strings**: `model_timeouts` accepts human-readable strings like `"1h30m"`, `"45m"`, `"90s"` — parsed by `parse_timeout()` in `io.py`.
@@ -148,7 +169,7 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
-- Expected: **479 passed, 5 skipped, ~6s**
+- Expected: **538 passed, 22 skipped, ~8s**
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
 - `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds
@@ -177,7 +198,7 @@ src/eda/profiler.py      — run_eda, format_eda_for_llm
 src/features/engineer.py — build_features, target encoding, interactions, ratios
 src/models/registry.py   — ModelRegistry class (register, get_model, get_search_space)
 src/models/trainer.py    — PerFoldTracker, run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists
-src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_model
+src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_model, optimize_meta_C, optimize_meta_xgb
 src/ensemble/diversity.py — run_nsga2_ensemble, select_from_pareto, effective_ensemble_size, _compute_diversity
 src/strategy/llm_strategist.py — generate_strategy (API + manual modes)
 run.py                   — main pipeline orchestrator (includes NSGA-II→meta chain logic)

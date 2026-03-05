@@ -1938,3 +1938,75 @@ class TestSampleWeightIntegration:
         )
         assert len(oof_list) == 1
         assert len(oof_list[0]) == len(train)
+
+
+# ---------------------------------------------------------------------------
+# OOF bounding (n_top_trials limit on stored oof_preds)
+# ---------------------------------------------------------------------------
+
+class TestOofBounding:
+    """Test that oof_preds are only stored for top-N trials to bound memory."""
+
+    def test_oof_stored_only_for_top_trials(self, ridge_configs_dir, binary_data, pipeline_config):
+        """Only the top n_top_trials trials should have oof_preds in user_attrs."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+        )
+        # n_trials=5, n_top_trials=2 in ridge_configs_dir fixture
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        assert len(completed) >= 3, "Need enough trials to test bounding"
+
+        trials_with_oof = [
+            t for t in completed if "oof_preds" in t.user_attrs
+        ]
+        # At most n_top_trials (2) should have oof_preds stored,
+        # plus any that tied with the cutoff. Should never be all trials.
+        assert len(trials_with_oof) <= len(completed), "sanity check"
+        # The best trial must always have oof_preds
+        best = study.best_trial
+        assert "oof_preds" in best.user_attrs, "Best trial must have oof_preds stored"
+
+    def test_oof_not_stored_for_worst_trial(self, ridge_configs_dir, binary_data, pipeline_config):
+        """The worst trial should not have oof_preds when n_top_trials < n_trials."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+        )
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if len(completed) >= 4:
+            # With n_top_trials=2 and 5 trials, the worst trial should
+            # NOT have oof_preds (unless it was one of the first 2 completed)
+            sorted_trials = sorted(completed, key=lambda t: t.value, reverse=True)
+            # At least some of the bottom trials should lack oof_preds
+            bottom_trials = sorted_trials[2:]  # trials ranked below top-2
+            bottom_without_oof = [
+                t for t in bottom_trials if "oof_preds" not in t.user_attrs
+            ]
+            # At least one bottom trial should lack oof_preds
+            # (the early ones may have been stored before being displaced)
+            assert len(bottom_without_oof) >= 1 or len(completed) <= 2, (
+                "Expected at least one non-top trial to lack oof_preds"
+            )

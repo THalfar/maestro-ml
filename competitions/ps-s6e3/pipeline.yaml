@@ -47,20 +47,19 @@ models:
   - realmlp
   - tabm
 
-features:
-  interactions: []
-  ratios: []
-  target_encoding:
-    columns: []
-    pairs: []
-    alpha: 15
-  custom: []
+features: {}
 
 ensemble:
   strategy: "nsga2"
+  meta_models:
+    - xgboost                                # Non-linear meta-learner (trees capture model interactions)
+    - logreg                                 # Linear meta-learner (LogisticRegression with logit features)
+  meta_trials:
+    xgboost: 100                              # More params → more trials
+    logreg: 500                              # Fast, can afford more
   nsga2_trials: 3000
   diversity_weight: 0.3
-  diversity_metric: "ambiguity"             # Weighted prediction variance — directly measures ensemble benefit
+  diversity_metric: "ambiguity"              # Weighted prediction variance — directly measures ensemble benefit
 
 optuna:
   global_seed: 42

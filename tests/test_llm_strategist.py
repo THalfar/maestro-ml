@@ -638,6 +638,74 @@ class TestRunManualMode:
         assert eda_out.exists()
         assert "MAESTRO-ML" in eda_out.read_text(encoding="utf-8")
 
+    def test_default_eda_output_path(self, tmp_path, monkeypatch):
+        """When eda_output_path is None, defaults to strategy_path.parent / eda_report.txt."""
+        subdir = tmp_path / "results"
+        subdir.mkdir()
+        strategy_yaml = subdir / "strategy.yaml"
+        strategy_yaml.write_text(
+            "features: {}\nmodels: []\nreasoning: default eda path\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("builtins.input", lambda _: "")
+        with patch("src.strategy.llm_strategist.Path") as MockPath:
+            real_path = Path
+            def path_side_effect(arg):
+                if arg == "configs/models":
+                    return tmp_path / "nonexistent"
+                return real_path(arg)
+            MockPath.side_effect = path_side_effect
+
+            run_manual_mode(
+                {"dataset_info": {}, "target_analysis": {"dtype": "int64", "n_unique": 2,
+                 "distribution": {}, "class_balance_pct": {}, "missing_pct": 0},
+                 "columns": {}, "correlation_matrix": {"columns": [], "values": []},
+                 "feature_clusters": [], "weak_features": [], "recommendations": []},
+                str(strategy_yaml),
+            )
+
+        default_eda = subdir / "eda_report.txt"
+        assert default_eda.exists()
+        assert "MAESTRO-ML" in default_eda.read_text(encoding="utf-8")
+
+    def test_validation_failure_warns_not_raises(self, tmp_path, monkeypatch, caplog):
+        """Manual mode: invalid strategy → warning logged, strategy still returned."""
+        strategy_yaml = tmp_path / "strategy.yaml"
+        # Missing 'reasoning' key → validation would raise ValueError
+        strategy_yaml.write_text(
+            "features: {}\nmodels: [nonexistent_model]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr("builtins.input", lambda _: "")
+        models_dir = tmp_path / "configs" / "models"
+        models_dir.mkdir(parents=True)
+        (models_dir / "catboost.yaml").write_text("name: CatBoost\n", encoding="utf-8")
+
+        with patch("src.strategy.llm_strategist.Path") as MockPath:
+            real_path = Path
+            def path_side_effect(arg):
+                if arg == "configs/models":
+                    return models_dir
+                return real_path(arg)
+            MockPath.side_effect = path_side_effect
+
+            import logging
+            with caplog.at_level(logging.WARNING, logger="maestro"):
+                result = run_manual_mode(
+                    {"dataset_info": {}, "target_analysis": {"dtype": "int64", "n_unique": 2,
+                     "distribution": {}, "class_balance_pct": {}, "missing_pct": 0},
+                     "columns": {}, "correlation_matrix": {"columns": [], "values": []},
+                     "feature_clusters": [], "weak_features": [], "recommendations": []},
+                    str(strategy_yaml),
+                )
+
+        # Strategy is returned despite validation failure
+        assert result["models"] == ["nonexistent_model"]
+        # Warning was logged
+        assert "validation warning" in caplog.text.lower() or "missing required keys" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # _parse_llm_response — empty / whitespace edge cases

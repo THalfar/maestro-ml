@@ -54,7 +54,12 @@ features:
 ensemble:
   strategy: str               # "blend" | "rank" | "meta" | "nsga2" | "auto"
   blend_trials: int           # Optuna trials for weight optimization (default: 500)
-  meta_trials: int            # Optuna trials for meta-model C param (default: 100)
+  meta_models:                # Meta-learners to try at ensemble stage (default: [logreg])
+    - logreg                  # LogisticRegression/Ridge (linear, C searched by Optuna)
+    - xgboost                 # XGBoost (non-linear, hyperparams searched by Optuna)
+  meta_trials: int | dict     # Optuna trials for meta-model search (default: 100)
+                              # int: same for all meta-models
+                              # dict: {logreg: 100, xgboost: 80} per meta-model
   nsga2_trials: int           # NSGA-II trials for diversity optimization (default: 300)
   diversity_weight: float     # 0.0-1.0, importance of diversity vs metric (default: 0.3)
 

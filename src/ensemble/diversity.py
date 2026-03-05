@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -993,12 +994,18 @@ def run_nsga2_ensemble(
 def print_diversity_report(
     corr_matrix: np.ndarray,
     labels: list[str],
+    output_path: str | Path | None = None,
 ) -> None:
-    """Print a formatted diversity report to the console.
+    """Print a formatted diversity report.
+
+    If output_path is given, the full correlation matrix is written to that file
+    and only a concise summary is printed to the console.  If output_path is
+    None, everything goes to the console (legacy behaviour).
 
     Args:
         corr_matrix: Correlation matrix of shape (n_models, n_models).
         labels: List of model names corresponding to matrix rows/columns.
+        output_path: Optional path for the detailed report file.
 
     Steps:
         1. Print header: "Ensemble Diversity Report".
@@ -1011,24 +1018,27 @@ def print_diversity_report(
            - If effective_size >= n/2: "Good diversity in ensemble"
     """
     n = len(labels)
-    print("\n" + "=" * 60)
-    print("ENSEMBLE DIVERSITY REPORT")
-    print("=" * 60)
+
+    # Build full report lines
+    lines: list[str] = []
+    lines.append("=" * 60)
+    lines.append("ENSEMBLE DIVERSITY REPORT")
+    lines.append("=" * 60)
 
     # Correlation matrix table
     label_width = max(len(lb) for lb in labels) + 2
     header = " " * label_width + "".join(f"{lb:>12s}" for lb in labels)
-    print(header)
-    print("-" * len(header))
+    lines.append(header)
+    lines.append("-" * len(header))
     for i, row_label in enumerate(labels):
         row_str = f"{row_label:<{label_width}}"
         for j in range(n):
             row_str += f"{corr_matrix[i, j]:>12.3f}"
-        print(row_str)
+        lines.append(row_str)
 
     # Effective ensemble size
     n_eff = effective_ensemble_size(corr_matrix)
-    print(f"\nEffective ensemble size (N_eff): {n_eff:.3f} / {n}")
+    lines.append(f"\nEffective ensemble size (N_eff): {n_eff:.3f} / {n}")
 
     # Most and least correlated pairs
     max_corr = -np.inf
@@ -1047,15 +1057,32 @@ def print_diversity_report(
                 min_pair = (labels[i], labels[j])
 
     if n > 1:
-        print(f"Most correlated pair : {max_pair[0]} & {max_pair[1]}  (r={max_corr:.3f})")
-        print(f"Least correlated pair: {min_pair[0]} & {min_pair[1]}  (r={min_corr:.3f})")
+        lines.append(f"Most correlated pair : {max_pair[0]} & {max_pair[1]}  (r={max_corr:.3f})")
+        lines.append(f"Least correlated pair: {min_pair[0]} & {min_pair[1]}  (r={min_corr:.3f})")
 
     # Summary recommendation
     if n_eff < 2:
-        print("\n⚠  Warning: ensemble is highly redundant (N_eff < 2). Consider more diverse models.")
+        recommendation = "Warning: ensemble is highly redundant (N_eff < 2). Consider more diverse models."
     elif n_eff >= n / 2:
-        print(f"\n✓  Good diversity in ensemble (N_eff={n_eff:.2f} >= {n/2:.1f}).")
+        recommendation = f"Good diversity in ensemble (N_eff={n_eff:.2f} >= {n/2:.1f})."
     else:
-        print(f"\n~  Moderate diversity (N_eff={n_eff:.2f}). Adding diverse models may help.")
+        recommendation = f"Moderate diversity (N_eff={n_eff:.2f}). Adding diverse models may help."
+    lines.append(f"\n{recommendation}")
+    lines.append("=" * 60)
 
-    print("=" * 60 + "\n")
+    if output_path is not None:
+        # Write full report to file
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        # Console: concise summary only
+        print(f"\nDiversity: N_eff={n_eff:.3f}/{n}", end="")
+        if n > 1:
+            print(f", least_corr={min_pair[0]}&{min_pair[1]}(r={min_corr:.3f})", end="")
+        print(f"  [{recommendation}]")
+        print(f"  Full report: {output_path}")
+    else:
+        # Legacy: everything to console
+        print("\n" + "\n".join(lines) + "\n")

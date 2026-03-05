@@ -8,9 +8,12 @@ from src.ensemble.blender import (
     _score,
     apply_blend,
     optimize_blend_weights,
+    optimize_meta_C,
+    optimize_meta_xgb,
     pick_best_strategy,
     rank_average,
     train_meta_model,
+    train_meta_model_xgb,
 )
 
 
@@ -329,6 +332,157 @@ class TestTrainMetaModel:
         )
         assert np.all(np.isfinite(meta_oof))
         assert np.all(np.isfinite(meta_test))
+
+
+# ---------------------------------------------------------------------------
+# optimize_meta_C
+# ---------------------------------------------------------------------------
+
+class TestOptimizeMetaC:
+    def test_returns_correct_shapes(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        meta_oof, meta_test, best_C = optimize_meta_C(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=5,
+        )
+        assert meta_oof.shape == (len(y),)
+        assert meta_test.shape == (len(test_preds[0]),)
+
+    def test_best_C_in_range(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        _, _, best_C = optimize_meta_C(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=5,
+        )
+        assert 0.001 <= best_C <= 100.0
+
+    def test_beats_fixed_C(self, binary_oof_data, test_preds):
+        """Optimized C should be at least as good as default C=1.0."""
+        from sklearn.metrics import roc_auc_score
+        oof_list, y = binary_oof_data
+        meta_oof_opt, _, _ = optimize_meta_C(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=20,
+        )
+        meta_oof_fixed, _ = train_meta_model(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, C=1.0,
+        )
+        score_opt = roc_auc_score(y, meta_oof_opt)
+        score_fixed = roc_auc_score(y, meta_oof_fixed)
+        # Optimized should be >= fixed (with small tolerance for Optuna variance)
+        assert score_opt >= score_fixed - 0.005
+
+    def test_regression(self):
+        """optimize_meta_C should work for regression."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.normal(0, 1, n)
+        oof1 = y + rng.normal(0, 0.3, n)
+        oof2 = y + rng.normal(0, 0.5, n)
+        test1 = rng.normal(0, 1, 50)
+        test2 = rng.normal(0, 1, 50)
+        meta_oof, meta_test, best_C = optimize_meta_C(
+            [oof1, oof2], [test1, test2], y,
+            n_folds=3, seed=42, task_type="regression",
+            metric="neg_rmse", n_trials=5,
+        )
+        assert meta_oof.shape == (n,)
+        assert meta_test.shape == (50,)
+        assert 0.001 <= best_C <= 100.0
+
+    def test_deterministic_same_seed(self, binary_oof_data, test_preds):
+        """Same seed must produce identical results."""
+        oof_list, y = binary_oof_data
+        oof_a, test_a, C_a = optimize_meta_C(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=10,
+        )
+        oof_b, test_b, C_b = optimize_meta_C(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=10,
+        )
+        assert C_a == C_b
+        np.testing.assert_array_equal(oof_a, oof_b)
+        np.testing.assert_array_equal(test_a, test_b)
+
+
+# ---------------------------------------------------------------------------
+# train_meta_model_xgb / optimize_meta_xgb
+# ---------------------------------------------------------------------------
+
+class TestTrainMetaModelXgb:
+    def test_returns_correct_shapes(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        meta_oof, meta_test = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42,
+        )
+        assert meta_oof.shape == (len(y),)
+        assert meta_test.shape == (len(test_preds[0]),)
+
+    def test_oof_are_probabilities(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        meta_oof, _ = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42,
+        )
+        assert meta_oof.min() >= 0.0
+        assert meta_oof.max() <= 1.0
+
+    def test_meta_beats_random(self, binary_oof_data, test_preds):
+        """XGBoost meta-model OOF score should be better than random."""
+        from sklearn.metrics import roc_auc_score
+        oof_list, y = binary_oof_data
+        meta_oof, _ = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42,
+            xgb_params={"n_estimators": 50, "max_depth": 2, "learning_rate": 0.1},
+        )
+        auc = roc_auc_score(y, meta_oof)
+        assert auc > 0.5
+
+    def test_regression(self):
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.normal(0, 1, n)
+        oof1 = y + rng.normal(0, 0.3, n)
+        oof2 = y + rng.normal(0, 0.5, n)
+        test1 = rng.normal(0, 1, 50)
+        test2 = rng.normal(0, 1, 50)
+        meta_oof, meta_test = train_meta_model_xgb(
+            [oof1, oof2], [test1, test2], y,
+            n_folds=3, seed=42, task_type="regression",
+            xgb_params={"n_estimators": 50, "max_depth": 2},
+        )
+        assert meta_oof.shape == (n,)
+        assert meta_test.shape == (50,)
+        assert np.all(np.isfinite(meta_oof))
+
+
+class TestOptimizeMetaXgb:
+    def test_returns_correct_shapes(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        meta_oof, meta_test, best_params = optimize_meta_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=3,
+        )
+        assert meta_oof.shape == (len(y),)
+        assert meta_test.shape == (len(test_preds[0]),)
+        assert "learning_rate" in best_params
+        assert "max_depth" in best_params
+
+    def test_deterministic_same_seed(self, binary_oof_data, test_preds):
+        oof_list, y = binary_oof_data
+        _, _, p_a = optimize_meta_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=5,
+        )
+        _, _, p_b = optimize_meta_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, n_trials=5,
+        )
+        assert p_a == p_b
 
 
 # ---------------------------------------------------------------------------

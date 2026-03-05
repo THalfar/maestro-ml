@@ -56,10 +56,21 @@ class EnsembleConfig:
 
     strategy: str = "auto"
     blend_trials: int = 500
-    meta_trials: int = 100
+    meta_models: list[str] = field(default_factory=lambda: ["logreg"])
+    meta_trials: dict[str, int] | int = 100
     nsga2_trials: int = 300
     diversity_weight: float | list[float] = 0.3
     diversity_metric: str = "pearson_neff"
+
+    def get_meta_trials(self, meta_model: str) -> int:
+        """Get Optuna trial count for a specific meta-model.
+
+        meta_trials can be int (same for all) or dict (per meta-model).
+        Falls back to 100 if meta-model not in dict.
+        """
+        if isinstance(self.meta_trials, dict):
+            return self.meta_trials.get(meta_model, 100)
+        return int(self.meta_trials)
 
 
 @dataclass
@@ -298,10 +309,18 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         custom=features_raw.get("custom", []) or [],
     )
 
+    # meta_trials: int (same for all) or dict {model_name: n_trials}
+    meta_trials_raw = ensemble_raw.get("meta_trials", 100)
+    if isinstance(meta_trials_raw, dict):
+        meta_trials: dict[str, int] | int = {str(k): int(v) for k, v in meta_trials_raw.items()}
+    else:
+        meta_trials = int(meta_trials_raw) if meta_trials_raw else 100
+
     ensemble = EnsembleConfig(
         strategy=ensemble_raw.get("strategy", "auto"),
         blend_trials=ensemble_raw.get("blend_trials", 500),
-        meta_trials=ensemble_raw.get("meta_trials", 100),
+        meta_models=ensemble_raw.get("meta_models", ["logreg"]),
+        meta_trials=meta_trials,
         nsga2_trials=ensemble_raw.get("nsga2_trials", 300),
         diversity_weight=ensemble_raw.get("diversity_weight", 0.3),
         diversity_metric=ensemble_raw.get("diversity_metric", "pearson_neff"),

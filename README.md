@@ -32,7 +32,9 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 ## Features
 
 - **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
-- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression) and compared against the linear blend — the best wins automatically.
+- **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression or XGBoost, configurable) with Optuna-optimized hyperparameters and compared against the linear blend — the best wins automatically.
+- **Extra data support** — Concat original (non-synthetic) datasets with configurable sample weights. Kaggle Playground Series competitions use synthetic data — weighting the original dataset higher (e.g., 10×) gives models cleaner training signal.
+- **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
 - **Per-fold selection for neural nets** — RealMLP uses per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
@@ -200,13 +202,19 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - Phase 2: TPE (Bayesian optimization)
 - **Global mode** (default): Top configs retrained with multiple seeds for stability
 - **Per-fold mode** (RealMLP): `PerFoldTracker` keeps top-N predictions per fold during Optuna (including pruned trials). After Optuna, composites assembled via rank or NSGA-II — no retraining needed. Per-fold timeout prunes slow trials while saving completed fold predictions.
+- Automatic median imputation for models with `handles_missing: false` (RealMLP, TabM, Ridge, etc.)
+- Sample weight support for extra data weighting
 - OOF predictions stored for ensemble
 
 **Ensemble** (`src/ensemble/blender.py`, `src/ensemble/diversity.py`)
 - Optimized weighted blend (Optuna)
 - Rank averaging
-- Meta-model stacking (LogisticRegression/Ridge with logit features)
-- NSGA-II diversity-aware selection → meta-model stacking chain (best of blend vs stacking)
+- Meta-model stacking with Optuna-optimized hyperparameters:
+  - **LogisticRegression/Ridge** — C searched on log scale (0.001–100) via `optimize_meta_C()`
+  - **XGBoost** — 8 hyperparameters searched via `optimize_meta_xgb()` for non-linear meta-stacking
+  - Configurable via `meta_models` list and `meta_trials` dict in pipeline YAML
+- Meta-model uses 2× pipeline CV folds for finer-grained OOF predictions
+- NSGA-II diversity-aware selection → meta-model stacking chain (best of blend vs all meta-models)
 - Three diversity metrics: `pearson_neff` (Pearson eigenvalues), `spearman_neff` (Spearman rank — better for AUC), `ambiguity` (prediction variance decomposition)
 - Auto mode: tries all strategies, picks the best on OOF score
 
@@ -292,10 +300,10 @@ pytest tests/ -v
 ```
 
 ```
-479 passed, 5 skipped in ~6s
+538 passed, 22 skipped in ~8s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training, per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending, NSGA-II→meta-model stacking chain, LLM strategy parsing, and end-to-end pipeline integration.
+Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights and NaN imputation), per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
 
 ---
 
@@ -305,12 +313,12 @@ Tests cover all modules: YAML loading, EDA profiling, feature engineering (inclu
 
 | Section | Key Fields | Description |
 |---------|-----------|-------------|
-| `data` | `train_path`, `test_path`, `target_column`, `id_column`, `task_type`, `target_mapping` | Dataset paths and metadata. `target_mapping` converts string targets to numeric (e.g., `{Presence: 1, Absence: 0}`) |
+| `data` | `train_path`, `test_path`, `target_column`, `id_column`, `task_type`, `target_mapping`, `extra_data` | Dataset paths and metadata. `target_mapping` converts string targets to numeric. `extra_data` concats original datasets with configurable `sample_weight` |
 | `cv` | `n_folds`, `seed`, `stratified` | Cross-validation settings |
 | `strategy` | `mode` (`api`/`manual`), `api.provider`, `api.model` | LLM strategy mode |
 | `models` | List of model names | Which models to train |
 | `features` | `interactions`, `ratios`, `target_encoding`, `custom` | Feature engineering (populated by LLM) |
-| `ensemble` | `strategy` (`auto`/`blend`/`rank`/`meta`/`nsga2`), `diversity_weight`, `diversity_metric` (`pearson_neff`/`spearman_neff`/`ambiguity`) | Ensemble selection |
+| `ensemble` | `strategy`, `meta_models` (`[logreg, xgboost]`), `meta_trials` (int or dict), `diversity_weight`, `diversity_metric` | Ensemble selection. `meta_models` configures which meta-learners to try; `meta_trials` sets Optuna budget per meta-model |
 | `optuna` | `global_seed`, `global_timeout` | Global Optuna settings |
 | `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
 | `output` | `submission_path`, `results_dir`, `save_oof` | Output paths |
@@ -373,7 +381,10 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Greedy Pareto selection with real diversity metrics (pearson/spearman/ambiguity)
 - [x] Per-fold timeout (saves completed folds before pruning)
 - [x] End-to-end pipeline orchestrator
-- [x] 479 tests with full coverage
+- [x] Extra data support (original datasets with sample weights)
+- [x] Automatic NaN imputation for models that don't handle missing values
+- [x] Configurable meta-models (LogReg + XGBoost) with Optuna-optimized hyperparameters
+- [x] 538 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [ ] Feature importance analysis and selection

@@ -530,6 +530,37 @@ class TestBuildFeatures:
             assert pd.api.types.is_numeric_dtype(train_out[col]), f"{col} not numeric in train"
             assert pd.api.types.is_numeric_dtype(test_out[col]), f"{col} not numeric in test"
 
+    def test_metadata_columns_not_in_test(self):
+        """_is_original / _sample_weight in train (from extra_data) must not crash.
+
+        After pd.concat with extra data, _is_original can become object dtype
+        (NaN coercion). build_features detects it as a string column and tries
+        test[str_cols], which fails because test doesn't have it.
+
+        The fix is in run.py (strip metadata before build_features), but this
+        test documents the failure mode directly.
+        """
+        rng = np.random.default_rng(42)
+        n = 50
+        train = pd.DataFrame({
+            "num_a": rng.normal(0, 1, n),
+            "cat_x": rng.choice(["A", "B"], n),
+            "target": rng.choice([0, 1], n).astype(float),
+        })
+        test = pd.DataFrame({
+            "num_a": rng.normal(0, 1, 20),
+            "cat_x": rng.choice(["A", "B"], 20),
+        })
+
+        # Simulate what run.py does: strip metadata before build_features
+        train_clean = train.copy()  # no metadata columns
+        strategy = {"features": {}}
+        train_out, test_out = build_features(
+            train_clean, test, strategy, target_col="target"
+        )
+        assert pd.api.types.is_numeric_dtype(train_out["cat_x"])
+        assert pd.api.types.is_numeric_dtype(test_out["cat_x"])
+
     def test_ordinal_encoding_handles_nan_in_string_columns(self):
         """NaN in string columns should be encoded via __missing__ placeholder."""
         rng = np.random.default_rng(42)

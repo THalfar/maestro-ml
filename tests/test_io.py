@@ -178,6 +178,49 @@ class TestLoadPipelineConfig:
         assert cfg.ensemble.blend_trials == 100
         assert cfg.ensemble.diversity_weight == 0.5
 
+    def test_meta_models_default(self, tmp_dir: Path):
+        """Default meta_models should be ['logreg'] when not specified."""
+        path = tmp_dir / "meta_default.yaml"
+        path.write_text("data:\n  train_path: t.csv\n", encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.meta_models == ["logreg"]
+
+    def test_meta_models_list(self, tmp_dir: Path):
+        """meta_models should be parsed as a list from YAML."""
+        path = tmp_dir / "meta_list.yaml"
+        path.write_text(
+            "data:\n  train_path: t.csv\n"
+            "ensemble:\n  meta_models:\n    - xgboost\n    - logreg\n",
+            encoding="utf-8",
+        )
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.meta_models == ["xgboost", "logreg"]
+
+    def test_meta_trials_int(self, tmp_dir: Path):
+        """meta_trials as int → same for all meta-models."""
+        path = tmp_dir / "meta_int.yaml"
+        path.write_text(
+            "data:\n  train_path: t.csv\n"
+            "ensemble:\n  meta_trials: 200\n",
+            encoding="utf-8",
+        )
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.get_meta_trials("logreg") == 200
+        assert cfg.ensemble.get_meta_trials("xgboost") == 200
+
+    def test_meta_trials_dict(self, tmp_dir: Path):
+        """meta_trials as dict → per-model trials with fallback."""
+        path = tmp_dir / "meta_dict.yaml"
+        path.write_text(
+            "data:\n  train_path: t.csv\n"
+            "ensemble:\n  meta_trials:\n    logreg: 150\n    xgboost: 80\n",
+            encoding="utf-8",
+        )
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.get_meta_trials("logreg") == 150
+        assert cfg.ensemble.get_meta_trials("xgboost") == 80
+        assert cfg.ensemble.get_meta_trials("unknown") == 100  # fallback
+
     def test_optuna_section(self, sample_pipeline_yaml: Path):
         cfg = load_pipeline_config(sample_pipeline_yaml)
         assert cfg.optuna.global_seed == 99
