@@ -183,7 +183,7 @@ feature_requirements:
 
 optuna:
   n_trials: 1000                                 # GPU-accelerated, can afford more trials
-  qmc_warmup_trials: 30
+  qmc_warmup_trials: 10
   timeout: null
   pruner:
     type: median                                 # prune bad trials after a few folds

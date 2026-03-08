@@ -44,6 +44,8 @@ Implement in this order (each module depends on the ones above it):
   ```
 - **XGBoost:** v2.0+ uses `device="cuda"`, not the deprecated `tree_method="gpu_hist"`.
 - **LightGBM:** Default pip/conda installs are CPU-only. GPU requires special build.
+- **Neural net QMC warmup**: TabM/RealMLP trials take ~8-10 min each on large datasets (595k rows). Keep `qmc_warmup_trials` low (≤10) to leave budget for TPE exploration. 30 QMC trials can consume the entire timeout.
+- **Neural net fold_timeout**: Per-fold training on large datasets needs generous timeouts. 120s is too aggressive for 595k rows — use 300s+ to avoid excessive trial pruning.
 
 ## Model-Specific Quirks
 
@@ -55,6 +57,15 @@ Implement in this order (each module depends on the ones above it):
 - **RealMLP fixed_params**: Task-type-keyed (`binary_classification` / `regression`), like Ridge. `n_ens` (pytabkit internal ensemble count) is in the Optuna search space, not fixed.
 - **Ridge/Elastic Net YAML**: `fixed_params` is task-type-keyed (`binary_classification` / `regression`) because Ridge wraps different sklearn classes per task.
 - **AdaBoost/GaussianNB/SVM/KNN**: No early stopping, no GPU — simple sklearn models added for ensemble diversity.
+
+## Monotone Constraints
+
+- **Strategy YAML** defines `monotone_constraints` as a dict of `{feature: direction}` (1=increasing, -1=decreasing).
+- **EDA monotonicity detection** flags features with |Spearman rho| > 0.7 on binned target rates — strategy YAML should only constrain features actually listed in the EDA monotonicity section.
+- **Positional list resolution**: `run_optuna_study()` and `run_all_studies()` convert the dict to a positional `list[int]` aligned to `feature_cols`, then to `tuple()` for the model constructor.
+- **Format**: XGBoost sklearn API requires `tuple(monotone_constraints)`, NOT `list` — calling `.keys()` on a list causes `AttributeError`. Always convert to tuple.
+- **CatBoost GPU limitation**: `monotone_constraints` is NOT supported on CatBoost GPU. The trainer auto-skips constraints with a warning when `model_name == "catboost" and gpu == True`. Constraints work fine on CatBoost CPU.
+- **Supported models**: CatBoost (CPU only), XGBoost, LightGBM. Other models ignore constraints.
 
 ## Per-Fold Selection (RealMLP)
 
@@ -149,7 +160,7 @@ preprocessing:
 
 ## EDA Advanced Analyses
 
-- **Duplicate detection** (`duplicates`): Hash-based detection of exact duplicate rows and conflicting duplicates (same features, different target). Conflicting duplicates set a hard ceiling on achievable performance.
+- **Duplicate detection** (`duplicates`): Hash-based detection of exact duplicate rows and conflicting duplicates (same features, different target). Signal-only mode excludes noise columns (IV < 0.001 AND |AUC-0.5| < 0.01) before hashing — reveals duplicates hidden by random noise features (e.g., ps_calc_* in Porto Seguro). Conflicting duplicates set a hard ceiling on achievable performance.
 - **Unseen categories** (`unseen_categories`): Per-categorical count of test values not in train, with affected row percentage. Guides target encoding smoothing alpha and encoding strategy.
 - **Monotonicity detection** (`monotonicity`): Bins numeric features and computes Spearman rho on binned target rates. Features with |rho| > 0.7 flagged as monotonic — candidates for `monotone_constraints` in gradient boosting.
 - **Cardinality profiles** (`cardinality_profiles`): Top-K share, Shannon entropy, normalized entropy per categorical. Classifies distribution shape as "uniform", "moderate", or "long_tail". Long-tail categoricals need frequency encoding or rare-category binning.
@@ -168,6 +179,7 @@ preprocessing:
 - **`fold_timeout`**: Per-model in model YAML. Max seconds per CV fold — exceeding prunes the trial.
 - **`assembly`**: Per-model in model YAML. Dict with `mode` (`rank`/`nsga2`), `n_composites`, `n_generations`, `pop_size`, `diversity_metric`, `diversity_weight`. Controls how per-fold composites are built.
 - **`meta_cv_folds`**: Number of CV folds for meta-model training. Defaults to `2 × pipeline n_folds` if not set. Set explicitly for large datasets (e.g., 15 folds for 595k samples).
+- **Model execution order**: Strategy YAML `models` dict overrides pipeline YAML `models` list. Python dict preserves insertion order — the first key in strategy YAML runs first. To control execution order, reorder the strategy YAML `models` dict.
 
 ## CV and OOF Predictions
 

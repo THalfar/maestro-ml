@@ -133,7 +133,7 @@ feature_requirements:
 
 optuna:
   n_trials: 1000
-  qmc_warmup_trials: 30
+  qmc_warmup_trials: 10
   timeout: null
   pruner:
     type: median
@@ -142,7 +142,7 @@ optuna:
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold
-  fold_timeout: 120
+  fold_timeout: 300
   assembly:
     mode: nsga2                                  # diversity-optimized assembly (like RealMLP)
     n_composites: 20
