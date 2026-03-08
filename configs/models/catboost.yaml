@@ -90,7 +90,7 @@ feature_requirements:
 
 optuna:
   n_trials: 200
-  qmc_warmup_trials: 20
+  qmc_warmup_trials: 50
   timeout: null
   pruner:
     type: median

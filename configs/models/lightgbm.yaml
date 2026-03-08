@@ -68,7 +68,7 @@ training:
   seed_param: random_state
   eval_metric_param: metric
   eval_metric:
-    binary_classification: binary_logloss
+    binary_classification: auc
     regression: rmse
   needs_eval_set: true
   supports_sample_weight: true
@@ -80,7 +80,7 @@ feature_requirements:
 
 optuna:
   n_trials: 200
-  qmc_warmup_trials: 20
+  qmc_warmup_trials: 50
   timeout: null
   pruner:
     type: median

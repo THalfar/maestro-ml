@@ -460,6 +460,33 @@ class TestTrainMetaModelXgb:
         assert np.all(np.isfinite(meta_oof))
 
 
+    def test_oof_all_indices_filled(self, binary_oof_data, test_preds):
+        """Every OOF index must be filled by XGB meta-model CV — no leftover zeros."""
+        oof_list, y = binary_oof_data
+        meta_oof, _ = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42,
+            xgb_params={"n_estimators": 20, "max_depth": 2},
+        )
+        # XGBClassifier probabilities are never exactly 0.0 on non-trivial data
+        assert np.count_nonzero(meta_oof) == len(y)
+
+    def test_deterministic_with_same_seed(self, binary_oof_data, test_preds):
+        """Same seed and params must produce identical XGB meta-model results."""
+        oof_list, y = binary_oof_data
+        params = {"n_estimators": 20, "max_depth": 2, "learning_rate": 0.1}
+        oof_a, test_a = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, xgb_params=params,
+        )
+        oof_b, test_b = train_meta_model_xgb(
+            oof_list, test_preds, y,
+            n_folds=3, seed=42, xgb_params=params,
+        )
+        np.testing.assert_array_equal(oof_a, oof_b)
+        np.testing.assert_array_equal(test_a, test_b)
+
+
 class TestOptimizeMetaXgb:
     def test_returns_correct_shapes(self, binary_oof_data, test_preds):
         oof_list, y = binary_oof_data

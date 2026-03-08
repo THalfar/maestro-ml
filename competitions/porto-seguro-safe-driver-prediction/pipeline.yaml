@@ -1,0 +1,95 @@
+# =============================================================================
+# Porto Seguro Safe Driver Prediction
+# =============================================================================
+# Binary classification: predict probability of insurance claim (target 0/1)
+# Metric: Normalized Gini Coefficient (= 2*AUC - 1, so optimize AUC)
+# Data: ~595k train, ~893k test, 57 features (anonymized)
+# Feature naming: ps_ind_* (individual), ps_reg_* (registration),
+#   ps_car_* (car), ps_calc_* (calculated — likely noise)
+# Suffixes: _bin (binary), _cat (categorical), no suffix (continuous/ordinal)
+# Missing values encoded as -1 in categorical features
+# Highly imbalanced: ~3.6% positive class
+#
+# Model selection: 5 SOTA models only.
+# - CatBoost/XGBoost/LightGBM: core GBM trio, each has unique inductive bias
+# - RealMLP: neural net, structurally different from GBMs
+# - Ridge: fast linear baseline, genuine diversity (low correlation with GBMs)
+# Weak models excluded — "garbage diversity" pollutes Pareto front.
+# RF/ET excluded — too slow on 595k rows and correlate heavily with GBMs.
+#
+# 10h budget allocation (~9.5h Optuna + ~30min ensemble/retrain):
+# - GPU models get bulk of time (CatBoost 3h, XGBoost 2h30m, LightGBM 2h)
+# - RealMLP 1h30m on GPU (595k rows = large batches, converges faster)
+# - Ridge 10m (linear, converges in <100 trials)
+# =============================================================================
+
+data:
+  train_path: "competitions/porto-seguro-safe-driver-prediction/train.csv"
+  test_path: "competitions/porto-seguro-safe-driver-prediction/test.csv"
+  target_column: "target"
+  id_column: "id"
+  task_type: "binary_classification"
+
+cv:
+  n_folds: 10
+  seed: 42
+  stratified: true
+
+strategy:
+  mode: "manual"
+  api:
+    provider: "anthropic"
+    model: "claude-sonnet-4-5-20250514"
+    env_key: "ANTHROPIC_API_KEY"
+    max_tokens: 4096
+  manual:
+    eda_output_path: "competitions/porto-seguro-safe-driver-prediction/results/eda_report.txt"
+    strategy_input_path: "competitions/porto-seguro-safe-driver-prediction/strategy_output.yaml"
+
+models:
+  - catboost
+  - xgboost
+  - lightgbm
+  - realmlp
+  - ridge
+
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
+
+ensemble:
+  strategy: "nsga2"
+  nsga2_trials: 10000
+  diversity_weight: 0.3
+  diversity_metric: "spearman_neff"
+  meta_models: ["logreg", "xgboost"]
+  meta_cv_folds: 15
+  meta_trials:
+    logreg: 150
+    xgboost: 200
+
+optuna:
+  global_seed: 42
+  global_timeout: null
+  model_timeouts:
+    catboost: "3h"
+    xgboost: "2h30m"
+    lightgbm: "2h"
+    realmlp: "2h30m"
+    ridge: "10m"
+
+runtime:
+  gpu_check: true
+  gpu_fallback: true
+  n_jobs: -1
+  verbose: 2
+
+output:
+  submission_path: "competitions/porto-seguro-safe-driver-prediction/results/submission.csv"
+  results_dir: "competitions/porto-seguro-safe-driver-prediction/results/"
+  save_oof: true

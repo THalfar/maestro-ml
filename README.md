@@ -35,6 +35,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 - **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression or XGBoost, configurable) with Optuna-optimized hyperparameters and compared against the linear blend — the best wins automatically.
 - **Extra data support** — Concat original (non-synthetic) datasets with configurable sample weights. Kaggle Playground Series competitions use synthetic data — weighting the original dataset higher (e.g., 10×) gives models cleaner training signal.
 - **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
+- **LLM-driven preprocessing** — EDA detects scaling signals (skewness, outliers, sentinels, scale range ratios) and the LLM selects appropriate scalers per model. Optuna optimizes scaler choice (StandardScaler, RobustScaler, QuantileTransformer, or none) as a hyperparameter — per fold, fit on train only. Only applied to models that benefit from scaling (Ridge, KNN, SVM, etc.); tree models are left untouched.
 - **Per-fold selection for neural nets** — RealMLP uses per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
@@ -170,8 +171,11 @@ kaggle competitions submit -c playground-series-s6e2 \
 ### Layer 1: EDA Profiler (`src/eda/profiler.py`)
 
 Analyzes raw CSVs and produces a structured JSON report:
-- Per-column statistics (type detection, missing %, cardinality, distribution)
+- Per-column statistics (type detection, missing %, cardinality, distribution, range)
 - Target correlations sorted by importance
+- Skewness labels ("symmetric"/"moderate"/"high") and outlier percentages
+- Sentinel value detection (-1, -999 etc. as masked NaN)
+- Preprocessing summary: scale range ratios, high-skew/outlier/sentinel feature lists, suggested scalers
 - Feature clusters (groups of highly correlated features)
 - Weak feature identification
 - Concrete LLM-readable recommendations
@@ -203,6 +207,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - **Global mode** (default): Top configs retrained with multiple seeds for stability
 - **Per-fold mode** (RealMLP): `PerFoldTracker` keeps top-N predictions per fold during Optuna (including pruned trials). After Optuna, composites assembled via rank or NSGA-II — no retraining needed. Per-fold timeout prunes slow trials while saving completed fold predictions.
 - Automatic median imputation for models with `handles_missing: false` (RealMLP, TabM, Ridge, etc.)
+- **Scaler as Optuna parameter** for models with `needs_scaling: true` — fit per fold, LLM constrains choices from EDA
 - Sample weight support for extra data weighting
 - OOF predictions stored for ensemble
 
@@ -383,6 +388,7 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] End-to-end pipeline orchestrator
 - [x] Extra data support (original datasets with sample weights)
 - [x] Automatic NaN imputation for models that don't handle missing values
+- [x] LLM-driven preprocessing: scaler selection (Standard/Robust/Quantile) as Optuna parameter, EDA sentinel detection, skewness/outlier analysis
 - [x] Configurable meta-models (LogReg + XGBoost) with Optuna-optimized hyperparameters
 - [x] 538 tests with full coverage
 - [ ] Kaggle Playground Series validation runs

@@ -14,10 +14,14 @@ from sklearn.model_selection import StratifiedKFold
 
 from src.models.registry import ModelRegistry
 from src.models.trainer import (
+    _apply_scaler_fold,
+    _identify_scale_cols,
+    _make_scaler,
     _compute_cv_metric,
     _extract_sample_weights,
     _get_eval_metric_value,
     _reassemble_int_lists,
+    ALL_SCALER_CHOICES,
     get_top_configs,
     run_optuna_study,
     train_with_config,
@@ -1455,6 +1459,33 @@ class TestParamTypeCoverage:
             if trial.state == optuna.trial.TrialState.COMPLETE:
                 assert "C" not in trial.params
 
+    def test_optuna_overrides_do_not_leak_to_search_space(
+        self, ridge_configs_dir, binary_data, pipeline_config,
+    ):
+        """Strategy optuna overrides (n_trials, n_seeds) must NOT pollute search space."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        strategy = {
+            "overrides": {
+                "ridge": {
+                    "optuna": {"n_trials": 5, "n_top_trials": 2, "n_seeds": 1},
+                }
+            }
+        }
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+        )
+        # Should have completed 5 trials (from override), not the YAML default
+        completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        assert len(completed) == 5
+
 
 # ---------------------------------------------------------------------------
 # Fold timeout
@@ -1944,6 +1975,134 @@ class TestSampleWeightIntegration:
 # OOF bounding (n_top_trials limit on stored oof_preds)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# NaN imputation path
+# ---------------------------------------------------------------------------
+
+class TestNanImputation:
+    """Test automatic NaN imputation for models with handles_missing: false."""
+
+    @pytest.fixture
+    def nan_configs_dir(self, tmp_path: Path) -> Path:
+        """Model config with handles_missing: false."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.1, "high": 10.0, "log": True},
+            },
+            "fixed_params": {
+                "binary_classification": {"max_iter": 1000, "solver": "lbfgs"},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "eval_metric_param": None,
+                "seed_param": "random_state",
+            },
+            "feature_requirements": {
+                "needs_scaling": True,
+                "handles_missing": False,
+            },
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_optuna_study_with_nan_data(self, nan_configs_dir):
+        """run_optuna_study should impute NaN and complete without errors."""
+        rng = np.random.default_rng(42)
+        n_train = 60
+        X = rng.normal(0, 1, (n_train, 3))
+        y = (X[:, 0] + X[:, 1] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+        # Inject NaNs
+        train.loc[0, "f1"] = np.nan
+        train.loc[5, "f2"] = np.nan
+        train.loc[10, "f3"] = np.nan
+
+        registry = ModelRegistry(nan_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(nan_configs_dir.parent / "results")),
+        )
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+        # OOF predictions should be finite (no NaN propagation)
+        oof = study.best_trial.user_attrs.get("oof_preds")
+        assert oof is not None
+        assert np.all(np.isfinite(oof))
+
+    def test_train_with_config_with_nan_data(self, nan_configs_dir):
+        """train_with_config should impute NaN and produce finite predictions."""
+        from sklearn.model_selection import StratifiedKFold
+
+        rng = np.random.default_rng(42)
+        n_train, n_test = 60, 20
+        X = rng.normal(0, 1, (n_train, 3))
+        y = (X[:, 0] + X[:, 1] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+        train.loc[0, "f1"] = np.nan
+        train.loc[5, "f2"] = np.nan
+
+        X_test = rng.normal(0, 1, (n_test, 3))
+        test = pd.DataFrame(X_test, columns=["f1", "f2", "f3"])
+        test.loc[0, "f3"] = np.nan  # NaN in test too
+
+        registry = ModelRegistry(nan_configs_dir)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        results_dir = nan_configs_dir.parent / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        oof_list, test_list, labels = train_with_config(
+            model_name="ridge",
+            hparams={"C": 1.0},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+        )
+        assert len(oof_list) == 1
+        assert np.all(np.isfinite(oof_list[0]))
+        assert np.all(np.isfinite(test_list[0]))
+
+
+# ---------------------------------------------------------------------------
+# OOF bounding (n_top_trials limit on stored oof_preds)
+# ---------------------------------------------------------------------------
+
 class TestOofBounding:
     """Test that oof_preds are only stored for top-N trials to bound memory."""
 
@@ -2010,3 +2169,373 @@ class TestOofBounding:
             assert len(bottom_without_oof) >= 1 or len(completed) <= 2, (
                 "Expected at least one non-top trial to lack oof_preds"
             )
+
+
+
+# ---------------------------------------------------------------------------
+# Scaler helpers
+# ---------------------------------------------------------------------------
+
+class TestMakeScaler:
+    def test_standard(self):
+        from sklearn.preprocessing import StandardScaler
+        scaler = _make_scaler("standard")
+        assert isinstance(scaler, StandardScaler)
+
+    def test_robust(self):
+        from sklearn.preprocessing import RobustScaler
+        scaler = _make_scaler("robust")
+        assert isinstance(scaler, RobustScaler)
+
+    def test_quantile(self):
+        from sklearn.preprocessing import QuantileTransformer
+        scaler = _make_scaler("quantile")
+        assert isinstance(scaler, QuantileTransformer)
+
+    def test_none_returns_none(self):
+        assert _make_scaler("none") is None
+
+    def test_all_choices_valid(self):
+        """All entries in ALL_SCALER_CHOICES should be creatable."""
+        for choice in ALL_SCALER_CHOICES:
+            result = _make_scaler(choice)
+            if choice == "none":
+                assert result is None
+            else:
+                assert result is not None
+
+
+class TestIdentifyScaleCols:
+    def test_excludes_binary(self):
+        df = pd.DataFrame({
+            "binary": [0, 1, 0, 1, 0],
+            "continuous": [1.1, 2.2, 3.3, 4.4, 5.5],
+        })
+        cols = _identify_scale_cols(df)
+        assert "continuous" in cols
+        assert "binary" not in cols
+
+    def test_excludes_ordinal_integers(self):
+        df = pd.DataFrame({
+            "ordinal": [1, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+            "continuous": np.random.randn(10),
+        })
+        cols = _identify_scale_cols(df)
+        assert "continuous" in cols
+        assert "ordinal" not in cols
+
+    def test_includes_high_cardinality_numeric(self):
+        df = pd.DataFrame({
+            "cont": np.random.randn(100),
+        })
+        cols = _identify_scale_cols(df)
+        assert "cont" in cols
+
+    def test_excludes_string_cols(self):
+        df = pd.DataFrame({
+            "cat": ["a", "b", "c", "d", "e"],
+            "num": [1.0, 2.0, 3.0, 4.0, 5.0],
+        })
+        cols = _identify_scale_cols(df)
+        assert "cat" not in cols
+
+
+class TestApplyScalerFold:
+    def test_none_returns_unchanged(self):
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        out_train, out_val, out_test = _apply_scaler_fold(
+            "none", df, df, df, ["a"]
+        )
+        pd.testing.assert_frame_equal(out_train, df)
+
+    def test_standard_scaler_transforms(self):
+        rng = np.random.default_rng(42)
+        X_train = pd.DataFrame({"a": rng.normal(100, 10, 50)})
+        X_val = pd.DataFrame({"a": rng.normal(100, 10, 10)})
+        out_train, out_val, _ = _apply_scaler_fold(
+            "standard", X_train, X_val, None, ["a"]
+        )
+        assert abs(out_train["a"].mean()) < 0.5
+        assert abs(out_train["a"].std() - 1.0) < 0.5
+
+    def test_does_not_mutate_input(self):
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        original = df.copy()
+        _apply_scaler_fold("standard", df, df.copy(), None, ["a"])
+        pd.testing.assert_frame_equal(df, original)
+
+    def test_robust_scaler(self):
+        rng = np.random.default_rng(42)
+        X_train = pd.DataFrame({"a": rng.normal(50, 5, 50)})
+        X_val = pd.DataFrame({"a": rng.normal(50, 5, 10)})
+        out_train, out_val, _ = _apply_scaler_fold(
+            "robust", X_train, X_val, None, ["a"]
+        )
+        assert abs(out_train["a"].median()) < 0.3
+
+    def test_quantile_scaler(self):
+        rng = np.random.default_rng(42)
+        X_train = pd.DataFrame({"a": rng.exponential(1, 100)})
+        X_val = pd.DataFrame({"a": rng.exponential(1, 20)})
+        out_train, out_val, _ = _apply_scaler_fold(
+            "quantile", X_train, X_val, None, ["a"]
+        )
+        assert abs(out_train["a"].mean()) < 0.5
+
+    def test_empty_scale_cols_unchanged(self):
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        out_train, out_val, out_test = _apply_scaler_fold(
+            "standard", df, df, df, []
+        )
+        pd.testing.assert_frame_equal(out_train, df)
+
+    def test_test_gets_transformed(self):
+        rng = np.random.default_rng(42)
+        X_train = pd.DataFrame({"a": rng.normal(100, 10, 50)})
+        X_val = pd.DataFrame({"a": rng.normal(100, 10, 10)})
+        X_test = pd.DataFrame({"a": rng.normal(100, 10, 20)})
+        _, _, out_test = _apply_scaler_fold(
+            "standard", X_train, X_val, X_test, ["a"]
+        )
+        assert abs(out_test["a"].mean()) < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Scaler integration with Optuna
+# ---------------------------------------------------------------------------
+
+class TestScalerOptuna:
+    """Integration tests: scaler as Optuna parameter in run_optuna_study."""
+
+    @pytest.fixture
+    def ridge_configs_dir_scaling(self, tmp_path: Path) -> Path:
+        """Ridge config with needs_scaling: true."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+                "regression": "sklearn.linear_model.Ridge",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
+            },
+            "fixed_params": {
+                "binary_classification": {"max_iter": 1000, "solver": "lbfgs"},
+                "regression": {"max_iter": 1000},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "early_stopping": False,
+                "eval_metric_param": None,
+            },
+            "feature_requirements": {"needs_scaling": True, "handles_missing": True},
+            "optuna": {
+                "n_trials": 5,
+                "qmc_warmup_trials": 2,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(yaml.dump(cfg), encoding="utf-8")
+        return configs_dir
+
+    @pytest.fixture
+    def scaling_pipeline(self, tmp_path: Path) -> PipelineConfig:
+        return PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+
+    @pytest.fixture
+    def scaling_binary_data(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        rng = np.random.default_rng(42)
+        n_train, n_test = 80, 20
+        X = rng.normal(0, 1, (n_train, 3))
+        y = (X[:, 0] + X[:, 1] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+        test = pd.DataFrame(
+            rng.normal(0, 1, (n_test, 3)), columns=["f1", "f2", "f3"]
+        )
+        return train, test
+
+    def test_scaler_in_trial_params(
+        self, ridge_configs_dir_scaling, scaling_binary_data, scaling_pipeline
+    ):
+        """Optuna should include scaler in trial params for needs_scaling models."""
+        train, test = scaling_binary_data
+        registry = ModelRegistry(ridge_configs_dir_scaling)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=scaling_pipeline,
+            strategy={},
+            gpu=False,
+        )
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        assert len(completed) >= 1
+        assert "scaler" in completed[0].params
+
+    def test_strategy_constrains_scaler_choices(
+        self, ridge_configs_dir_scaling, scaling_binary_data, scaling_pipeline
+    ):
+        """Strategy preprocessing.scaler_choices should constrain scaler options."""
+        train, test = scaling_binary_data
+        registry = ModelRegistry(ridge_configs_dir_scaling)
+        strategy = {
+            "preprocessing": {
+                "scaler_choices": ["robust"],
+            }
+        }
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=scaling_pipeline,
+            strategy=strategy,
+            gpu=False,
+        )
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        for t in completed:
+            assert t.params["scaler"] in ("robust", "none")
+
+    def test_train_with_config_uses_scaler(
+        self, ridge_configs_dir_scaling, scaling_binary_data, scaling_pipeline
+    ):
+        """train_with_config should apply scaler from hparams."""
+        train, test = scaling_binary_data
+        registry = ModelRegistry(ridge_configs_dir_scaling)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        results_dir = Path(scaling_pipeline.output.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        oof_list, test_list, labels = train_with_config(
+            model_name="ridge",
+            hparams={"C": 1.0, "scaler": "standard"},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv,
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            seeds=[42],
+            results_dir=results_dir,
+        )
+        assert len(oof_list) == 1
+        assert len(test_list) == 1
+        assert np.all(np.isfinite(oof_list[0]))
+        assert np.all(np.isfinite(test_list[0]))
+
+    def test_no_scaler_for_tree_models(self, tmp_path: Path):
+        """Models with needs_scaling=false should not get scaler param."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        rf_cfg = {
+            "name": "RandomForest",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "n_estimators": {"type": "int", "low": 10, "high": 20},
+            },
+            "fixed_params": {"random_state": 42, "n_jobs": 1},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {"needs_scaling": False, "handles_missing": True},
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "pruner": {"type": "none"},
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "random_forest.yaml").write_text(
+            yaml.dump(rf_cfg), encoding="utf-8"
+        )
+        registry = ModelRegistry(configs_dir)
+
+        rng = np.random.default_rng(42)
+        n = 60
+        X = rng.normal(0, 1, (n, 3))
+        y = (X[:, 0] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+
+        pipeline = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["random_forest"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+        study, _ = run_optuna_study(
+            model_name="random_forest",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline,
+            strategy={},
+            gpu=False,
+        )
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        assert len(completed) >= 1
+        assert "scaler" not in completed[0].params
+
+    def test_strategy_per_model_override(
+        self, ridge_configs_dir_scaling, scaling_binary_data, scaling_pipeline
+    ):
+        """Strategy per_model.needs_scaling override should work."""
+        train, test = scaling_binary_data
+        registry = ModelRegistry(ridge_configs_dir_scaling)
+        strategy = {
+            "preprocessing": {
+                "per_model": {
+                    "ridge": {"needs_scaling": False}
+                }
+            }
+        }
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=scaling_pipeline,
+            strategy=strategy,
+            gpu=False,
+        )
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        for t in completed:
+            assert "scaler" not in t.params

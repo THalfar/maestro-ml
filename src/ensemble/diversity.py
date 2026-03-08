@@ -160,6 +160,7 @@ def compute_spearman_error_correlation_matrix(
 def compute_ambiguity(
     oof_list: list[np.ndarray],
     weights: np.ndarray,
+    y_true: np.ndarray | None = None,
 ) -> float:
     """Compute weighted ambiguity (ensemble disagreement).
 
@@ -174,9 +175,17 @@ def compute_ambiguity(
     measures "how much does averaging these models reduce error?" It is
     the quantity you want to maximize in an ensemble.
 
+    When ``y_true`` is provided, the raw ambiguity is normalized by the
+    target variance: ``ambiguity / var(y_true)``.  This makes the metric
+    scale-invariant — without normalization, regression targets with large
+    values (e.g. house prices ~100k–800k) produce enormous ambiguity
+    numbers that are not comparable to N_eff or to classification ambiguity.
+
     Args:
         oof_list: List of OOF prediction arrays.
         weights: Normalized weight vector (same length as oof_list, sum=1).
+        y_true: True target values. When provided, ambiguity is normalized
+                by var(y_true) for scale invariance.
 
     Returns:
         Ambiguity value (float >= 0). Higher = more diverse = better.
@@ -188,7 +197,15 @@ def compute_ambiguity(
         w * float(np.mean((oof - f_bar) ** 2))
         for w, oof in zip(weights, oof_list)
     )
-    return float(ambiguity)
+    ambiguity = float(ambiguity)
+
+    # Normalize by target variance for scale invariance (regression)
+    if y_true is not None:
+        target_var = float(np.var(y_true))
+        if target_var > 0:
+            ambiguity = ambiguity / target_var
+
+    return ambiguity
 
 
 def _compute_diversity(
@@ -220,7 +237,7 @@ def _compute_diversity(
         corr = compute_spearman_error_correlation_matrix(oof_list, y_true)
         return effective_ensemble_size(corr)
     elif diversity_metric == "ambiguity":
-        return compute_ambiguity(oof_list, weights)
+        return compute_ambiguity(oof_list, weights, y_true=y_true)
     else:
         raise ValueError(
             f"Unknown diversity_metric '{diversity_metric}'. "

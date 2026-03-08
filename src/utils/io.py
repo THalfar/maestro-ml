@@ -61,6 +61,7 @@ class EnsembleConfig:
     nsga2_trials: int = 300
     diversity_weight: float | list[float] = 0.3
     diversity_metric: str = "pearson_neff"
+    meta_cv_folds: int | None = None
 
     def get_meta_trials(self, meta_model: str) -> int:
         """Get Optuna trial count for a specific meta-model.
@@ -319,11 +320,12 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     ensemble = EnsembleConfig(
         strategy=ensemble_raw.get("strategy", "auto"),
         blend_trials=ensemble_raw.get("blend_trials", 500),
-        meta_models=ensemble_raw.get("meta_models", ["logreg"]),
+        meta_models=ensemble_raw.get("meta_models", ["logreg"]) or ["logreg"],
         meta_trials=meta_trials,
         nsga2_trials=ensemble_raw.get("nsga2_trials", 300),
         diversity_weight=ensemble_raw.get("diversity_weight", 0.3),
         diversity_metric=ensemble_raw.get("diversity_metric", "pearson_neff"),
+        meta_cv_folds=ensemble_raw.get("meta_cv_folds", None),
     )
 
     raw_timeouts = optuna_raw.get("model_timeouts", {}) or {}

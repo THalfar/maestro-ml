@@ -138,6 +138,13 @@ class TestLoadYaml:
         result = load_yaml(str(path))
         assert result == {"a": 1}
 
+    def test_invalid_yaml_raises(self, tmp_dir: Path):
+        """Malformed YAML should raise yaml.YAMLError."""
+        path = tmp_dir / "bad.yaml"
+        path.write_text("key: [unclosed\n", encoding="utf-8")
+        with pytest.raises(yaml.YAMLError):
+            load_yaml(path)
+
 
 # ---------------------------------------------------------------------------
 # load_pipeline_config
@@ -535,12 +542,44 @@ class TestPipelineConfigExtended:
         cfg = load_pipeline_config(path)
         assert cfg.ensemble.diversity_weight == [0.3, 0.4, 0.5]
 
+    def test_meta_cv_folds_explicit(self, tmp_dir: Path):
+        """meta_cv_folds set explicitly should be parsed as int."""
+        content = {
+            "data": {"train_path": "t.csv"},
+            "ensemble": {"meta_cv_folds": 15},
+        }
+        path = tmp_dir / "mcf.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.meta_cv_folds == 15
+
+    def test_meta_cv_folds_default_none(self, tmp_dir: Path):
+        """Missing meta_cv_folds should default to None."""
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "mcf_def.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.ensemble.meta_cv_folds is None
+
     def test_null_models_handled(self, tmp_dir: Path):
         """models: null should produce empty list, not None."""
         path = tmp_dir / "null_models.yaml"
         path.write_text("data:\n  train_path: t.csv\nmodels: null\n", encoding="utf-8")
         cfg = load_pipeline_config(path)
         assert cfg.models == []
+
+    def test_null_meta_models_defaults_to_logreg(self, tmp_dir: Path):
+        """meta_models: null should default to ['logreg'], not None."""
+        content = {
+            "data": {"train_path": "t.csv"},
+            "ensemble": {"meta_models": None},
+        }
+        path = tmp_dir / "null_meta.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        # BUG: currently returns None instead of ["logreg"]
+        # because .get() returns None when key exists with null value
+        assert cfg.ensemble.meta_models == ["logreg"]
 
     def test_extra_data_list_of_dicts(self, tmp_dir: Path):
         """extra_data as list of dicts should be parsed correctly."""
@@ -631,6 +670,16 @@ class TestSaveSubmissionEdgeCases:
         save_submission(ids, preds, "target", path)
         df = pd.read_csv(path)
         assert "id" in df.columns
+
+    def test_empty_arrays(self, tmp_dir: Path):
+        """Empty arrays should produce a CSV with headers only."""
+        ids = np.array([])
+        preds = np.array([])
+        path = tmp_dir / "empty_sub.csv"
+        save_submission(ids, preds, "target", path)
+        df = pd.read_csv(path)
+        assert len(df) == 0
+        assert "target" in df.columns
 
 
 # ---------------------------------------------------------------------------

@@ -208,6 +208,9 @@ def _concat_extra_data(
     return result
 
 
+_META_XGB_MIN_SAMPLES = 5000
+
+
 def _score_fn(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
     """Compute score (higher is better) for ensemble comparison."""
     if metric == "roc_auc":
@@ -334,6 +337,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
         target_col=pipeline_config.target_column,
         id_col=pipeline_config.id_column or None,
         target_mapping=pipeline_config.target_mapping,
+        task_type=pipeline_config.task_type,
     )
     eda_path = results_dir / "eda_report.json"
     save_eda_report(eda_report, eda_path)
@@ -412,6 +416,15 @@ def main(pipeline_yaml_path: str | Path) -> None:
         cv_folds = KFold(
             n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed
         )
+
+    # Drop columns specified in strategy (e.g., noise features like ps_calc_*)
+    strategy_drop = strategy.get("drop_columns", []) or []
+    if strategy_drop:
+        existing_drop = [c for c in strategy_drop if c in train.columns]
+        if existing_drop:
+            train = train.drop(columns=existing_drop)
+            test = test.drop(columns=[c for c in existing_drop if c in test.columns])
+            logger.info(f"Dropped {len(existing_drop)} features from strategy: {existing_drop[:5]}{'...' if len(existing_drop) > 5 else ''}")
 
     # Strip metadata columns before feature engineering (they are not
     # real features and _is_original can become object dtype after concat,
@@ -513,11 +526,18 @@ def main(pipeline_yaml_path: str | Path) -> None:
         final_test_preds = rank_average(all_test)
 
     elif ensemble_strategy == "meta":
-        meta_n_folds = 2 * cv_cfg.n_folds
+        meta_n_folds = ensemble_cfg.meta_cv_folds or 2 * cv_cfg.n_folds
         best_meta_score = -np.inf
         final_oof = None
         final_test_preds = None
-        for meta_name in ensemble_cfg.meta_models:
+        meta_models_meta = ensemble_cfg.meta_models
+        if len(y_true) < _META_XGB_MIN_SAMPLES and "xgboost" in meta_models_meta:
+            logger.info(
+                f"  Auto-disabling meta-xgboost: {len(y_true)} samples "
+                f"< {_META_XGB_MIN_SAMPLES} minimum (overfitting risk)"
+            )
+            meta_models_meta = [m for m in meta_models_meta if m != "xgboost"]
+        for meta_name in meta_models_meta:
             n_trials_for = ensemble_cfg.get_meta_trials(meta_name)
             try:
                 if meta_name == "logreg":
@@ -531,6 +551,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
                         all_oof, all_test, y_true,
                         n_folds=meta_n_folds, seed=seed, task_type=task_type,
                         metric=metric, n_trials=n_trials_for,
+                        gpu=gpu_status.get("xgboost", False),
                     )
                 else:
                     continue
@@ -577,8 +598,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
         )
 
         # Chain: train meta-models on NSGA-II selected models
-        # Meta-models use 2× pipeline folds for finer-grained OOF
-        meta_n_folds = 2 * cv_cfg.n_folds
+        meta_n_folds = ensemble_cfg.meta_cv_folds or 2 * cv_cfg.n_folds
         sel_oof = [all_oof[i] for i in sel]
         sel_test = [all_test[i] for i in sel]
         sel_labels = [model_labels[i] for i in sel]
@@ -591,8 +611,14 @@ def main(pipeline_yaml_path: str | Path) -> None:
         best_meta_name = "blend"
         logger.info(f"  NSGA-II linear blend: {metric}={blend_score:.6f}")
 
-        # Try each configured meta-model
+        # Try each configured meta-model (auto-disable xgboost on small data)
         meta_models = ensemble_cfg.meta_models
+        if len(y_true) < _META_XGB_MIN_SAMPLES and "xgboost" in meta_models:
+            logger.info(
+                f"  Auto-disabling meta-xgboost: {len(y_true)} samples "
+                f"< {_META_XGB_MIN_SAMPLES} minimum (overfitting risk)"
+            )
+            meta_models = [m for m in meta_models if m != "xgboost"]
         n_meta_features = len(sel_oof)
         logger.info(
             f"Meta-model stage: {len(meta_models)} meta-model(s) "
@@ -626,6 +652,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
                         sel_oof, sel_test, y_true,
                         n_folds=meta_n_folds, seed=seed, task_type=task_type,
                         metric=metric, n_trials=n_trials_for,
+                        gpu=gpu_status.get("xgboost", False),
                     )
                     m_score = _score_fn(y_true, m_oof, metric)
                     meta_elapsed = time.time() - meta_start
@@ -697,8 +724,15 @@ def main(pipeline_yaml_path: str | Path) -> None:
         candidates["blend"] = (apply_blend(all_oof, weights), apply_blend(all_test, weights))
         candidates["rank"] = (rank_average(all_oof), rank_average(all_test))
 
-        auto_meta_folds = 2 * cv_cfg.n_folds
-        for meta_name in ensemble_cfg.meta_models:
+        auto_meta_folds = ensemble_cfg.meta_cv_folds or 2 * cv_cfg.n_folds
+        auto_meta_models = ensemble_cfg.meta_models
+        if len(y_true) < _META_XGB_MIN_SAMPLES and "xgboost" in auto_meta_models:
+            logger.info(
+                f"  Auto-disabling meta-xgboost: {len(y_true)} samples "
+                f"< {_META_XGB_MIN_SAMPLES} minimum (overfitting risk)"
+            )
+            auto_meta_models = [m for m in auto_meta_models if m != "xgboost"]
+        for meta_name in auto_meta_models:
             n_trials_for = ensemble_cfg.get_meta_trials(meta_name)
             try:
                 if meta_name == "logreg":
@@ -712,6 +746,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
                         all_oof, all_test, y_true,
                         n_folds=auto_meta_folds, seed=seed, task_type=task_type,
                         metric=metric, n_trials=n_trials_for,
+                        gpu=gpu_status.get("xgboost", False),
                     )
                 else:
                     continue

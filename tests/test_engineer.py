@@ -9,6 +9,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from src.features.engineer import (
     _add_custom_features,
     _add_interactions,
+    _add_log_transforms,
     _add_ratios,
     _add_target_encoding,
     build_features,
@@ -238,6 +239,45 @@ class TestAddTargetEncoding:
         expected_test = (n * global_mean + 15.0 * global_mean) / (n + 15.0)
         np.testing.assert_allclose(test_enc["cat_te"].values[0], expected_test, atol=0.01)
 
+    def test_oof_leakage_adversarial(self):
+        """Strong leakage test: fold 0 val rows have target=1.0, other folds 0.0.
+
+        If OOF encoding leaks the val fold's own target, fold 0's val rows
+        would be encoded near 1.0. Correct OOF should encode them near 0.0
+        (using only the other folds' targets).
+        """
+        # Use KFold with shuffle=False so we know exactly which rows are in fold 0
+        kf = KFold(n_splits=3, shuffle=False)
+        n = 90  # 30 per fold
+        target = np.zeros(n)
+        target[:30] = 1.0  # Fold 0's val rows all have target=1.0
+        train = pd.DataFrame({
+            "cat": ["X"] * n,
+            "target": target,
+        })
+        test = pd.DataFrame({"cat": ["X"]})
+
+        train_enc, _ = _add_target_encoding(
+            train=train, test=test,
+            columns=["cat"], pairs=[],
+            cv_folds=kf,
+            target_col="target", alpha=0.01,  # near-zero alpha: encoding ≈ raw mean
+        )
+        # Fold 0 val rows (indices 0-29) should be encoded using folds 1+2 stats.
+        # Folds 1+2 have target=0.0 for all rows. So encoding should be near 0.0.
+        fold0_val_encoding = train_enc["cat_te"].iloc[:30].mean()
+        assert fold0_val_encoding < 0.1, (
+            f"Fold 0 val encoding = {fold0_val_encoding:.3f}, expected near 0.0. "
+            "Leakage: val fold's own target data is being used."
+        )
+        # Folds 1+2 val rows (indices 30-89) should be encoded using other folds.
+        # Fold 1 val (30-59): train folds are 0+2, target mean = 30/60 = 0.5
+        # Fold 2 val (60-89): train folds are 0+1, target mean = 30/60 = 0.5
+        other_folds_encoding = train_enc["cat_te"].iloc[30:].mean()
+        assert 0.4 < other_folds_encoding < 0.6, (
+            f"Other folds encoding = {other_folds_encoding:.3f}, expected near 0.5."
+        )
+
     def test_works_with_kfold_regression(self):
         """Target encoding must work with KFold (regression), not only StratifiedKFold."""
         rng = np.random.default_rng(7)
@@ -311,6 +351,46 @@ class TestAddTargetEncoding:
         assert not np.allclose(
             train_enc["cat_x_te"].values, train_enc["cat_x_cat_y_te"].values
         ), "Pair TE should differ from single-column TE"
+
+
+# ---------------------------------------------------------------------------
+# _add_log_transforms
+# ---------------------------------------------------------------------------
+
+class TestAddLogTransforms:
+    def test_creates_log_column(self, train_df: pd.DataFrame):
+        result = _add_log_transforms(train_df, ["num_b"])
+        assert "num_b_log" in result.columns
+        expected = np.sign(train_df["num_b"]) * np.log1p(np.abs(train_df["num_b"]))
+        np.testing.assert_array_almost_equal(result["num_b_log"], expected)
+
+    def test_handles_negative_values(self):
+        df = pd.DataFrame({"x": [-5.0, -1.0, 0.0, 1.0, 5.0]})
+        result = _add_log_transforms(df, ["x"])
+        assert "x_log" in result.columns
+        # sign-preserving: sign(x) * log1p(|x|)
+        expected = np.sign(df["x"]) * np.log1p(np.abs(df["x"]))
+        np.testing.assert_array_almost_equal(result["x_log"], expected)
+        # Negative input → negative output
+        assert result["x_log"].iloc[0] < 0
+
+    def test_missing_column_skipped(self, train_df: pd.DataFrame):
+        result = _add_log_transforms(train_df, ["nonexistent"])
+        assert "nonexistent_log" not in result.columns
+
+    def test_non_numeric_skipped(self, train_df: pd.DataFrame):
+        result = _add_log_transforms(train_df, ["cat_x"])
+        assert "cat_x_log" not in result.columns
+
+    def test_does_not_mutate_input(self, train_df: pd.DataFrame):
+        original_cols = list(train_df.columns)
+        _add_log_transforms(train_df, ["num_a"])
+        assert list(train_df.columns) == original_cols
+
+    def test_multiple_columns(self, train_df: pd.DataFrame):
+        result = _add_log_transforms(train_df, ["num_a", "num_b"])
+        assert "num_a_log" in result.columns
+        assert "num_b_log" in result.columns
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +669,16 @@ class TestBuildFeatures:
         assert train_out["cat"].iloc[0] == train_out["cat"].iloc[5]
 
 
+    def test_log_transforms_in_build_features(
+        self, train_df: pd.DataFrame, test_df: pd.DataFrame
+    ):
+        """build_features should apply log_transforms and create _log columns."""
+        strategy = {"features": {"log_transforms": ["num_b"]}}
+        train_out, test_out = build_features(train_df, test_df, strategy, target_col="target")
+        assert "num_b_log" in train_out.columns
+        assert "num_b_log" in test_out.columns
+
+
 # ---------------------------------------------------------------------------
 # get_feature_columns
 # ---------------------------------------------------------------------------
@@ -600,6 +690,7 @@ class TestGetFeatureColumns:
                 "interactions": [["a", "b"]],
                 "ratios": [["c", "d"]],
                 "target_encoding": {"columns": ["cat"], "pairs": [["cat", "bin"]]},
+                "log_transforms": ["a", "c"],
                 "custom": [{"name": "custom1", "formula": "a+b"}],
             }
         }
@@ -609,6 +700,8 @@ class TestGetFeatureColumns:
         assert "c__div__d" in cols
         assert "cat_te" in cols
         assert "cat_bin_te" in cols
+        assert "a_log" in cols
+        assert "c_log" in cols
         assert "custom1" in cols
         assert "target" not in cols
         assert "id" not in cols

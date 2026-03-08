@@ -253,7 +253,7 @@ class ModelRegistry:
             raise KeyError(f"Model '{name}' not registered.")
 
         optuna_cfg = self._configs[name].optuna
-        return {
+        return copy.deepcopy({
             "n_trials": optuna_cfg.n_trials,
             "qmc_warmup_trials": optuna_cfg.qmc_warmup_trials,
             "timeout": optuna_cfg.timeout,
@@ -263,7 +263,7 @@ class ModelRegistry:
             "selection_mode": optuna_cfg.selection_mode,
             "fold_timeout": optuna_cfg.fold_timeout,
             "assembly": optuna_cfg.assembly,
-        }
+        })
 
     def get_training_config(self, name: str) -> dict[str, Any]:
         """Get the training configuration dict for a model.

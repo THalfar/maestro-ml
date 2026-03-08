@@ -4,6 +4,7 @@
 # Regression: predict SalePrice (log1p-transformed → RMSLE metric)
 # Dataset: 1460 train / 1459 test, 79 features (numeric + categorical)
 # Evaluation: RMSLE (Root Mean Squared Log Error)
+# Target: ~10h overnight run
 # =============================================================================
 
 data:
@@ -20,7 +21,7 @@ cv:
   stratified: false                  # KFold regression
 
 strategy:
-  mode: "api"
+  mode: "manual"
   api:
     provider: "anthropic"
     model: "claude-sonnet-4-6"
@@ -39,31 +40,34 @@ models:
   - random_forest
   - extra_trees
 
-features:
-  interactions: []
-  ratios: []
-  target_encoding:
-    columns: []
-    pairs: []
-    alpha: 15
-  custom: []
+# Features defined in strategy_output.yaml (strategy overrides these)
+features: {}
 
 ensemble:
   strategy: "nsga2"
-  nsga2_trials: 15000
-  diversity_weight: [0.3, 0.4, 0.5]
+  blend_trials: 500
+  nsga2_trials: 15000  
+  diversity_metric: "pearson_neff"
+  meta_models:
+    - xgboost
+    - logreg
+  meta_trials:
+    xgboost: 100
+    logreg: 100              # pieni data → nopea, 100 riittää
+  diversity_weight: 0.3
+  
 
 optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    catboost: "45m"       # GPU boosting — paras single model
-    xgboost: "30m"        # GPU boosting
-    lightgbm: "30m"       # CPU, hyvin optimoitu
-    ridge: "5m"           # lineaarinen, konvergoi nopeasti
-    elastic_net: "5m"     # lineaarinen
-    random_forest: "20m"  # hidas sklearn, riittää ~100 trialia
-    extra_trees: "15m"    # nopeampi kuin RF
+    catboost: "2h30m"        # GPU boosting — paras single model, n=1460 → nopeat foldit
+    xgboost: "2h"            # GPU boosting
+    lightgbm: "1h30m"        # CPU, hyvin optimoitu
+    ridge: "10m"             # lineaarinen, konvergoi nopeasti
+    elastic_net: "10m"       # lineaarinen
+    random_forest: "1h"      # pieni data → voidaan ajaa paljon trialeita
+    extra_trees: "45m"       # nopeampi kuin RF
 
 runtime:
   gpu_check: true

@@ -24,6 +24,8 @@ from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score, mean_squared_error
 from sklearn.model_selection import StratifiedKFold, KFold
 
+from sklearn.preprocessing import StandardScaler, RobustScaler, QuantileTransformer
+
 from src.models.registry import ModelRegistry
 from src.utils.io import PipelineConfig
 
@@ -44,6 +46,97 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # Suppress pytorch_lightning "LOCAL_RANK" spam from RealMLP
 logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.WARNING)
+
+# All supported scaler types for Optuna search
+ALL_SCALER_CHOICES: list[str] = ["none", "standard", "robust", "quantile"]
+
+
+def _make_scaler(scaler_type: str) -> StandardScaler | RobustScaler | QuantileTransformer | None:
+    """Create a scaler instance from a type string.
+
+    Args:
+        scaler_type: One of "none", "standard", "robust", "quantile".
+
+    Returns:
+        A fitted-ready scaler instance, or None for "none".
+    """
+    if scaler_type == "standard":
+        return StandardScaler()
+    elif scaler_type == "robust":
+        return RobustScaler()
+    elif scaler_type == "quantile":
+        return QuantileTransformer(output_distribution="normal", random_state=42)
+    return None
+
+
+def _identify_scale_cols(X: pd.DataFrame) -> list[str]:
+    """Identify columns suitable for scaling: numeric continuous only.
+
+    Excludes binary columns (0/1) and low-cardinality ordinal-like columns
+    (integers with <= 20 unique values). These don't benefit from scaling.
+
+    Args:
+        X: Feature DataFrame.
+
+    Returns:
+        List of column names to apply scaling to.
+    """
+    scale_cols = []
+    for col in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[col]):
+            continue
+        nunique = X[col].nunique(dropna=True)
+        if nunique <= 2:
+            continue  # binary
+        if nunique <= 20:
+            non_null = X[col].dropna()
+            if len(non_null) > 0 and (non_null == non_null.round()).all():
+                continue  # ordinal integer
+        scale_cols.append(col)
+    return scale_cols
+
+
+def _apply_scaler_fold(
+    scaler_type: str,
+    X_train: pd.DataFrame,
+    X_val: pd.DataFrame,
+    X_test: pd.DataFrame | None,
+    scale_cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Fit a scaler on X_train[scale_cols] and transform train/val/test.
+
+    Returns new DataFrames (no mutation). If scaler_type is "none" or
+    scale_cols is empty, returns inputs unchanged.
+
+    Args:
+        scaler_type: Scaler type string.
+        X_train: Training features for this fold.
+        X_val: Validation features for this fold.
+        X_test: Test features (may be None).
+        scale_cols: Columns to scale.
+
+    Returns:
+        Tuple of (X_train_scaled, X_val_scaled, X_test_scaled).
+    """
+    if scaler_type == "none" or not scale_cols:
+        return X_train, X_val, X_test
+    # Filter to cols that actually exist
+    cols = [c for c in scale_cols if c in X_train.columns]
+    if not cols:
+        return X_train, X_val, X_test
+
+    scaler = _make_scaler(scaler_type)
+    if scaler is None:
+        return X_train, X_val, X_test
+
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    X_train[cols] = scaler.fit_transform(X_train[cols])
+    X_val[cols] = scaler.transform(X_val[cols])
+    if X_test is not None:
+        X_test = X_test.copy()
+        X_test[cols] = scaler.transform(X_test[cols])
+    return X_train, X_val, X_test
 
 
 def _greedy_pareto_select(
@@ -641,8 +734,24 @@ def run_optuna_study(
 
     # Search space with optional LLM overrides
     overrides_all = strategy.get("overrides", {}) or {}
-    model_overrides = overrides_all.get(model_name, None)
-    search_space = registry.get_search_space(model_name, overrides=model_overrides, task_type=task_type)
+    # Copy so that .pop() calls below don't mutate the caller's strategy dict.
+    model_overrides_raw = dict(overrides_all.get(model_name, None) or {})
+
+    # Separate optuna config overrides (n_trials, n_top_trials, n_seeds, etc.)
+    # from hyperparameter overrides (depth, learning_rate, etc.)
+    optuna_overrides = model_overrides_raw.pop("optuna", None)
+    if optuna_overrides:
+        optuna_cfg.update(optuna_overrides)
+
+    # Separate hyperparameters key if present (explicit hyperparameter overrides)
+    hp_overrides = model_overrides_raw.pop("hyperparameters", None)
+    # Remaining keys are treated as hyperparameter overrides too
+    if hp_overrides:
+        model_overrides_raw.update(hp_overrides)
+
+    search_space = registry.get_search_space(
+        model_name, overrides=model_overrides_raw or None, task_type=task_type,
+    )
     if cv_cfg.stratified and task_type != "regression":
         cv = StratifiedKFold(n_splits=cv_cfg.n_folds, shuffle=True, random_state=cv_cfg.seed)
     else:
@@ -674,6 +783,27 @@ def run_optuna_study(
 
     fold_timeout = optuna_cfg.get("fold_timeout")
 
+    # Determine scaler choices for this model (None = no scaling)
+    feat_reqs = registry.get_feature_requirements(model_name)
+    needs_scaling = feat_reqs.get("needs_scaling", False)
+
+    # Strategy can override needs_scaling per model and constrain scaler choices
+    preprocessing = strategy.get("preprocessing", {}) or {}
+    per_model_preproc = preprocessing.get("per_model", {}) or {}
+    model_preproc = per_model_preproc.get(model_name, {}) or {}
+    # Strategy can force scaling on/off per model
+    if "needs_scaling" in model_preproc:
+        needs_scaling = bool(model_preproc["needs_scaling"])
+
+    scaler_choices: list[str] | None = None
+    if needs_scaling:
+        # Default: all scalers. Strategy can narrow to a subset.
+        scaler_choices = model_preproc.get("scaler_choices") or preprocessing.get("scaler_choices") or list(ALL_SCALER_CHOICES)
+        # Ensure "none" is always an option so Optuna can decide
+        if "none" not in scaler_choices:
+            scaler_choices = ["none"] + list(scaler_choices)
+        logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
+
     objective = _create_objective(
         model_name=model_name,
         train=train,
@@ -689,6 +819,7 @@ def run_optuna_study(
         per_fold_tracker=tracker,
         fold_timeout=fold_timeout,
         n_top_trials=optuna_cfg["n_top_trials"],
+        scaler_choices=scaler_choices,
     )
 
     # Configure pruner
@@ -754,6 +885,7 @@ def _create_objective(
     per_fold_tracker: PerFoldTracker | None = None,
     fold_timeout: int | None = None,
     n_top_trials: int = 5,
+    scaler_choices: list[str] | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Create an Optuna objective function for a model.
 
@@ -822,15 +954,21 @@ def _create_objective(
     X_test = test[feature_cols] if test is not None else None
 
     # Impute NaN for models that don't handle missing values (e.g. RealMLP, TabM).
-    # Fit median on train, apply to both train and test.
+    # Fitted per fold (on train fold only) to avoid leakage into the validation set.
     feat_reqs = registry.get_feature_requirements(model_name)
-    if not feat_reqs.get("handles_missing", False) and X.isna().any().any():
+    has_nan_in_train = X.isna().any().any()
+    has_nan_in_test = X_test is not None and X_test.isna().any().any()
+    needs_imputation = not feat_reqs.get("handles_missing", False) and (has_nan_in_train or has_nan_in_test)
+    if needs_imputation:
         from sklearn.impute import SimpleImputer
-        imputer = SimpleImputer(strategy="median")
-        X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns, index=X.index)
-        if X_test is not None:
-            X_test = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns, index=X_test.index)
-        logger.info(f"Imputed NaN values (median) for {model_name}")
+        nan_cols = [
+            c for c in X.columns
+            if X[c].isna().any() or (X_test is not None and X_test[c].isna().any())
+        ]
+        logger.info(f"Will impute NaN values per-fold (median) for {model_name}")
+
+    # Identify columns to scale (computed once, reused by all trials)
+    scale_cols = _identify_scale_cols(X) if scaler_choices else []
 
     training_cfg = registry.get_training_config(model_name)
     sample_weights = _extract_sample_weights(train, training_cfg)
@@ -849,6 +987,12 @@ def _create_objective(
     )
 
     def objective(trial: optuna.Trial) -> float:
+        # Scaler selection (Optuna parameter when model needs scaling)
+        if scaler_choices and scale_cols:
+            scaler_type = trial.suggest_categorical("scaler", scaler_choices)
+        else:
+            scaler_type = "none"
+
         # Sample hyperparameters
         hparams: dict[str, Any] = {}
         for param_name, spec in search_space.items():
@@ -935,10 +1079,31 @@ def _create_objective(
         else:
             oof = np.zeros(len(X))
 
+        # Per-fold test reference for scaler transform (avoid mutating shared X_test)
+        X_test_base = X_test
+
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y[train_idx], y[val_idx]
             fold_weights = sample_weights[train_idx] if sample_weights is not None else None
+
+            # Impute NaN per fold (fit on train fold only — no leakage from val)
+            X_test_fold = X_test_base
+            if needs_imputation:
+                imputer = SimpleImputer(strategy="median")
+                X_train = X_train.copy()
+                X_val = X_val.copy()
+                X_train[nan_cols] = imputer.fit_transform(X_train[nan_cols])
+                X_val[nan_cols] = imputer.transform(X_val[nan_cols])
+                if X_test_fold is not None:
+                    X_test_fold = X_test_fold.copy()
+                    X_test_fold[nan_cols] = imputer.transform(X_test_fold[nan_cols])
+
+            # Apply scaler per fold (fit on train fold, transform val + test)
+            if scaler_type != "none" and scale_cols:
+                X_train, X_val, X_test_fold = _apply_scaler_fold(
+                    scaler_type, X_train, X_val, X_test_fold, scale_cols
+                )
 
             # Early stopping via constructor (XGBoost v2.0+)
             model_hparams = dict(hparams)
@@ -996,13 +1161,14 @@ def _create_objective(
 
             # Per-fold tracking: predict test and update leaderboard.
             # Runs BEFORE prune check so pruned trials still contribute.
-            if per_fold_tracker is not None and X_test is not None:
+            # Use X_test_fold (scaled with this fold's scaler) for predictions.
+            if per_fold_tracker is not None and X_test_fold is not None:
                 if task_type == "binary_classification":
-                    test_fold_preds = model.predict_proba(X_test)[:, 1]
+                    test_fold_preds = model.predict_proba(X_test_fold)[:, 1]
                 elif task_type == "multiclass":
-                    test_fold_preds = model.predict_proba(X_test)
+                    test_fold_preds = model.predict_proba(X_test_fold)
                 else:
-                    test_fold_preds = model.predict(X_test)
+                    test_fold_preds = model.predict(X_test_fold)
                 per_fold_tracker.update(
                     fold_idx=fold_idx,
                     score=fold_metric,
@@ -1221,12 +1387,20 @@ def train_with_config(
     X_test = test[feature_cols]
 
     # Impute NaN for models that don't handle missing values.
+    # Fitted per fold (on train fold only) to avoid leakage into the validation set.
     feat_reqs = registry.get_feature_requirements(model_name)
-    if not feat_reqs.get("handles_missing", False) and X_train.isna().any().any():
+    has_nan_in_train = X_train.isna().any().any()
+    has_nan_in_test = X_test.isna().any().any()
+    needs_imputation = not feat_reqs.get("handles_missing", False) and (has_nan_in_train or has_nan_in_test)
+    if needs_imputation:
         from sklearn.impute import SimpleImputer
-        imputer = SimpleImputer(strategy="median")
-        X_train = pd.DataFrame(imputer.fit_transform(X_train), columns=X_train.columns, index=X_train.index)
-        X_test = pd.DataFrame(imputer.transform(X_test), columns=X_test.columns, index=X_test.index)
+        nan_cols = [c for c in X_train.columns if X_train[c].isna().any() or X_test[c].isna().any()]
+
+    # Extract scaler type from trial params (Optuna stored it during search).
+    # Copy first so we don't mutate the caller's dict.
+    hparams = dict(hparams)
+    scaler_type = hparams.pop("scaler", "none")
+    scale_cols = _identify_scale_cols(X_train) if scaler_type != "none" else []
 
     training_cfg = registry.get_training_config(model_name)
     needs_eval_set = training_cfg.get("needs_eval_set", False)
@@ -1283,6 +1457,23 @@ def train_with_config(
             y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
             fold_weights = sample_weights[train_idx] if sample_weights is not None else None
 
+            # Impute NaN per fold (fit on train fold only — no leakage from val)
+            X_test_fold = X_test
+            if needs_imputation:
+                imputer = SimpleImputer(strategy="median")
+                X_fold_train = X_fold_train.copy()
+                X_fold_val = X_fold_val.copy()
+                X_fold_train[nan_cols] = imputer.fit_transform(X_fold_train[nan_cols])
+                X_fold_val[nan_cols] = imputer.transform(X_fold_val[nan_cols])
+                X_test_fold = X_test.copy()
+                X_test_fold[nan_cols] = imputer.transform(X_test_fold[nan_cols])
+
+            # Apply scaler per fold (same type as Optuna trial selected)
+            if scaler_type != "none" and scale_cols:
+                X_fold_train, X_fold_val, X_test_fold = _apply_scaler_fold(
+                    scaler_type, X_fold_train, X_fold_val, X_test_fold, scale_cols
+                )
+
             model = registry.get_model(
                 model_name, hparams=hparams_seeded,
                 task_type=task_type, gpu=gpu, results_dir=results_dir
@@ -1316,13 +1507,13 @@ def train_with_config(
 
             if task_type == "binary_classification":
                 val_preds = model.predict_proba(X_fold_val)[:, 1]
-                tst_preds = model.predict_proba(X_test)[:, 1]
+                tst_preds = model.predict_proba(X_test_fold)[:, 1]
             elif task_type == "multiclass":
                 val_preds = model.predict_proba(X_fold_val)  # (n_val, n_classes)
-                tst_preds = model.predict_proba(X_test)       # (n_test, n_classes)
+                tst_preds = model.predict_proba(X_test_fold)  # (n_test, n_classes)
             else:
                 val_preds = model.predict(X_fold_val)
-                tst_preds = model.predict(X_test)
+                tst_preds = model.predict(X_test_fold)
 
             oof_preds[val_idx] = val_preds
             test_preds += tst_preds / n_folds

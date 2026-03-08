@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 import optuna
+from joblib import Parallel, delayed
 from scipy.stats import rankdata
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import roc_auc_score, mean_squared_error
@@ -242,20 +243,34 @@ def train_meta_model(
         cv_splitter = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
         splits = cv_splitter.split(X_meta, y)
 
-    for train_idx, val_idx in splits:
+    def _fit_fold(
+        train_idx: np.ndarray, val_idx: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Fit one CV fold and return (val_idx, val_preds, test_preds)."""
         X_tr, X_val = X_meta[train_idx], X_meta[val_idx]
         y_tr = y[train_idx]
 
         if is_regression:
             meta_model = Ridge(alpha=1.0 / C)
             meta_model.fit(X_tr, y_tr)
-            meta_oof[val_idx] = meta_model.predict(X_val)
-            meta_test += meta_model.predict(X_test_meta) / n_folds
+            return val_idx, meta_model.predict(X_val), meta_model.predict(X_test_meta)
         else:
             meta_model = LogisticRegression(C=C, max_iter=2000, solver="lbfgs")
             meta_model.fit(X_tr, y_tr)
-            meta_oof[val_idx] = meta_model.predict_proba(X_val)[:, 1]
-            meta_test += meta_model.predict_proba(X_test_meta)[:, 1] / n_folds
+            return (
+                val_idx,
+                meta_model.predict_proba(X_val)[:, 1],
+                meta_model.predict_proba(X_test_meta)[:, 1],
+            )
+
+    fold_results = Parallel(n_jobs=-1)(
+        delayed(_fit_fold)(train_idx, val_idx)
+        for train_idx, val_idx in splits
+    )
+
+    for val_idx, val_preds, test_preds in fold_results:
+        meta_oof[val_idx] = val_preds
+        meta_test += test_preds / n_folds
 
     return meta_oof, meta_test
 
@@ -280,7 +295,7 @@ def optimize_meta_C(
         oof_list: List of OOF prediction arrays from base models.
         test_list: List of test prediction arrays from base models.
         y: True target values.
-        n_folds: Number of CV folds for meta-model (typically 2× pipeline folds).
+        n_folds: Number of CV folds for meta-model.
         seed: Random seed.
         task_type: 'binary_classification' or 'regression'.
         n_trials: Number of Optuna trials for C search.
@@ -328,6 +343,7 @@ def train_meta_model_xgb(
     seed: int = 42,
     task_type: str = "binary_classification",
     xgb_params: dict | None = None,
+    gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Train an XGBoost meta-model (stacking) on OOF predictions.
 
@@ -343,6 +359,7 @@ def train_meta_model_xgb(
         seed: Random seed.
         task_type: 'binary_classification' or 'regression'.
         xgb_params: XGBoost hyperparameters (from Optuna search).
+        gpu: If True, use device="cuda" for GPU acceleration.
 
     Returns:
         Tuple of (meta_oof_preds, meta_test_preds).
@@ -351,6 +368,7 @@ def train_meta_model_xgb(
 
     is_regression = task_type == "regression"
     params = xgb_params or {}
+    device = "cuda" if gpu else "cpu"
 
     X_meta = np.column_stack(oof_list)
     X_test_meta = np.column_stack(test_list)
@@ -371,13 +389,15 @@ def train_meta_model_xgb(
         y_tr = y[train_idx]
 
         if is_regression:
-            model = XGBRegressor(random_state=seed, verbosity=0, **params)
+            model = XGBRegressor(
+                random_state=seed, verbosity=0, device=device, **params,
+            )
             model.fit(X_tr, y_tr)
             meta_oof[val_idx] = model.predict(X_val)
             meta_test += model.predict(X_test_meta) / n_folds
         else:
             model = XGBClassifier(
-                random_state=seed, verbosity=0,
+                random_state=seed, verbosity=0, device=device,
                 eval_metric="logloss", **params,
             )
             model.fit(X_tr, y_tr)
@@ -396,6 +416,7 @@ def optimize_meta_xgb(
     task_type: str = "binary_classification",
     n_trials: int = 50,
     metric: str = "roc_auc",
+    gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Search optimal XGBoost meta-model hyperparameters using Optuna.
 
@@ -406,11 +427,12 @@ def optimize_meta_xgb(
         oof_list: List of OOF prediction arrays from base models.
         test_list: List of test prediction arrays from base models.
         y: True target values.
-        n_folds: Number of CV folds for meta-model (typically 2× pipeline folds).
+        n_folds: Number of CV folds for meta-model.
         seed: Random seed.
         task_type: 'binary_classification' or 'regression'.
         n_trials: Number of Optuna trials.
         metric: Metric to optimize ('roc_auc' or 'neg_rmse').
+        gpu: If True, use device="cuda" for GPU acceleration.
 
     Returns:
         Tuple of (meta_oof_preds, meta_test_preds, best_params).
@@ -431,7 +453,7 @@ def optimize_meta_xgb(
         meta_oof, _ = train_meta_model_xgb(
             oof_list, test_list, y,
             n_folds=n_folds, seed=seed, task_type=task_type,
-            xgb_params=params,
+            xgb_params=params, gpu=gpu,
         )
         return _score(y, meta_oof, metric)
 
@@ -443,8 +465,9 @@ def optimize_meta_xgb(
 
     best_params = study.best_params
     elapsed = time.time() - t0
+    device_str = "GPU" if gpu else "CPU"
     logger.info(
-        f"Meta-XGBoost search: best_{metric}={study.best_value:.6f} "
+        f"Meta-XGBoost search ({device_str}): best_{metric}={study.best_value:.6f} "
         f"(lr={best_params['learning_rate']:.4f}, depth={best_params['max_depth']}, "
         f"n_est={best_params['n_estimators']}, "
         f"{n_trials} trials, {n_folds}-fold CV, {elapsed:.1f}s)"
@@ -453,7 +476,7 @@ def optimize_meta_xgb(
     meta_oof, meta_test = train_meta_model_xgb(
         oof_list, test_list, y,
         n_folds=n_folds, seed=seed, task_type=task_type,
-        xgb_params=best_params,
+        xgb_params=best_params, gpu=gpu,
     )
     return meta_oof, meta_test, best_params
 

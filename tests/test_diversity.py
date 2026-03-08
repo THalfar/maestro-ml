@@ -564,6 +564,43 @@ class TestComputeAmbiguity:
         amb = compute_ambiguity([preds], np.array([1.0]))
         np.testing.assert_almost_equal(amb, 0.0)
 
+    def test_normalized_by_target_variance(self):
+        """When y_true is provided, ambiguity should be normalized by var(y_true)."""
+        rng = np.random.default_rng(42)
+        a = rng.random(200)
+        b = rng.random(200)
+        y = rng.random(200)
+        weights = np.array([0.5, 0.5])
+
+        raw = compute_ambiguity([a, b], weights)
+        normalized = compute_ambiguity([a, b], weights, y_true=y)
+
+        target_var = float(np.var(y))
+        np.testing.assert_almost_equal(normalized, raw / target_var)
+
+    def test_regression_scale_invariance(self):
+        """Scaling predictions and target by 1000x should give same normalized ambiguity."""
+        rng = np.random.default_rng(42)
+        a = rng.random(200)
+        b = rng.random(200)
+        y = rng.random(200)
+        weights = np.array([0.5, 0.5])
+
+        small = compute_ambiguity([a, b], weights, y_true=y)
+        large = compute_ambiguity([a * 1000, b * 1000], weights, y_true=y * 1000)
+        np.testing.assert_almost_equal(small, large, decimal=5)
+
+    def test_no_ytrue_returns_raw(self):
+        """Without y_true, raw (unnormalized) ambiguity is returned."""
+        rng = np.random.default_rng(42)
+        a = rng.random(200) * 1000
+        b = rng.random(200) * 1000
+        weights = np.array([0.5, 0.5])
+
+        raw = compute_ambiguity([a, b], weights)
+        # Raw ambiguity should be large for large-scale predictions
+        assert raw > 1.0
+
 
 # ---------------------------------------------------------------------------
 # _compute_diversity (dispatcher)

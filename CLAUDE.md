@@ -83,17 +83,19 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 
 ## Ensemble & Diversity
 
+- **SOTA models only**: Only include strong models in the ensemble. Weak models (gaussian_nb, svm, knn, adaboost) dilute ensemble quality — their noisy predictions can hurt the meta-learner and final blend even with NSGA-II selection. Prefer: catboost, xgboost, lightgbm, realmlp, random_forest, extra_trees. NSGA-II handles diversity within strong models.
 - **NSGA-II → meta-model chain** (in `run.py`): NSGA-II selects diverse models, then trains meta-models on selected OOFs. Compares linear blend vs each meta-model on OOF score — picks the winner automatically.
+- **NSGA-II knee-point selection** (default): `run_nsga2_ensemble()` uses `use_knee=True` by default. pymoo's `HighTradeoffPoints` finds the optimal tradeoff point on the Pareto front between metric score and diversity — no need to manually tune `diversity_weight`. The `diversity_weight` parameter serves as fallback when knee-point detection fails (< 3 Pareto solutions) or for explicit linear weighting.
+- **`diversity_weight`** can be a single float or a list of floats. A single float uses knee-point selection (default, recommended). A list of floats creates multiple submissions by re-selecting from the same Pareto front with linear weighting — useful for exploring different metric/diversity tradeoffs without re-running NSGA-II.
+- **`select_from_pareto()`** in `diversity.py` re-selects from cached Pareto data with different `diversity_weight` or `use_knee`.
 - **Meta-model C optimization**: `optimize_meta_C()` in `blender.py` uses Optuna to search LogisticRegression/Ridge C on log scale (0.001–100). Never hardcode C=1.0.
 - **XGBoost meta-learner**: `optimize_meta_xgb()` in `blender.py` searches 8 hyperparameters via Optuna for non-linear meta-stacking. Can capture model interaction effects that linear meta-learners miss.
 - **Configurable meta-models**: `EnsembleConfig.meta_models` (list, default `["logreg"]`) and `meta_trials` (int or dict per meta-model). Pipeline tries all configured meta-models and picks the best.
-- **Meta-model CV**: Uses 2× pipeline CV folds (e.g., 5-fold pipeline → 10-fold meta-CV) for finer-grained OOF predictions.
+- **Meta-model CV**: Configurable via `meta_cv_folds` in ensemble config. Defaults to `2 × pipeline CV folds` if not set. Controls how many folds the meta-model uses for its own OOF predictions.
 - **Three diversity metrics** (`diversity_metric` in pipeline YAML):
   - `pearson_neff` — Effective ensemble size from Pearson error correlation eigenvalues (default).
   - `spearman_neff` — Same but Spearman rank correlation. Better for AUC (ranking metric).
   - `ambiguity` — Weighted prediction variance. Directly measures ensemble benefit.
-- **`diversity_weight`** can be a single float or a list of floats. Multiple weights re-select from the same Pareto front without re-running NSGA-II.
-- **`select_from_pareto()`** in `diversity.py` re-selects from cached Pareto data with different `diversity_weight`.
 
 ## Extra Data (Original Datasets)
 
@@ -111,6 +113,40 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - Fitted on train, applied to both train and test via `sklearn.impute.SimpleImputer`.
 - Models with `handles_missing: true` (CatBoost, XGBoost, LightGBM) handle NaN natively — no imputation applied.
 
+## Preprocessing & Scaling
+
+- **Scaler as Optuna parameter**: Models with `needs_scaling: true` (Ridge, Elastic Net, KNN, SVM, Gaussian NB) get an Optuna `suggest_categorical("scaler", choices)` parameter. Optuna decides the best scaler per trial.
+- **Scaler types**: `"none"`, `"standard"` (StandardScaler), `"robust"` (RobustScaler), `"quantile"` (QuantileTransformer normal output).
+- **Per-fold fitting**: Scaler is fit on each fold's training data and transforms train/val/test independently. Same pattern as NaN imputation.
+- **Retrain consistency**: `train_with_config()` reads the `"scaler"` key from trial params and applies the same scaler type. The key is popped from hparams so it's not passed to the model constructor.
+- **Only continuous columns scaled**: `_identify_scale_cols()` excludes binary (≤2 unique) and ordinal (≤20 unique integers) columns. Target-encoded features are included.
+- **LLM controls search space**: Strategy YAML `preprocessing.scaler_choices` narrows the scaler options (e.g., `["robust"]` if EDA shows outliers). `"none"` is always added so Optuna can opt out.
+- **Per-model override**: Strategy YAML `preprocessing.per_model.<name>.needs_scaling` can force scaling on/off, overriding model YAML default.
+- **Tree models don't scale**: CatBoost, XGBoost, LightGBM, Random Forest, Extra Trees have `needs_scaling: false` — scaling is never applied.
+- **RealMLP/TabM**: `needs_scaling: false` by default (internal preprocessing). LLM can override via strategy if EDA shows extreme outliers.
+
+### Strategy YAML Preprocessing Section
+```yaml
+preprocessing:
+  scaler_choices: ["robust", "quantile"]    # LLM narrows based on EDA
+  per_model:
+    ridge:
+      scaler_choices: ["robust"]            # Force robust for ridge
+    realmlp:
+      needs_scaling: true                   # Override: enable scaling for RealMLP
+      scaler_choices: ["none", "robust"]    # Let Optuna decide
+```
+
+## EDA Preprocessing Signals
+
+- **`preprocessing_summary`** in EDA report: Aggregated signals for LLM scaling decisions.
+  - `scale_range_ratio`: Max/min feature range ratio — high values indicate features on different scales.
+  - `high_skew_features`: Features with |skewness| > 1.0 — candidates for log transform.
+  - `high_outlier_features`: Features with outlier% > 3% — candidates for clipping/RobustScaler.
+  - `sentinel_features`: Features with detected sentinel values (-1, -999, etc.) — likely masked NaN.
+  - `suggested_scalers`: EDA's automatic suggestion based on data characteristics.
+- **Per-column additions**: `skewness_label` ("symmetric"/"moderate"/"high"), `sentinels` (list of detected sentinel values with counts), `range` in stats.
+
 ## Pipeline YAML Key Features
 
 - **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).
@@ -121,6 +157,7 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - **`selection_mode`**: Per-model in model YAML (`global` or `per_fold`). Controls whether top configs are retrained (global) or per-fold composites are assembled (per_fold).
 - **`fold_timeout`**: Per-model in model YAML. Max seconds per CV fold — exceeding prunes the trial.
 - **`assembly`**: Per-model in model YAML. Dict with `mode` (`rank`/`nsga2`), `n_composites`, `n_generations`, `pop_size`, `diversity_metric`, `diversity_weight`. Controls how per-fold composites are built.
+- **`meta_cv_folds`**: Number of CV folds for meta-model training. Defaults to `2 × pipeline n_folds` if not set. Set explicitly for large datasets (e.g., 15 folds for 595k samples).
 
 ## CV and OOF Predictions
 

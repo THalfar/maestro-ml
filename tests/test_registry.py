@@ -755,3 +755,37 @@ class TestListModelsSorted:
         models = registry.list_models()
         assert models == sorted(models)
         assert models == ["random_forest", "ridge"]
+
+
+# ---------------------------------------------------------------------------
+# get_optuna_config — mutation safety
+# ---------------------------------------------------------------------------
+
+class TestGetOptunaConfigMutation:
+    def test_mutating_nested_pruner_does_not_affect_internal(self, registry: ModelRegistry):
+        """Mutating the returned pruner dict should not change internal config."""
+        cfg1 = registry.get_optuna_config("ridge")
+        cfg1["pruner"]["type"] = "hyperband"  # mutate nested dict
+        cfg2 = registry.get_optuna_config("ridge")
+        assert cfg2["pruner"]["type"] == "none"  # original unchanged
+
+    def test_mutating_nested_assembly_does_not_affect_internal(self, registry: ModelRegistry):
+        """Mutating the returned assembly dict should not change internal config."""
+        cfg1 = registry.get_optuna_config("ridge")
+        cfg1["assembly"]["mode"] = "nsga2"  # mutate nested dict
+        cfg2 = registry.get_optuna_config("ridge")
+        assert cfg2["assembly"]["mode"] == "rank"  # original unchanged
+
+
+# ---------------------------------------------------------------------------
+# register — overwrite
+# ---------------------------------------------------------------------------
+
+class TestRegisterOverwrite:
+    def test_re_register_overwrites(self, model_configs_dir: Path):
+        """Registering the same name twice should use the latest config."""
+        reg = ModelRegistry(model_configs_dir)
+        # Re-register ridge with the random_forest yaml
+        reg.register("ridge", model_configs_dir / "random_forest.yaml")
+        cfg = reg.get_optuna_config("ridge")
+        assert cfg["n_trials"] == 30  # RF's n_trials, not Ridge's 20

@@ -58,6 +58,7 @@ def build_features(
         4. If ratios exist, call _add_ratios on both DataFrames.
         5. If target_encoding config exists, call _add_target_encoding
            (this uses cv_folds to prevent leakage).
+        5b. If log_transforms exist, call _add_log_transforms on both DataFrames.
         6. If custom features exist, call _add_custom_features on both.
         7. Ordinal-encode any remaining string/object columns (fit on train,
            apply to test) so all models receive numeric-only DataFrames.
@@ -94,6 +95,11 @@ def build_features(
                 alpha=te_alpha,
                 _copy=False,
             )
+
+    log_transforms = features_cfg.get("log_transforms", []) or []
+    if log_transforms:
+        train = _add_log_transforms(train, log_transforms, _copy=False)
+        test = _add_log_transforms(test, log_transforms, _copy=False)
 
     custom = features_cfg.get("custom", []) or []
     if custom:
@@ -339,6 +345,37 @@ def _add_target_encoding(
     return train, test
 
 
+def _add_log_transforms(
+    df: pd.DataFrame,
+    columns: list[str],
+    _copy: bool = True,
+) -> pd.DataFrame:
+    """Apply log1p transform to specified numeric columns.
+
+    Creates new columns named '{col}_log' = log1p(col). Negative values
+    are handled via sign-preserving log: sign(x) * log1p(|x|).
+
+    Args:
+        df: Input DataFrame.
+        columns: List of column names to log-transform.
+
+    Returns:
+        New DataFrame with log-transformed columns appended.
+    """
+    if _copy:
+        df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            logger.warning(f"Log transform: column '{col}' not found, skipping.")
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            logger.warning(f"Log transform: column '{col}' is not numeric, skipping.")
+            continue
+        vals = df[col]
+        df[f"{col}_log"] = np.sign(vals) * np.log1p(np.abs(vals))
+    return df
+
+
 def _add_custom_features(
     df: pd.DataFrame,
     formulas: list[dict[str, str]],
@@ -405,6 +442,7 @@ def get_feature_columns(
         3. Add interaction column names: '{col_a}__x__{col_b}'.
         4. Add ratio column names: '{num}__div__{den}'.
         5. Add target encoding column names: '{col}_te', '{a}_{b}_te'.
+        5b. Add log_transform column names: '{col}_log'.
         6. Add custom feature names from strategy['features']['custom'].
         7. Return the sorted list.
     """
@@ -426,6 +464,9 @@ def get_feature_columns(
         all_cols.append(f"{col}_te")
     for pair in (te_cfg.get("pairs", []) or []):
         all_cols.append(f"{pair[0]}_{pair[1]}_te")
+
+    for col in (features_cfg.get("log_transforms", []) or []):
+        all_cols.append(f"{col}_log")
 
     for item in (features_cfg.get("custom", []) or []):
         name = item.get("name", "")
