@@ -178,9 +178,16 @@ Analyzes raw CSVs and produces a structured JSON report:
 - Preprocessing summary: scale range ratios, high-skew/outlier/sentinel feature lists, suggested scalers
 - Feature clusters (groups of highly correlated features)
 - Weak feature identification
+- **Duplicate & conflict detection** — exact duplicates and conflicting rows (same features, different target) that set a hard performance ceiling
+- **Unseen category detection** — test categories not in train, with affected row percentages (guides TE smoothing alpha)
+- **Monotonicity detection** — features with monotonic target relationships (candidates for `monotone_constraints`)
+- **Categorical cardinality profiles** — entropy and concentration (uniform vs long-tail distribution shape)
+- **Target encoding preview** — OOF-simulated TE correlation and AUC per categorical (concrete go/no-go numbers)
+- **Quick model baseline** — 3-fold RandomForest gives baseline AUC/RMSE and feature importances (sees non-linear effects)
+- **Fold context** — per-fold train/val sizes for 5-fold and 10-fold CV
 - Concrete LLM-readable recommendations
 
-Pure pandas/numpy. Deterministic, no randomness.
+Pure pandas/numpy/sklearn. Deterministic (seeded).
 
 ### Layer 2: LLM Strategist (`src/strategy/llm_strategist.py`)
 
@@ -305,10 +312,10 @@ pytest tests/ -v
 ```
 
 ```
-538 passed, 22 skipped in ~8s
+723 passed, 22 skipped in ~30s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling, feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights and NaN imputation), per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
+Tests cover all modules: YAML loading, EDA profiling (including duplicate detection, unseen categories, monotonicity, cardinality profiles, target encoding preview, quick model baseline), feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights and NaN imputation), per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
 
 ---
 
@@ -390,10 +397,10 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Automatic NaN imputation for models that don't handle missing values
 - [x] LLM-driven preprocessing: scaler selection (Standard/Robust/Quantile) as Optuna parameter, EDA sentinel detection, skewness/outlier analysis
 - [x] Configurable meta-models (LogReg + XGBoost) with Optuna-optimized hyperparameters
-- [x] 538 tests with full coverage
+- [x] 723 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
-- [ ] Feature importance analysis and selection
+- [x] Feature importance analysis (quick model baseline in EDA)
 - [ ] Automated post-hoc analysis report
 
 ---

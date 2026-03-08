@@ -1,26 +1,30 @@
 # =============================================================================
-# Porto Seguro Safe Driver Prediction
+# Porto Seguro Safe Driver Prediction — 16h GPU Run (RTX 5090)
 # =============================================================================
 # Binary classification: predict probability of insurance claim (target 0/1)
 # Metric: Normalized Gini Coefficient (= 2*AUC - 1, so optimize AUC)
 # Data: ~595k train, ~893k test, 57 features (anonymized)
 # Feature naming: ps_ind_* (individual), ps_reg_* (registration),
-#   ps_car_* (car), ps_calc_* (calculated — likely noise)
+#   ps_car_* (car), ps_calc_* (calculated — noise, dropped)
 # Suffixes: _bin (binary), _cat (categorical), no suffix (continuous/ordinal)
 # Missing values encoded as -1 in categorical features
 # Highly imbalanced: ~3.6% positive class
 #
-# Model selection: 5 SOTA models only.
-# - CatBoost/XGBoost/LightGBM: core GBM trio, each has unique inductive bias
-# - RealMLP: neural net, structurally different from GBMs
-# - Ridge: fast linear baseline, genuine diversity (low correlation with GBMs)
-# Weak models excluded — "garbage diversity" pollutes Pareto front.
-# RF/ET excluded — too slow on 595k rows and correlate heavily with GBMs.
+# Model selection: 5 models — 3 GBM + 2 neural nets for structural diversity.
+# - CatBoost: GPU with Logloss eval (AUC unsupported on GPU) — different
+#   optimization signal, symmetric tree growth
+# - XGBoost: GPU with AUC eval — direct metric optimization, level-wise growth
+# - LightGBM: leaf-wise growth — fundamentally different tree structure from
+#   CatBoost/XGBoost, finds different optima. Fast even on CPU.
+# - RealMLP: neural net, per-fold NSGA-II assembly
+# - TabM: parameter-efficient ensemble NN, per-fold NSGA-II assembly
 #
-# 10h budget allocation (~9.5h Optuna + ~30min ensemble/retrain):
-# - GPU models get bulk of time (CatBoost 3h, XGBoost 2h30m, LightGBM 2h)
-# - RealMLP 1h30m on GPU (595k rows = large batches, converges faster)
-# - Ridge 10m (linear, converges in <100 trials)
+# 16h budget allocation (~15.5h Optuna + ~30min ensemble/retrain):
+# - CatBoost 3h30m: GPU, symmetric growth, Logloss metric
+# - XGBoost 3h: GPU, level-wise growth, AUC metric
+# - LightGBM 3h: CPU/GPU, leaf-wise growth — fast per trial
+# - RealMLP 3h: GPU, per-fold = ~10× cost vs global (10 folds each trial)
+# - TabM 3h: GPU, per-fold, parameter-efficient = faster per trial
 # =============================================================================
 
 data:
@@ -47,11 +51,12 @@ strategy:
     strategy_input_path: "competitions/porto-seguro-safe-driver-prediction/strategy_output.yaml"
 
 models:
+  - tabm
   - catboost
   - xgboost
   - lightgbm
   - realmlp
-  - ridge
+  
 
 features:
   interactions: []
@@ -65,7 +70,7 @@ features:
 ensemble:
   strategy: "nsga2"
   nsga2_trials: 10000
-  diversity_weight: 0.3
+  diversity_weight: 0.2
   diversity_metric: "spearman_neff"
   meta_models: ["logreg", "xgboost"]
   meta_cv_folds: 15
@@ -78,10 +83,10 @@ optuna:
   global_timeout: null
   model_timeouts:
     catboost: "3h"
-    xgboost: "2h30m"
-    lightgbm: "2h"
-    realmlp: "2h30m"
-    ridge: "10m"
+    xgboost: "3h"
+    lightgbm: "3h"
+    realmlp: "4h"
+    tabm: "4h"
 
 runtime:
   gpu_check: true

@@ -10,6 +10,7 @@ import pytest
 
 from src.eda.profiler import (
     _add_skewness_and_outliers,
+    _compute_cardinality_profile,
     _compute_categorical_target_rates,
     _compute_correlations,
     _compute_cramers_v,
@@ -17,10 +18,15 @@ from src.eda.profiler import (
     _compute_iv_woe,
     _compute_mutual_information,
     _compute_psi_numeric,
+    _compute_quick_importance_and_baseline,
+    _compute_target_encoding_preview,
     _compute_univariate_auc,
+    _compute_unseen_categories,
     _compute_vif,
     _detect_column_types,
+    _detect_duplicates,
     _detect_leakage,
+    _detect_monotonicity,
     _enrich_clusters_with_pairs,
     _find_feature_clusters,
     _generate_recommendations,
@@ -96,6 +102,8 @@ class TestRunEda:
             "interaction_candidates", "leakage_warnings", "vif_scores",
             "univariate_auc", "iv_woe", "cramers_v",
             "preprocessing_summary",
+            "duplicates", "unseen_categories", "monotonicity",
+            "cardinality_profiles", "te_preview", "quick_model",
         }
         assert set(report.keys()) == expected_keys
 
@@ -1614,3 +1622,463 @@ class TestGenerateRecommendationsAdvanced:
             columns_analysis, {"nzv_col": 0.01}, [], [],
         )
         assert any("zero-variance" in r.lower() or "nzv_col" in r for r in recs)
+
+    def test_conflicting_duplicates_recommendation(self):
+        """Conflicting duplicates should produce a warning recommendation."""
+        dupes = {
+            "n_duplicate_rows": 100, "duplicate_pct": 10.0,
+            "n_conflicting_rows": 50, "conflicting_pct": 5.0,
+            "n_duplicate_groups": 20, "n_conflicting_groups": 10,
+        }
+        recs = _generate_recommendations(
+            {}, {}, [], [], duplicates=dupes,
+        )
+        assert any("CONFLICTING" in r for r in recs)
+
+    def test_baseline_recommendation(self):
+        """Quick model baseline should appear in recommendations."""
+        qm = {"feature_importances": {}, "baseline_score": 0.63, "baseline_metric": "AUC"}
+        recs = _generate_recommendations(
+            {}, {}, [], [], quick_model=qm,
+        )
+        assert any("baseline" in r.lower() and "0.63" in r for r in recs)
+
+    def test_monotonicity_recommendation(self):
+        """Monotonic features should produce recommendation."""
+        mono = {"feat_a": {"spearman_rho": 0.95, "direction": "increasing", "is_monotonic": True}}
+        recs = _generate_recommendations(
+            {}, {}, [], [], monotonicity=mono,
+        )
+        assert any("monoton" in r.lower() for r in recs)
+
+    def test_te_preview_recommendation(self):
+        """Strong target encoding preview should produce recommendation."""
+        te = {"cat_col": {"encoded_corr": 0.15, "encoded_auc": 0.58}}
+        recs = _generate_recommendations(
+            {}, {}, [], [], te_preview=te,
+        )
+        assert any("target encoding" in r.lower() for r in recs)
+
+    def test_unseen_categories_recommendation(self):
+        """High unseen category rate should produce recommendation."""
+        unseen = {"cat_col": {"n_unseen": 5, "n_test_unique": 20, "unseen_pct": 25.0,
+                              "unseen_row_pct": 8.0, "unseen_values": ["a", "b"]}}
+        recs = _generate_recommendations(
+            {}, {}, [], [], unseen_categories=unseen,
+        )
+        assert any("unseen" in r.lower() for r in recs)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate detection tests
+# ---------------------------------------------------------------------------
+class TestDetectDuplicates:
+    """Tests for _detect_duplicates."""
+
+    def test_no_duplicates(self):
+        """All unique rows should report zeros."""
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        target = pd.Series([0, 1, 0])
+        result = _detect_duplicates(df, target)
+        assert result["n_duplicate_rows"] == 0
+        assert result["n_conflicting_rows"] == 0
+        assert result["duplicate_pct"] == 0.0
+
+    def test_exact_duplicates_same_target(self):
+        """Duplicate rows with same target should be counted as duplicates, not conflicts."""
+        df = pd.DataFrame({"a": [1, 1, 2], "b": [10, 10, 20]})
+        target = pd.Series([0, 0, 1])
+        result = _detect_duplicates(df, target)
+        assert result["n_duplicate_rows"] == 2
+        assert result["n_duplicate_groups"] == 1
+        assert result["n_conflicting_rows"] == 0
+
+    def test_conflicting_duplicates(self):
+        """Duplicate rows with different targets should be counted as conflicts."""
+        df = pd.DataFrame({"a": [1, 1, 2], "b": [10, 10, 20]})
+        target = pd.Series([0, 1, 0])
+        result = _detect_duplicates(df, target)
+        assert result["n_duplicate_rows"] == 2
+        assert result["n_conflicting_rows"] == 2
+        assert result["n_conflicting_groups"] == 1
+
+    def test_empty_dataframe(self):
+        """Empty input should return zeros."""
+        df = pd.DataFrame({"a": []})
+        target = pd.Series([], dtype=float)
+        result = _detect_duplicates(df, target)
+        assert result["n_duplicate_rows"] == 0
+
+    def test_mixed_duplicates_and_conflicts(self):
+        """Mix of non-conflicting and conflicting duplicates."""
+        df = pd.DataFrame({"a": [1, 1, 2, 2, 3], "b": [10, 10, 20, 20, 30]})
+        target = pd.Series([0, 0, 0, 1, 1])
+        result = _detect_duplicates(df, target)
+        assert result["n_duplicate_rows"] == 4
+        assert result["n_duplicate_groups"] == 2
+        # Only group (a=2, b=20) is conflicting
+        assert result["n_conflicting_rows"] == 2
+        assert result["n_conflicting_groups"] == 1
+
+
+    def test_signal_only_pass_no_columns_analysis(self):
+        """Without columns_analysis, no signal_only key should appear."""
+        df = pd.DataFrame({"a": [1, 1, 2], "b": [10, 10, 20]})
+        target = pd.Series([0, 0, 1])
+        result = _detect_duplicates(df, target)
+        assert "signal_only" not in result
+
+    def test_signal_only_pass_with_noise_columns(self):
+        """Noise columns mask duplicates -- signal-only pass should reveal them."""
+        df = pd.DataFrame({
+            "a": [1, 1, 2, 3],
+            "b": [10, 10, 20, 30],
+            "noise": [100, 200, 300, 400],
+        })
+        target = pd.Series([0, 1, 0, 1])
+        col_analysis = {
+            "a": {"iv": 0.05, "mutual_information": 0.1, "univariate_auc": 0.6, "dominant_pct": 25.0},
+            "b": {"iv": 0.03, "mutual_information": 0.05, "univariate_auc": 0.55, "dominant_pct": 25.0},
+            "noise": {"iv": 0.0, "mutual_information": 0.0, "univariate_auc": 0.5, "dominant_pct": 25.0},
+        }
+        result = _detect_duplicates(df, target, columns_analysis=col_analysis)
+        assert result["n_duplicate_rows"] == 0
+        assert "signal_only" in result
+        assert result["signal_only"]["n_duplicate_rows"] == 2
+        assert result["signal_only"]["n_conflicting_rows"] == 2
+        assert "noise" in result["signal_only"]["dropped_columns"]
+
+    def test_signal_only_pass_near_zero_variance(self):
+        """Near-zero-variance columns (>99% same) should be dropped in signal-only pass."""
+        df = pd.DataFrame({
+            "signal": [1, 1, 2, 3],
+            "constant": [0, 0, 0, 0],
+        })
+        target = pd.Series([0, 0, 1, 0])
+        col_analysis = {
+            "signal": {"iv": 0.05, "mutual_information": 0.1, "univariate_auc": 0.6, "dominant_pct": 25.0},
+            "constant": {"iv": None, "mutual_information": 0.0, "univariate_auc": None, "dominant_pct": 100.0},
+        }
+        result = _detect_duplicates(df, target, columns_analysis=col_analysis)
+        assert result["n_duplicate_rows"] == 2
+        assert "signal_only" in result
+        assert "constant" in result["signal_only"]["dropped_columns"]
+
+    def test_signal_only_pass_no_noise_detected(self):
+        """When no columns are noise, signal_only should not appear."""
+        df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+        target = pd.Series([0, 1, 0])
+        col_analysis = {
+            "a": {"iv": 0.05, "mutual_information": 0.1, "univariate_auc": 0.6, "dominant_pct": 33.0},
+            "b": {"iv": 0.03, "mutual_information": 0.05, "univariate_auc": 0.55, "dominant_pct": 33.0},
+        }
+        result = _detect_duplicates(df, target, columns_analysis=col_analysis)
+        assert "signal_only" not in result
+
+
+# ---------------------------------------------------------------------------
+# Unseen categories tests
+# ---------------------------------------------------------------------------
+class TestUnseenCategories:
+    """Tests for _compute_unseen_categories."""
+
+    def test_no_unseen(self):
+        """All test values present in train should return empty dict."""
+        train = pd.DataFrame({"cat": ["a", "b", "c"]})
+        test = pd.DataFrame({"cat": ["a", "b"]})
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 3}}
+        result = _compute_unseen_categories(train, test, col_analysis)
+        assert result == {}
+
+    def test_unseen_values_detected(self):
+        """Test values not in train should be reported."""
+        train = pd.DataFrame({"cat": ["a", "b", "c"]})
+        test = pd.DataFrame({"cat": ["a", "b", "d", "e", "d"]})
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 3}}
+        result = _compute_unseen_categories(train, test, col_analysis)
+        assert "cat" in result
+        assert result["cat"]["n_unseen"] == 2
+        assert set(result["cat"]["unseen_values"]) == {"d", "e"}
+        assert result["cat"]["unseen_row_pct"] > 0
+
+    def test_numeric_columns_ignored(self):
+        """Numeric columns should not be checked for unseen values."""
+        train = pd.DataFrame({"num": [1, 2, 3]})
+        test = pd.DataFrame({"num": [4, 5, 6]})
+        col_analysis = {"num": {"detected_type": "numeric_continuous", "cardinality": 3}}
+        result = _compute_unseen_categories(train, test, col_analysis)
+        assert result == {}
+
+    def test_column_not_in_test(self):
+        """Missing test column should be skipped."""
+        train = pd.DataFrame({"cat": ["a", "b"]})
+        test = pd.DataFrame({"other": ["x"]})
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 2}}
+        result = _compute_unseen_categories(train, test, col_analysis)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Monotonicity detection tests
+# ---------------------------------------------------------------------------
+class TestDetectMonotonicity:
+    """Tests for _detect_monotonicity."""
+
+    def test_increasing_monotonic(self):
+        """Feature with strong positive relationship should be flagged increasing."""
+        rng = np.random.default_rng(42)
+        n = 200
+        x = rng.uniform(0, 10, n)
+        # Target rate increases with x
+        y = (rng.uniform(0, 1, n) < (x / 10)).astype(float)
+        df = pd.DataFrame({"feat": x})
+        target = pd.Series(y)
+        col_analysis = {"feat": {"stats": {"mean": 5.0}, "cardinality": 100}}
+        result = _detect_monotonicity(df, target, col_analysis)
+        assert "feat" in result
+        assert result["feat"]["is_monotonic"]
+        assert result["feat"]["direction"] == "increasing"
+
+    def test_no_monotonicity(self):
+        """Random feature should not be flagged."""
+        rng = np.random.default_rng(42)
+        n = 200
+        df = pd.DataFrame({"feat": rng.uniform(0, 10, n)})
+        target = pd.Series(rng.choice([0, 1], n))
+        col_analysis = {"feat": {"stats": {"mean": 5.0}, "cardinality": 100}}
+        result = _detect_monotonicity(df, target, col_analysis)
+        if "feat" in result:
+            assert not result["feat"]["is_monotonic"]
+
+    def test_low_cardinality_skipped(self):
+        """Features with cardinality < 3 should be skipped."""
+        df = pd.DataFrame({"feat": [0, 1, 0, 1]})
+        target = pd.Series([0, 1, 0, 1])
+        col_analysis = {"feat": {"stats": {"mean": 0.5}, "cardinality": 2}}
+        result = _detect_monotonicity(df, target, col_analysis)
+        assert "feat" not in result
+
+    def test_non_numeric_skipped(self):
+        """Non-numeric columns should be skipped."""
+        df = pd.DataFrame({"cat": ["a", "b", "c", "d"]})
+        target = pd.Series([0, 1, 0, 1])
+        col_analysis = {"cat": {"stats": None, "cardinality": 4}}
+        result = _detect_monotonicity(df, target, col_analysis)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Cardinality profile tests
+# ---------------------------------------------------------------------------
+class TestCardinalityProfile:
+    """Tests for _compute_cardinality_profile."""
+
+    def test_uniform_distribution(self):
+        """Evenly distributed categories should have high entropy and 'uniform' shape."""
+        n = 100
+        cats = [f"cat_{i % 10}" for i in range(n)]
+        df = pd.DataFrame({"feat": cats})
+        col_analysis = {"feat": {"detected_type": "low_cardinality_categorical", "cardinality": 10}}
+        result = _compute_cardinality_profile(df, col_analysis)
+        assert "feat" in result
+        assert result["feat"]["shape"] == "uniform"
+        assert result["feat"]["normalized_entropy"] > 0.8
+
+    def test_long_tail_distribution(self):
+        """One dominant category should have low entropy and 'long_tail' shape."""
+        cats = ["common"] * 90 + [f"rare_{i}" for i in range(10)]
+        df = pd.DataFrame({"feat": cats})
+        col_analysis = {"feat": {"detected_type": "low_cardinality_categorical", "cardinality": 11}}
+        result = _compute_cardinality_profile(df, col_analysis)
+        assert "feat" in result
+        assert result["feat"]["shape"] == "long_tail"
+        assert result["feat"]["top5_share"] > 80
+
+    def test_binary_skipped(self):
+        """Binary columns (cardinality < 3) should be skipped."""
+        df = pd.DataFrame({"feat": [0, 1, 0, 1]})
+        col_analysis = {"feat": {"detected_type": "binary", "cardinality": 2}}
+        result = _compute_cardinality_profile(df, col_analysis)
+        assert "feat" not in result
+
+    def test_numeric_continuous_skipped(self):
+        """Numeric continuous columns should be skipped."""
+        df = pd.DataFrame({"feat": [1.0, 2.0, 3.0]})
+        col_analysis = {"feat": {"detected_type": "numeric_continuous", "cardinality": 3}}
+        result = _compute_cardinality_profile(df, col_analysis)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Target encoding preview tests
+# ---------------------------------------------------------------------------
+class TestTargetEncodingPreview:
+    """Tests for _compute_target_encoding_preview."""
+
+    def test_informative_categorical(self):
+        """Categorical correlated with target should have non-zero encoded_corr."""
+        rng = np.random.default_rng(42)
+        n = 200
+        cats = rng.choice(["A", "B", "C"], n)
+        # A → high target, C → low target
+        y = np.zeros(n)
+        y[cats == "A"] = rng.binomial(1, 0.8, (cats == "A").sum())
+        y[cats == "B"] = rng.binomial(1, 0.5, (cats == "B").sum())
+        y[cats == "C"] = rng.binomial(1, 0.2, (cats == "C").sum())
+        df = pd.DataFrame({"cat": cats})
+        target = pd.Series(y)
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 3}}
+        result = _compute_target_encoding_preview(df, target, col_analysis)
+        assert "cat" in result
+        assert abs(result["cat"]["encoded_corr"]) > 0.1
+        assert result["cat"]["encoded_auc"] is not None
+        assert result["cat"]["encoded_auc"] > 0.55
+
+    def test_random_categorical(self):
+        """Random categorical should have near-zero encoded_corr."""
+        rng = np.random.default_rng(42)
+        n = 200
+        df = pd.DataFrame({"cat": rng.choice(["X", "Y", "Z"], n)})
+        target = pd.Series(rng.choice([0, 1], n))
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 3}}
+        result = _compute_target_encoding_preview(df, target, col_analysis)
+        assert "cat" in result
+        assert abs(result["cat"]["encoded_corr"]) < 0.15
+
+    def test_numeric_continuous_skipped(self):
+        """Numeric continuous columns should be skipped."""
+        df = pd.DataFrame({"num": [1.0, 2.0, 3.0]})
+        target = pd.Series([0, 1, 0])
+        col_analysis = {"num": {"detected_type": "numeric_continuous", "cardinality": 3}}
+        result = _compute_target_encoding_preview(df, target, col_analysis)
+        assert result == {}
+
+    def test_single_category_skipped(self):
+        """Single-category column (cardinality < 2) should be skipped."""
+        df = pd.DataFrame({"cat": ["A"] * 10})
+        target = pd.Series([0, 1] * 5)
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 1}}
+        result = _compute_target_encoding_preview(df, target, col_analysis)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Quick model importance and baseline tests
+# ---------------------------------------------------------------------------
+class TestQuickImportanceAndBaseline:
+    """Tests for _compute_quick_importance_and_baseline."""
+
+    def test_classification_baseline(self):
+        """Binary classification should return AUC and feature importances."""
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.normal(0, 1, n)
+        x2 = rng.normal(0, 1, n)
+        y = (x1 > 0).astype(float)
+        df = pd.DataFrame({"x1": x1, "x2": x2})
+        target = pd.Series(y)
+        result = _compute_quick_importance_and_baseline(df, target, "binary_classification")
+        assert result["baseline_metric"] == "AUC"
+        assert result["baseline_score"] is not None
+        assert result["baseline_score"] > 0.5  # better than random
+        assert "x1" in result["feature_importances"]
+        assert "x2" in result["feature_importances"]
+        # x1 should be more important than x2
+        assert result["feature_importances"]["x1"] > result["feature_importances"]["x2"]
+
+    def test_regression_baseline(self):
+        """Regression should return RMSE and feature importances."""
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.normal(0, 1, n)
+        y = x1 * 2 + rng.normal(0, 0.1, n)
+        df = pd.DataFrame({"x1": x1, "noise": rng.normal(0, 1, n)})
+        target = pd.Series(y)
+        result = _compute_quick_importance_and_baseline(df, target, "regression")
+        assert result["baseline_metric"] == "RMSE"
+        assert result["baseline_score"] is not None
+        assert result["baseline_score"] < 2.0  # reasonable RMSE
+        assert result["feature_importances"]["x1"] > result["feature_importances"]["noise"]
+
+    def test_empty_dataframe(self):
+        """Empty input should return None baseline."""
+        df = pd.DataFrame()
+        target = pd.Series([], dtype=float)
+        result = _compute_quick_importance_and_baseline(df, target, "binary_classification")
+        assert result["baseline_score"] is None
+
+    def test_categorical_features_handled(self):
+        """Categorical features should be label-encoded automatically."""
+        rng = np.random.default_rng(42)
+        n = 50
+        cats = rng.choice(["A", "B", "C"], n)
+        y = (cats == "A").astype(float)
+        df = pd.DataFrame({"cat": cats, "num": rng.normal(0, 1, n)})
+        target = pd.Series(y)
+        result = _compute_quick_importance_and_baseline(df, target, "binary_classification")
+        assert result["baseline_score"] is not None
+        assert "cat" in result["feature_importances"]
+
+    def test_subsampling_works(self):
+        """Large datasets should be subsampled without error."""
+        rng = np.random.default_rng(42)
+        n = 200
+        df = pd.DataFrame({"x": rng.normal(0, 1, n)})
+        target = pd.Series(rng.choice([0, 1], n))
+        # Use very small max_samples to trigger subsampling
+        result = _compute_quick_importance_and_baseline(
+            df, target, "binary_classification", max_samples=50,
+        )
+        assert result["baseline_score"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Integration: new sections in run_eda and format_eda_for_llm
+# ---------------------------------------------------------------------------
+class TestNewEDASections:
+    """Test that new EDA sections appear in run_eda output and format_eda_for_llm."""
+
+    def test_run_eda_has_new_keys(self, binary_dataset):
+        """run_eda should include all new report keys."""
+        train_path, test_path = binary_dataset
+        report, _, _ = run_eda(train_path, test_path, "target", id_col="id")
+        assert "duplicates" in report
+        assert "unseen_categories" in report
+        assert "monotonicity" in report
+        assert "cardinality_profiles" in report
+        assert "te_preview" in report
+        assert "quick_model" in report
+        # Quick model should have a valid baseline
+        assert report["quick_model"]["baseline_score"] is not None
+        assert report["quick_model"]["baseline_metric"] == "AUC"
+
+    def test_format_eda_includes_new_sections(self, binary_dataset):
+        """format_eda_for_llm should include new section headers."""
+        train_path, test_path = binary_dataset
+        report, _, _ = run_eda(train_path, test_path, "target", id_col="id")
+        text = format_eda_for_llm(report)
+        assert "QUICK MODEL BASELINE" in text
+        # Fold context
+        assert "fold CV" in text
+
+    def test_duplicates_in_format(self):
+        """Duplicate section should appear when duplicates exist."""
+        report = {
+            "dataset_info": {"train_shape": [100, 5], "test_shape": [50, 5],
+                             "train_memory_mb": 1.0, "test_memory_mb": 0.5, "n_features": 3},
+            "target_analysis": {"dtype": "int64", "n_unique": 2,
+                                "distribution": {"0": 50, "1": 50},
+                                "class_balance_pct": {"0": 50.0, "1": 50.0}, "missing_pct": 0.0},
+            "columns": {},
+            "duplicates": {"n_duplicate_rows": 20, "duplicate_pct": 20.0,
+                           "n_conflicting_rows": 10, "conflicting_pct": 10.0,
+                           "n_duplicate_groups": 5, "n_conflicting_groups": 3},
+            "unseen_categories": {},
+            "monotonicity": {},
+            "cardinality_profiles": {},
+            "te_preview": {},
+            "quick_model": {"feature_importances": {}, "baseline_score": None, "baseline_metric": "N/A"},
+        }
+        text = format_eda_for_llm(report)
+        assert "DUPLICATE ANALYSIS" in text
+        assert "Conflicting rows" in text

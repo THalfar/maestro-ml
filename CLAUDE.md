@@ -147,6 +147,16 @@ preprocessing:
   - `suggested_scalers`: EDA's automatic suggestion based on data characteristics.
 - **Per-column additions**: `skewness_label` ("symmetric"/"moderate"/"high"), `sentinels` (list of detected sentinel values with counts), `range` in stats.
 
+## EDA Advanced Analyses
+
+- **Duplicate detection** (`duplicates`): Hash-based detection of exact duplicate rows and conflicting duplicates (same features, different target). Conflicting duplicates set a hard ceiling on achievable performance.
+- **Unseen categories** (`unseen_categories`): Per-categorical count of test values not in train, with affected row percentage. Guides target encoding smoothing alpha and encoding strategy.
+- **Monotonicity detection** (`monotonicity`): Bins numeric features and computes Spearman rho on binned target rates. Features with |rho| > 0.7 flagged as monotonic — candidates for `monotone_constraints` in gradient boosting.
+- **Cardinality profiles** (`cardinality_profiles`): Top-K share, Shannon entropy, normalized entropy per categorical. Classifies distribution shape as "uniform", "moderate", or "long_tail". Long-tail categoricals need frequency encoding or rare-category binning.
+- **Target encoding preview** (`te_preview`): OOF target encoding simulation (5-fold, alpha=10). Reports Pearson correlation and AUC of encoded column with target — concrete numbers for whether TE is worthwhile.
+- **Quick model baseline** (`quick_model`): 3-fold CV RandomForest (n_estimators=100, max_depth=8) with label-encoded categoricals. Returns baseline AUC/RMSE (performance floor without feature engineering) and feature importances (sees non-linear effects and interactions unlike univariate metrics). Subsamples to 50k rows for speed. Fully deterministic (seeded).
+- **Fold context**: Dataset header shows per-fold train/val sizes for 5-fold and 10-fold CV to help calibrate min_leaf parameters.
+
 ## Pipeline YAML Key Features
 
 - **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).
@@ -206,7 +216,7 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
-- Expected: **538 passed, 22 skipped, ~8s**
+- Expected: **723 passed, 22 skipped, ~30s**
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
 - `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds

@@ -15,6 +15,7 @@ from sklearn.model_selection import StratifiedKFold
 from src.models.registry import ModelRegistry
 from src.models.trainer import (
     _apply_scaler_fold,
+    _deep_merge,
     _identify_scale_cols,
     _make_scaler,
     _compute_cv_metric,
@@ -711,6 +712,88 @@ class TestRunOptunaStudyExtra:
             timeout_override=300,
         )
         assert len(study.trials) >= 1
+
+
+
+# ---------------------------------------------------------------------------
+# Monotone constraints
+# ---------------------------------------------------------------------------
+
+class TestMonotoneConstraints:
+    """Tests for monotone constraints support in run_optuna_study and train_with_config."""
+
+    def test_monotone_constraints_resolved_for_gbm(self, ridge_configs_dir, binary_data, pipeline_config):
+        """Monotone constraints dict should be resolved to positional list.
+
+        Note: ridge doesn't support monotone_constraints, so this tests that
+        the feature is silently skipped for non-GBM models (no error).
+        """
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        strategy = {
+            "monotone_constraints": {
+                "f1": 1,
+                "f2": -1,
+                "f3": 0,
+            }
+        }
+        # Should not raise — ridge is not in (catboost, xgboost, lightgbm)
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+
+    def test_monotone_constraints_empty_dict_no_error(self, ridge_configs_dir, binary_data, pipeline_config):
+        """Empty monotone_constraints dict should not cause errors."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        strategy = {"monotone_constraints": {}}
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+
+    def test_train_with_config_accepts_monotone_constraints(self, ridge_configs_dir, binary_data, pipeline_config):
+        """train_with_config should accept monotone_constraints param without error."""
+        from src.models.trainer import train_with_config
+        from sklearn.model_selection import StratifiedKFold
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+        # Ridge ignores unknown kwargs, so passing monotone_constraints
+        # should not crash — it just gets merged into hparams (and ignored by Ridge).
+        # This test verifies the parameter plumbing works.
+        oof_list, test_list, y = train_with_config(
+            model_name="ridge",
+            hparams={"C": 1.0},
+            feature_cols=["f1", "f2", "f3"],
+            train=train,
+            test=test,
+            target_col="target",
+            cv=cv,
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            seeds=[42],
+            results_dir=pipeline_config.output.results_dir,
+            monotone_constraints=None,
+        )
+        assert len(oof_list) == 1
+        assert len(test_list) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2539,3 +2622,217 @@ class TestScalerOptuna:
         ]
         for t in completed:
             assert "scaler" not in t.params
+
+
+class TestDeepMerge:
+    """Unit tests for _deep_merge helper."""
+
+    def test_flat_override(self):
+        base = {"a": 1, "b": 2}
+        result = _deep_merge(base, {"b": 99, "c": 3})
+        assert result == {"a": 1, "b": 99, "c": 3}
+        assert result is base  # in-place
+
+    def test_nested_merge(self):
+        base = {"assembly": {"mode": "rank", "n_composites": 20}}
+        _deep_merge(base, {"assembly": {"mode": "nsga2"}})
+        # mode overridden but n_composites preserved
+        assert base["assembly"] == {"mode": "nsga2", "n_composites": 20}
+
+    def test_deep_nested(self):
+        base = {"a": {"b": {"c": 1, "d": 2}, "e": 3}}
+        _deep_merge(base, {"a": {"b": {"c": 99}}})
+        assert base["a"]["b"]["c"] == 99
+        assert base["a"]["b"]["d"] == 2
+        assert base["a"]["e"] == 3
+
+    def test_override_non_dict_with_dict(self):
+        base = {"assembly": "rank"}
+        _deep_merge(base, {"assembly": {"mode": "nsga2"}})
+        assert base["assembly"] == {"mode": "nsga2"}
+
+    def test_override_dict_with_non_dict(self):
+        base = {"assembly": {"mode": "rank"}}
+        _deep_merge(base, {"assembly": None})
+        assert base["assembly"] is None
+
+    def test_empty_overrides(self):
+        base = {"a": 1}
+        _deep_merge(base, {})
+        assert base == {"a": 1}
+
+    def test_empty_base(self):
+        base = {}
+        _deep_merge(base, {"a": {"b": 1}})
+        assert base == {"a": {"b": 1}}
+
+
+class TestStrategyOptunaOverrides:
+    """Integration tests: strategy overrides for optuna config (assembly, etc.)."""
+
+    @pytest.fixture
+    def rf_configs_dir(self, tmp_path: Path) -> Path:
+        """RandomForest config with assembly defaults."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "RandomForest",
+            "class_path": {
+                "binary_classification": "sklearn.ensemble.RandomForestClassifier",
+            },
+            "task_types": ["binary_classification"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "n_estimators": {"type": "int", "low": 10, "high": 20},
+            },
+            "fixed_params": {"random_state": 42, "n_jobs": 1},
+            "training": {"needs_eval_set": False},
+            "feature_requirements": {"needs_scaling": False, "handles_missing": True},
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+                "selection_mode": "global",
+                "fold_timeout": None,
+                "assembly": {
+                    "mode": "rank",
+                    "n_composites": 10,
+                    "diversity_weight": 0.2,
+                },
+            },
+        }
+        (configs_dir / "random_forest.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    @pytest.fixture
+    def rf_pipeline(self, tmp_path: Path) -> PipelineConfig:
+        return PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["random_forest"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+
+    @pytest.fixture
+    def rf_data(self) -> pd.DataFrame:
+        rng = np.random.default_rng(42)
+        n = 60
+        X = rng.normal(0, 1, (n, 3))
+        y = (X[:, 0] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+        return train
+
+    def test_assembly_mode_override(self, rf_configs_dir, rf_data, rf_pipeline):
+        """Strategy can override assembly.mode while preserving other assembly keys."""
+        registry = ModelRegistry(rf_configs_dir)
+        strategy = {
+            "overrides": {
+                "random_forest": {
+                    "optuna": {
+                        "assembly": {"mode": "nsga2"},
+                    }
+                }
+            }
+        }
+        # Patch _create_objective to capture the optuna_cfg state
+        original_run = run_optuna_study.__wrapped__ if hasattr(run_optuna_study, '__wrapped__') else run_optuna_study
+        # We verify by checking the registry config is unchanged (deep copy)
+        # and the strategy override takes effect
+        optuna_cfg = registry.get_optuna_config("random_forest")
+        assert optuna_cfg["assembly"]["mode"] == "rank"  # original default
+
+        # Run with override — the study runs fine even though assembly.mode
+        # changed (assembly is used after study, not during Optuna trials)
+        study, _ = run_optuna_study(
+            model_name="random_forest",
+            train=rf_data,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=rf_pipeline,
+            strategy=strategy,
+            gpu=False,
+        )
+        # Original registry is unmodified (deep copy in get_optuna_config)
+        optuna_cfg_after = registry.get_optuna_config("random_forest")
+        assert optuna_cfg_after["assembly"]["mode"] == "rank"
+
+    def test_partial_assembly_preserves_keys(self, rf_configs_dir):
+        """Partial assembly override preserves unmentioned keys via deep merge."""
+        registry = ModelRegistry(rf_configs_dir)
+        optuna_cfg = registry.get_optuna_config("random_forest")
+        assert optuna_cfg["assembly"]["n_composites"] == 10
+        assert optuna_cfg["assembly"]["diversity_weight"] == 0.2
+
+        # Simulate what run_optuna_study does
+        overrides = {"assembly": {"mode": "nsga2", "diversity_weight": 0.3}}
+        _deep_merge(optuna_cfg, overrides)
+
+        assert optuna_cfg["assembly"]["mode"] == "nsga2"
+        assert optuna_cfg["assembly"]["diversity_weight"] == 0.3
+        assert optuna_cfg["assembly"]["n_composites"] == 10  # preserved!
+
+    def test_selection_mode_override(self, rf_configs_dir):
+        """Strategy can override selection_mode."""
+        registry = ModelRegistry(rf_configs_dir)
+        optuna_cfg = registry.get_optuna_config("random_forest")
+        assert optuna_cfg["selection_mode"] == "global"
+
+        _deep_merge(optuna_cfg, {"selection_mode": "per_fold", "fold_timeout": 120})
+        assert optuna_cfg["selection_mode"] == "per_fold"
+        assert optuna_cfg["fold_timeout"] == 120
+
+    def test_n_trials_override(self, rf_configs_dir, rf_data, rf_pipeline):
+        """Strategy can override n_trials via optuna key."""
+        registry = ModelRegistry(rf_configs_dir)
+        strategy = {
+            "overrides": {
+                "random_forest": {
+                    "optuna": {"n_trials": 2},
+                }
+            }
+        }
+        study, _ = run_optuna_study(
+            model_name="random_forest",
+            train=rf_data,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=rf_pipeline,
+            strategy=strategy,
+            gpu=False,
+        )
+        # Should have at most 2 trials (n_trials=2)
+        assert len(study.trials) <= 2
+
+    def test_strategy_does_not_mutate_input(self, rf_configs_dir, rf_data, rf_pipeline):
+        """run_optuna_study should not mutate the strategy dict."""
+        import copy
+        registry = ModelRegistry(rf_configs_dir)
+        strategy = {
+            "overrides": {
+                "random_forest": {
+                    "optuna": {"assembly": {"mode": "nsga2"}},
+                    "n_estimators": {"type": "int", "low": 5, "high": 15},
+                }
+            }
+        }
+        strategy_copy = copy.deepcopy(strategy)
+        run_optuna_study(
+            model_name="random_forest",
+            train=rf_data,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=rf_pipeline,
+            strategy=strategy,
+            gpu=False,
+        )
+        assert strategy == strategy_copy

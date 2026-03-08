@@ -51,6 +51,23 @@ logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.WARNIN
 ALL_SCALER_CHOICES: list[str] = ["none", "standard", "robust", "quantile"]
 
 
+def _deep_merge(base: dict, overrides: dict) -> dict:
+    """Recursively merge *overrides* into *base* in-place.
+
+    For nested dicts, values are merged rather than replaced.
+    For all other types, the override replaces the base value.
+
+    Returns:
+        The mutated *base* dict (also modified in-place).
+    """
+    for key, val in overrides.items():
+        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+    return base
+
+
 def _make_scaler(scaler_type: str) -> StandardScaler | RobustScaler | QuantileTransformer | None:
     """Create a scaler instance from a type string.
 
@@ -737,11 +754,12 @@ def run_optuna_study(
     # Copy so that .pop() calls below don't mutate the caller's strategy dict.
     model_overrides_raw = dict(overrides_all.get(model_name, None) or {})
 
-    # Separate optuna config overrides (n_trials, n_top_trials, n_seeds, etc.)
-    # from hyperparameter overrides (depth, learning_rate, etc.)
+    # Separate optuna config overrides (n_trials, n_top_trials, n_seeds,
+    # assembly, selection_mode, fold_timeout, etc.) from hyperparameter overrides.
+    # Deep merge so partial assembly overrides don't drop unspecified keys.
     optuna_overrides = model_overrides_raw.pop("optuna", None)
     if optuna_overrides:
-        optuna_cfg.update(optuna_overrides)
+        _deep_merge(optuna_cfg, optuna_overrides)
 
     # Separate hyperparameters key if present (explicit hyperparameter overrides)
     hp_overrides = model_overrides_raw.pop("hyperparameters", None)
@@ -804,6 +822,29 @@ def run_optuna_study(
             scaler_choices = ["none"] + list(scaler_choices)
         logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
 
+    # Resolve monotone constraints from strategy (feature_name → direction)
+    # into a positional list matching feature_cols order.
+    monotone_constraints_list: list[int] | None = None
+    mc_dict = strategy.get("monotone_constraints", {}) or {}
+    if mc_dict and model_name in ("catboost", "xgboost", "lightgbm"):
+        monotone_constraints_list = [
+            int(mc_dict.get(col, 0)) for col in feature_cols
+        ]
+        n_constrained = sum(1 for v in monotone_constraints_list if v != 0)
+        if n_constrained > 0:
+            if model_name == "catboost" and gpu:
+                logger.warning(
+                    f"[{model_name}] Monotone constraints ({n_constrained} features) "
+                    "skipped — CatBoost GPU does not support monotone_constraints"
+                )
+                monotone_constraints_list = None
+            else:
+                logger.info(
+                    f"[{model_name}] Monotone constraints: {n_constrained}/{len(feature_cols)} features constrained"
+                )
+        else:
+            monotone_constraints_list = None
+
     objective = _create_objective(
         model_name=model_name,
         train=train,
@@ -820,6 +861,7 @@ def run_optuna_study(
         fold_timeout=fold_timeout,
         n_top_trials=optuna_cfg["n_top_trials"],
         scaler_choices=scaler_choices,
+        monotone_constraints=monotone_constraints_list,
     )
 
     # Configure pruner
@@ -886,6 +928,7 @@ def _create_objective(
     fold_timeout: int | None = None,
     n_top_trials: int = 5,
     scaler_choices: list[str] | None = None,
+    monotone_constraints: list[int] | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Create an Optuna objective function for a model.
 
@@ -1109,6 +1152,13 @@ def _create_objective(
             model_hparams = dict(hparams)
             if es_in_constructor and early_stopping_rounds:
                 model_hparams["early_stopping_rounds"] = early_stopping_rounds
+
+            # Monotone constraints (CatBoost/XGBoost/LightGBM)
+            if monotone_constraints is not None:
+                if model_name == "catboost" and gpu:
+                    pass  # CatBoost GPU doesn't support monotone_constraints
+                else:
+                    model_hparams["monotone_constraints"] = tuple(monotone_constraints)
 
             # Fresh model per fold — each fold gets an independent RandomState,
             # matching the behaviour of train_with_config for reproducibility.
@@ -1342,6 +1392,7 @@ def train_with_config(
     gpu: bool,
     seeds: list[int],
     results_dir: Path,
+    monotone_constraints: list[int] | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
     """Train a model with fixed hyperparameters across multiple seeds.
 
@@ -1442,6 +1493,11 @@ def train_with_config(
             hparams_seeded[eval_metric_param] = eval_metric_val
         if es_in_constructor and early_stopping_rounds:
             hparams_seeded["early_stopping_rounds"] = early_stopping_rounds
+        if monotone_constraints is not None:
+            if model_name == "catboost" and gpu:
+                pass  # CatBoost GPU doesn't support monotone_constraints
+            else:
+                hparams_seeded["monotone_constraints"] = tuple(monotone_constraints)
 
         if task_type == "multiclass":
             oof_preds = np.zeros((len(X_train), n_classes))
@@ -1805,6 +1861,17 @@ def run_all_studies(
                     f"{total_retrain_fits} fits"
                 )
 
+                # Resolve monotone constraints for retraining
+                mc_dict = strategy.get("monotone_constraints", {}) or {}
+                mc_list: list[int] | None = None
+                if mc_dict and model_name in ("catboost", "xgboost", "lightgbm"):
+                    if model_name == "catboost" and gpu:
+                        mc_list = None  # CatBoost GPU doesn't support monotone_constraints
+                    else:
+                        mc_list = [int(mc_dict.get(col, 0)) for col in feature_cols]
+                        if not any(v != 0 for v in mc_list):
+                            mc_list = None
+
                 for cfg_idx, cfg in enumerate(top_configs, 1):
                     logger.debug(
                         f"[{model_name}] Retrain config {cfg_idx}/{len(top_configs)} "
@@ -1823,6 +1890,7 @@ def run_all_studies(
                         gpu=gpu,
                         seeds=seeds,
                         results_dir=results_dir,
+                        monotone_constraints=mc_list,
                     )
                     all_oof.extend(oof_list)
                     all_test.extend(test_list)

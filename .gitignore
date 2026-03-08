@@ -8,7 +8,16 @@ competitions/*/results/
 
 # Strategy files (generated per competition)
 strategy_output.yaml
-competitions/*/strategy_output.yaml
+
+# Competition data — large CSVs should not be committed
+# Keep: pipeline.yaml, strategy_output.yaml, CLAUDE.md
+competitions/*/train.csv
+competitions/*/test.csv
+competitions/*/sample_submission.csv
+competitions/*/eda_report.txt
+competitions/*/eda_report.json
+competitions/*/data_description.txt
+competitions/*/*.npy
 
 # prompts
 prompts/

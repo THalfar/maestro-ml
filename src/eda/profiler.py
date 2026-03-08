@@ -19,9 +19,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import KFold, StratifiedKFold
 
 
 def _add_skewness_and_outliers(
@@ -777,6 +779,502 @@ def _compute_vif(
     return dict(sorted(vif_scores.items(), key=lambda x: x[1], reverse=True))
 
 
+def _count_duplicates(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+) -> dict[str, Any]:
+    """Count duplicate and conflicting rows for a given feature set.
+
+    Helper used by _detect_duplicates for both full and signal-only passes.
+
+    Args:
+        feature_df: Feature columns to check.
+        target_series: Target series (same length).
+
+    Returns:
+        Dict with n_duplicate_rows, duplicate_pct, n_conflicting_rows,
+        conflicting_pct, n_duplicate_groups, n_conflicting_groups.
+    """
+    n_total = len(feature_df)
+    if n_total == 0 or feature_df.shape[1] == 0:
+        return {
+            "n_duplicate_rows": 0, "duplicate_pct": 0.0,
+            "n_conflicting_rows": 0, "conflicting_pct": 0.0,
+            "n_duplicate_groups": 0, "n_conflicting_groups": 0,
+        }
+
+    row_hash = pd.util.hash_pandas_object(feature_df, index=False)
+    hash_counts = row_hash.value_counts()
+    dup_hashes = hash_counts[hash_counts > 1]
+
+    n_dup_groups = len(dup_hashes)
+    dup_mask = row_hash.isin(dup_hashes.index)
+    n_dup_rows = int(dup_mask.sum())
+
+    n_conflict_rows = 0
+    n_conflict_groups = 0
+    if n_dup_rows > 0:
+        combined = pd.DataFrame({"hash": row_hash, "target": target_series.values})
+        dup_combined = combined[dup_mask]
+        target_per_hash = dup_combined.groupby("hash")["target"].nunique()
+        conflict_hashes = target_per_hash[target_per_hash > 1]
+        n_conflict_groups = len(conflict_hashes)
+        if n_conflict_groups > 0:
+            conflict_mask = row_hash.isin(conflict_hashes.index)
+            n_conflict_rows = int(conflict_mask.sum())
+
+    return {
+        "n_duplicate_rows": n_dup_rows,
+        "duplicate_pct": round(n_dup_rows / n_total * 100, 2),
+        "n_conflicting_rows": n_conflict_rows,
+        "conflicting_pct": round(n_conflict_rows / n_total * 100, 2),
+        "n_duplicate_groups": n_dup_groups,
+        "n_conflicting_groups": n_conflict_groups,
+    }
+
+
+def _detect_duplicates(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    columns_analysis: dict[str, dict] | None = None,
+) -> dict[str, Any]:
+    """Detect duplicate and conflicting rows in training data.
+
+    Performs two passes:
+    1. **Full pass**: all feature columns — exact duplicates.
+    2. **Signal-only pass**: excludes noise columns (IV=0 AND AUC~0.5,
+       or near-zero-variance >99%). This catches hidden duplicates masked by
+       noise features (e.g., Porto Seguro's ps_calc_* columns).
+
+    Uses hash-based approach for speed (avoids groupby on many columns).
+
+    Args:
+        feature_df: Feature columns (no target, no id).
+        target_series: Target series.
+        columns_analysis: Per-column analysis dict from run_eda. If provided,
+            enables the signal-only pass. Keys used: ``iv``, ``dominant_pct``,
+            ``mutual_information``, ``univariate_auc``.
+
+    Returns:
+        Dict with full-pass keys (n_duplicate_rows, duplicate_pct, etc.)
+        and optional signal_only sub-dict with same keys + dropped_columns list.
+    """
+    result = _count_duplicates(feature_df, target_series)
+
+    # Signal-only pass: drop noise columns
+    if columns_analysis:
+        noise_cols: list[str] = []
+        for col, info in columns_analysis.items():
+            if col not in feature_df.columns:
+                continue
+            dom_pct = info.get("dominant_pct", 0) or 0
+            iv = info.get("iv")
+            mi = info.get("mutual_information", 0) or 0
+            auc = info.get("univariate_auc")
+
+            # Near-zero-variance: >99% same value
+            if dom_pct > 99.0:
+                noise_cols.append(col)
+                continue
+
+            # Near-zero IV + AUC ~0.5 → pure noise
+            # IV has small estimation noise on large N (ps_calc_* get IV≈0.0001–0.001).
+            # Threshold IV < 0.001 catches noise but preserves weak-signal features.
+            if iv is not None and iv < 0.001:
+                if auc is not None and abs(auc - 0.5) < 0.01:
+                    noise_cols.append(col)
+                    continue
+
+        if noise_cols:
+            signal_cols = [c for c in feature_df.columns if c not in noise_cols]
+            if signal_cols and len(signal_cols) < len(feature_df.columns):
+                signal_df = feature_df[signal_cols]
+                signal_result = _count_duplicates(signal_df, target_series)
+                signal_result["dropped_columns"] = sorted(noise_cols)
+                signal_result["n_signal_features"] = len(signal_cols)
+                result["signal_only"] = signal_result
+
+    return result
+
+
+def _compute_unseen_categories(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    columns_analysis: dict[str, dict],
+) -> dict[str, dict[str, Any]]:
+    """Find categorical values in test that don't appear in train.
+
+    Unseen categories get only the global prior in target encoding, so high
+    unseen counts signal the need for higher smoothing alpha or frequency-based
+    encoding fallback.
+
+    Args:
+        train_df: Feature columns from train.
+        test_df: Feature columns from test.
+        columns_analysis: Per-column type info.
+
+    Returns:
+        Dict keyed by column name (only columns with unseen values) with:
+        - n_unseen: count of unique values in test not in train
+        - n_test_unique: total unique values in test
+        - unseen_pct: n_unseen / n_test_unique * 100
+        - unseen_row_pct: percentage of test rows containing unseen values
+        - unseen_values: list of unseen values (up to 20)
+    """
+    cat_types = {"low_cardinality_categorical", "high_cardinality_categorical",
+                 "ordinal", "binary"}
+    result: dict[str, dict[str, Any]] = {}
+
+    for col, info in columns_analysis.items():
+        if info["detected_type"] not in cat_types:
+            continue
+        if col not in train_df.columns or col not in test_df.columns:
+            continue
+
+        train_vals = set(train_df[col].dropna().unique())
+        test_vals = set(test_df[col].dropna().unique())
+        unseen = test_vals - train_vals
+
+        if not unseen:
+            continue
+
+        n_test_unique = len(test_vals)
+        test_series = test_df[col].dropna()
+        unseen_row_count = int(test_series.isin(unseen).sum())
+        unseen_row_pct = (
+            round(float(unseen_row_count) / len(test_series) * 100, 2)
+            if len(test_series) > 0 else 0.0
+        )
+
+        result[col] = {
+            "n_unseen": len(unseen),
+            "n_test_unique": n_test_unique,
+            "unseen_pct": round(len(unseen) / n_test_unique * 100, 1) if n_test_unique > 0 else 0.0,
+            "unseen_row_pct": unseen_row_pct,
+            "unseen_values": sorted([str(v) for v in unseen])[:20],
+        }
+
+    return result
+
+
+def _detect_monotonicity(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    columns_analysis: dict[str, dict],
+    n_bins: int = 10,
+) -> dict[str, dict[str, Any]]:
+    """Detect monotonic relationships between features and target.
+
+    Bins each numeric feature and computes mean target per bin. Features with
+    strong monotonic trends (|Spearman rho| > 0.7 on binned means) can benefit
+    from monotone_constraints in gradient boosting models.
+
+    Args:
+        feature_df: Feature columns (no target, no id).
+        target_series: Target series.
+        columns_analysis: Per-column type info.
+        n_bins: Number of bins for numeric features.
+
+    Returns:
+        Dict keyed by column name with:
+        - spearman_rho: Spearman correlation on binned target rates
+        - direction: "increasing", "decreasing", or "non_monotonic"
+        - is_monotonic: True if |rho| > 0.7
+    """
+    result: dict[str, dict[str, Any]] = {}
+    y = target_series.values.astype(float)
+
+    for col, info in columns_analysis.items():
+        if info["stats"] is None or col not in feature_df.columns:
+            continue
+        if info["cardinality"] < 3:
+            continue
+
+        series = feature_df[col]
+        try:
+            binned = pd.qcut(
+                series.fillna(series.median()), q=n_bins,
+                duplicates="drop", labels=False,
+            )
+        except ValueError:
+            continue
+
+        if binned.nunique() < 3:
+            continue
+
+        df_temp = pd.DataFrame({"bin": binned, "target": y})
+        bin_means = df_temp.groupby("bin")["target"].mean()
+        if len(bin_means) < 3:
+            continue
+
+        rho, _ = scipy_stats.spearmanr(bin_means.index, bin_means.values)
+        if np.isnan(rho):
+            continue
+
+        is_mono = abs(rho) > 0.7
+        if rho > 0.7:
+            direction = "increasing"
+        elif rho < -0.7:
+            direction = "decreasing"
+        else:
+            direction = "non_monotonic"
+
+        result[col] = {
+            "spearman_rho": round(float(rho), 4),
+            "direction": direction,
+            "is_monotonic": is_mono,
+        }
+
+    return result
+
+
+def _compute_cardinality_profile(
+    feature_df: pd.DataFrame,
+    columns_analysis: dict[str, dict],
+) -> dict[str, dict[str, Any]]:
+    """Profile the distribution shape of categorical features.
+
+    Reports concentration (top-K share) and entropy to distinguish uniform
+    distributions from long-tail ones. Long-tail categoricals need different
+    encoding strategies (frequency encoding, rare-category binning).
+
+    Args:
+        feature_df: Feature columns.
+        columns_analysis: Per-column type info.
+
+    Returns:
+        Dict keyed by column name with:
+        - top5_share: percentage of rows in top-5 categories
+        - top10_share: percentage of rows in top-10 categories
+        - entropy: Shannon entropy (higher = more uniform)
+        - normalized_entropy: entropy / max_entropy (1.0 = perfectly uniform)
+        - shape: "uniform", "moderate", or "long_tail"
+    """
+    cat_types = {"low_cardinality_categorical", "high_cardinality_categorical", "ordinal"}
+    result: dict[str, dict[str, Any]] = {}
+
+    for col, info in columns_analysis.items():
+        if info["detected_type"] not in cat_types:
+            continue
+        if info["cardinality"] < 3 or col not in feature_df.columns:
+            continue
+
+        vc = feature_df[col].value_counts(normalize=True)
+        n_cats = len(vc)
+        top5_share = float(vc.head(5).sum()) * 100
+        top10_share = float(vc.head(10).sum()) * 100
+
+        probs = vc.values
+        entropy = float(-np.sum(probs * np.log2(probs + 1e-10)))
+        max_entropy = float(np.log2(n_cats)) if n_cats > 1 else 1.0
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 1.0
+
+        if normalized_entropy > 0.8:
+            shape = "uniform"
+        elif normalized_entropy > 0.5:
+            shape = "moderate"
+        else:
+            shape = "long_tail"
+
+        result[col] = {
+            "top5_share": round(top5_share, 1),
+            "top10_share": round(top10_share, 1),
+            "entropy": round(entropy, 3),
+            "normalized_entropy": round(normalized_entropy, 3),
+            "shape": shape,
+        }
+
+    return result
+
+
+def _compute_target_encoding_preview(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    columns_analysis: dict[str, dict],
+    n_folds: int = 5,
+    alpha: float = 10.0,
+) -> dict[str, dict[str, Any]]:
+    """Preview target encoding effectiveness per categorical feature.
+
+    Simulates OOF target encoding with smoothing and reports the resulting
+    correlation with target. Gives the LLM a concrete number for whether
+    target encoding is worthwhile for each feature.
+
+    Args:
+        feature_df: Feature columns.
+        target_series: Target series.
+        columns_analysis: Per-column type info.
+        n_folds: Number of CV folds for OOF encoding.
+        alpha: Smoothing parameter (higher = more regularization).
+
+    Returns:
+        Dict keyed by column name, sorted by |encoded_corr| descending, with:
+        - encoded_corr: Pearson correlation of OOF-encoded column with target
+        - encoded_auc: AUC of OOF-encoded column (binary only, else None)
+    """
+    cat_types = {"low_cardinality_categorical", "high_cardinality_categorical",
+                 "ordinal"}
+    result: dict[str, dict[str, Any]] = {}
+    y = target_series.values.astype(float)
+    global_mean = float(np.nanmean(y))
+    is_binary = len(np.unique(y[~np.isnan(y)])) == 2
+
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    for col, info in columns_analysis.items():
+        if info["detected_type"] not in cat_types:
+            continue
+        if info["cardinality"] < 2 or col not in feature_df.columns:
+            continue
+
+        series = feature_df[col].values
+        encoded = np.full(len(y), np.nan)
+
+        for train_idx, val_idx in kf.split(series):
+            # Smoothed target encoding on train fold
+            cat_stats: dict[Any, tuple[float, int]] = {}
+            for i in train_idx:
+                cat = series[i]
+                if pd.isna(cat):
+                    continue
+                if cat not in cat_stats:
+                    cat_stats[cat] = (0.0, 0)
+                s, c = cat_stats[cat]
+                cat_stats[cat] = (s + y[i], c + 1)
+
+            for idx in val_idx:
+                cat = series[idx]
+                if pd.isna(cat) or cat not in cat_stats:
+                    encoded[idx] = global_mean
+                else:
+                    s, c = cat_stats[cat]
+                    encoded[idx] = (s + alpha * global_mean) / (c + alpha)
+
+        mask = ~np.isnan(encoded)
+        if mask.sum() < 10:
+            continue
+
+        corr_mat = np.corrcoef(encoded[mask], y[mask])
+        corr_val = float(corr_mat[0, 1]) if not np.isnan(corr_mat[0, 1]) else 0.0
+
+        auc_val = None
+        if is_binary:
+            try:
+                auc_val = float(roc_auc_score(y[mask], encoded[mask]))
+                auc_val = max(auc_val, 1.0 - auc_val)
+            except ValueError:
+                pass
+
+        result[col] = {
+            "encoded_corr": round(corr_val, 4),
+            "encoded_auc": round(auc_val, 4) if auc_val is not None else None,
+        }
+
+    return dict(sorted(result.items(), key=lambda x: abs(x[1]["encoded_corr"]), reverse=True))
+
+
+def _compute_quick_importance_and_baseline(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    task_type: str,
+    n_folds: int = 3,
+    max_samples: int = 50000,
+) -> dict[str, Any]:
+    """Train a quick random forest to get feature importances and baseline score.
+
+    Combines two analyses: (1) feature importance from a quick model (sees
+    interactions and non-linear effects unlike univariate metrics), and
+    (2) baseline OOF score as a performance estimate without feature engineering.
+
+    Subsamples large datasets for speed. Fully deterministic (seeded).
+
+    Args:
+        feature_df: Feature columns. Categoricals are label-encoded.
+        target_series: Target series.
+        task_type: 'binary_classification' or 'regression'.
+        n_folds: Number of CV folds.
+        max_samples: Subsample to this many rows for speed.
+
+    Returns:
+        Dict with:
+        - feature_importances: dict {col: importance} sorted descending
+        - baseline_score: float (AUC for classification, RMSE for regression)
+        - baseline_metric: str describing the metric used
+    """
+    if feature_df.empty or len(target_series) == 0:
+        return {"feature_importances": {}, "baseline_score": None, "baseline_metric": "N/A"}
+
+    y = target_series.values.astype(float)
+    cols = list(feature_df.columns)
+
+    # Prepare X: label-encode categoricals, fill NaN
+    arrays: list[np.ndarray] = []
+    for col in cols:
+        series = feature_df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            codes, _ = pd.factorize(series, sort=False)
+            arrays.append(codes.astype(float))
+        else:
+            arrays.append(series.fillna(series.median()).values.astype(float))
+
+    X = np.column_stack(arrays) if arrays else np.empty((len(feature_df), 0))
+    X = np.nan_to_num(X, nan=0.0)
+
+    # Subsample for speed on large datasets
+    rng = np.random.default_rng(42)
+    if len(X) > max_samples:
+        idx = rng.choice(len(X), max_samples, replace=False)
+        idx.sort()
+        X = X[idx]
+        y = y[idx]
+
+    # Auto-detect: if task_type says classification but target is actually
+    # continuous (many unique values), fall back to regression.
+    n_unique = len(np.unique(y[~np.isnan(y)]))
+    is_classification = task_type != "regression" and n_unique <= 30
+
+    if is_classification:
+        model_cls = RandomForestClassifier
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        split_target = y
+    else:
+        model_cls = RandomForestRegressor
+        cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        split_target = None
+
+    model_kwargs = dict(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1)
+    oof = np.zeros(len(y))
+    importances = np.zeros(len(cols))
+
+    for train_idx, val_idx in cv.split(X, split_target):
+        model = model_cls(**model_kwargs)
+        model.fit(X[train_idx], y[train_idx])
+        if is_classification:
+            oof[val_idx] = model.predict_proba(X[val_idx])[:, 1]
+        else:
+            oof[val_idx] = model.predict(X[val_idx])
+        importances += model.feature_importances_ / n_folds
+
+    if is_classification:
+        try:
+            score = float(roc_auc_score(y, oof))
+        except ValueError:
+            score = 0.5
+        metric_name = "AUC"
+    else:
+        score = float(np.sqrt(np.mean((y - oof) ** 2)))
+        metric_name = "RMSE"
+
+    imp_dict = {col: round(float(imp), 6) for col, imp in zip(cols, importances)}
+    imp_dict = dict(sorted(imp_dict.items(), key=lambda x: x[1], reverse=True))
+
+    return {
+        "feature_importances": imp_dict,
+        "baseline_score": round(score, 6),
+        "baseline_metric": metric_name,
+    }
+
+
 def run_eda(
     train_path: str | Path,
     test_path: str | Path,
@@ -955,6 +1453,30 @@ def run_eda(
     # Cramér's V (categorical-categorical associations)
     cramers_v = _compute_cramers_v(feature_df, columns_analysis)
 
+    # Duplicate and conflicting row detection
+    duplicates = _detect_duplicates(feature_df, target_series, columns_analysis)
+
+    # Unseen categories in test
+    unseen_categories = _compute_unseen_categories(
+        feature_df, test_feature_df, columns_analysis
+    )
+
+    # Monotonicity detection
+    monotonicity = _detect_monotonicity(feature_df, target_series, columns_analysis)
+
+    # Categorical cardinality profiles
+    cardinality_profiles = _compute_cardinality_profile(feature_df, columns_analysis)
+
+    # Target encoding preview
+    te_preview = _compute_target_encoding_preview(
+        feature_df, target_series, columns_analysis
+    )
+
+    # Quick model baseline and feature importances
+    quick_model = _compute_quick_importance_and_baseline(
+        feature_df, target_series, task_type
+    )
+
     # Weak features
     weak_features = _identify_weak_features(target_correlations, threshold=0.05)
 
@@ -966,6 +1488,11 @@ def run_eda(
         distribution_shift=distribution_shift,
         iv_woe=iv_woe,
         univariate_auc=univariate_auc,
+        duplicates=duplicates,
+        unseen_categories=unseen_categories,
+        monotonicity=monotonicity,
+        te_preview=te_preview,
+        quick_model=quick_model,
     )
 
     # Preprocessing summary: aggregate scaling/transform signals for LLM
@@ -988,6 +1515,12 @@ def run_eda(
         "iv_woe": iv_woe,
         "cramers_v": cramers_v,
         "preprocessing_summary": preprocessing_summary,
+        "duplicates": duplicates,
+        "unseen_categories": unseen_categories,
+        "monotonicity": monotonicity,
+        "cardinality_profiles": cardinality_profiles,
+        "te_preview": te_preview,
+        "quick_model": quick_model,
     }
     return report, train, test
 
@@ -1073,6 +1606,11 @@ def _generate_recommendations(
     distribution_shift: dict | None = None,
     iv_woe: dict[str, dict] | None = None,
     univariate_auc: dict[str, float] | None = None,
+    duplicates: dict[str, Any] | None = None,
+    unseen_categories: dict[str, dict] | None = None,
+    monotonicity: dict[str, dict] | None = None,
+    te_preview: dict[str, dict] | None = None,
+    quick_model: dict[str, Any] | None = None,
 ) -> list[str]:
     """Generate LLM-readable recommendation strings from EDA results."""
     recs = []
@@ -1083,6 +1621,92 @@ def _generate_recommendations(
             recs.append(
                 f"LEAKAGE WARNING: {w['column']} has suspiciously high predictive "
                 f"power ({w['reason']}={w['value']:.3f}). Verify this is not data leakage."
+            )
+
+    # Duplicate/conflict warnings
+    if duplicates and duplicates.get("n_conflicting_rows", 0) > 0:
+        recs.append(
+            f"CONFLICTING DUPLICATES: {duplicates['n_conflicting_rows']} rows "
+            f"({duplicates['conflicting_pct']:.1f}%) have identical features but "
+            f"different targets. This sets a hard ceiling on model performance — "
+            f"no feature engineering can resolve these."
+        )
+    elif duplicates and duplicates.get("duplicate_pct", 0) > 5:
+        recs.append(
+            f"High duplicate rate: {duplicates['duplicate_pct']:.1f}% of rows are "
+            f"exact duplicates (but same target). Consider deduplication or "
+            f"sample weighting."
+        )
+
+    # Signal-only duplicates (noise features mask real duplicates)
+    signal_dupes = duplicates.get("signal_only", {}) if duplicates else {}
+    if signal_dupes and signal_dupes.get("n_conflicting_rows", 0) > 0:
+        n_dropped = len(signal_dupes.get("dropped_columns", []))
+        recs.append(
+            f"HIDDEN CONFLICTS: After dropping {n_dropped} noise columns, "
+            f"{signal_dupes['n_conflicting_rows']} rows "
+            f"({signal_dupes['conflicting_pct']:.1f}%) have identical signal features "
+            f"but different targets. Noise features mask real conflicts — drop them "
+            f"to reveal the true performance ceiling."
+        )
+    elif signal_dupes and signal_dupes.get("n_duplicate_rows", 0) > 0 and duplicates.get("n_duplicate_rows", 0) == 0:
+        n_dropped = len(signal_dupes.get("dropped_columns", []))
+        recs.append(
+            f"HIDDEN DUPLICATES: {signal_dupes['n_duplicate_rows']} rows "
+            f"({signal_dupes['duplicate_pct']:.1f}%) are duplicates in signal features "
+            f"but differ only in {n_dropped} noise columns. Dropping noise features "
+            f"will expose this redundancy."
+        )
+
+    # Quick model baseline
+    if quick_model and quick_model.get("baseline_score") is not None:
+        metric = quick_model["baseline_metric"]
+        score = quick_model["baseline_score"]
+        recs.append(
+            f"Quick RF baseline (no feature engineering): {metric}={score:.4f}. "
+            f"This is the performance floor — feature engineering should improve on this."
+        )
+
+    # Monotonicity signals
+    if monotonicity:
+        mono_feats = [
+            (col, info["direction"]) for col, info in monotonicity.items()
+            if info["is_monotonic"]
+        ]
+        if mono_feats:
+            desc = ", ".join(f"{c}({d})" for c, d in mono_feats[:8])
+            recs.append(
+                f"Monotonic features: {desc}. "
+                "Consider monotone_constraints in gradient boosting for regularization."
+            )
+
+    # Target encoding preview
+    if te_preview:
+        strong_te = [
+            (col, info["encoded_corr"]) for col, info in te_preview.items()
+            if abs(info["encoded_corr"]) > 0.05
+        ]
+        if strong_te:
+            desc = ", ".join(f"{c}(corr={corr:+.3f})" for c, corr in strong_te[:5])
+            recs.append(
+                f"Target encoding effective for: {desc}. "
+                "Prioritize these for OOF target encoding."
+            )
+
+    # Unseen categories
+    if unseen_categories:
+        high_unseen = [
+            (col, info) for col, info in unseen_categories.items()
+            if info["unseen_row_pct"] > 1.0
+        ]
+        if high_unseen:
+            desc = ", ".join(
+                f"{c}({info['n_unseen']} unseen, {info['unseen_row_pct']:.1f}% rows)"
+                for c, info in high_unseen[:5]
+            )
+            recs.append(
+                f"Unseen test categories: {desc}. "
+                "Increase target encoding smoothing alpha or use frequency encoding fallback."
             )
 
     # Strong IV features
@@ -1560,6 +2184,15 @@ def format_eda_for_llm(eda_report: dict) -> str:
         f"({info.get('test_memory_mb', 0):.1f} MB)"
     )
     lines.append(f"Features    : {info.get('n_features', 'N/A')}")
+    train_shape = info.get("train_shape", [0, 0])
+    if isinstance(train_shape, list) and len(train_shape) >= 1 and train_shape[0] > 0:
+        n_rows = train_shape[0]
+        for n_folds in (5, 10):
+            fold_train = n_rows * (n_folds - 1) // n_folds
+            fold_val = n_rows // n_folds
+            lines.append(
+                f"  {n_folds}-fold CV  : ~{fold_train:,} train / ~{fold_val:,} val per fold"
+            )
     lines.append("")
 
     # Target distribution
@@ -1834,6 +2467,108 @@ def format_eda_for_llm(eda_report: dict) -> str:
         for col, dom_pct in nzv:
             lines.append(f"  {col:<35} dominant={dom_pct:.1f}%")
         lines.append("")
+
+    # Duplicate analysis
+    dupes = eda_report.get("duplicates", {})
+    signal_dupes = dupes.get("signal_only", {}) if dupes else {}
+    has_exact = dupes and (dupes.get("n_duplicate_rows", 0) > 0 or dupes.get("n_conflicting_rows", 0) > 0)
+    has_signal = signal_dupes and (signal_dupes.get("n_duplicate_rows", 0) > 0 or signal_dupes.get("n_conflicting_rows", 0) > 0)
+    if has_exact or has_signal:
+        lines.append("─" * 50)
+        lines.append("DUPLICATE ANALYSIS")
+        lines.append("─" * 50)
+        lines.append(f"  Exact duplicate rows : {dupes.get('n_duplicate_rows', 0)} ({dupes.get('duplicate_pct', 0):.1f}%)")
+        lines.append(f"  Exact dup groups     : {dupes.get('n_duplicate_groups', 0)}")
+        lines.append(f"  Conflicting rows     : {dupes.get('n_conflicting_rows', 0)} ({dupes.get('conflicting_pct', 0):.1f}%)")
+        lines.append(f"  Conflicting groups   : {dupes.get('n_conflicting_groups', 0)}")
+        if dupes.get("n_conflicting_rows", 0) > 0:
+            lines.append("  ⚠ Conflicting duplicates set a hard ceiling on achievable performance.")
+        if has_signal:
+            n_dropped = len(signal_dupes.get("dropped_columns", []))
+            n_signal = signal_dupes.get("n_signal_features", 0)
+            lines.append(f"  --- Signal-only ({n_signal} features, {n_dropped} noise columns dropped) ---")
+            dropped_list = ", ".join(signal_dupes.get("dropped_columns", []))
+            lines.append(f"  Dropped: {dropped_list}")
+            lines.append(f"  Signal duplicate rows : {signal_dupes['n_duplicate_rows']} ({signal_dupes['duplicate_pct']:.1f}%)")
+            lines.append(f"  Signal dup groups     : {signal_dupes['n_duplicate_groups']}")
+            lines.append(f"  Signal conflicts      : {signal_dupes['n_conflicting_rows']} ({signal_dupes['conflicting_pct']:.1f}%)")
+            lines.append(f"  Signal conflict groups: {signal_dupes['n_conflicting_groups']}")
+            if signal_dupes.get("n_conflicting_rows", 0) > 0:
+                lines.append("  ⚠ Noise features mask real conflicts — these set a hard AUC ceiling.")
+        lines.append("")
+
+    # Unseen categories (train-test overlap)
+    unseen = eda_report.get("unseen_categories", {})
+    if unseen:
+        lines.append("─" * 50)
+        lines.append("TRAIN-TEST OVERLAP (unseen categories in test)")
+        lines.append("─" * 50)
+        for col, info in sorted(unseen.items(), key=lambda x: x[1]["unseen_row_pct"], reverse=True):
+            lines.append(
+                f"  {col:<30} {info['n_unseen']} unseen / {info['n_test_unique']} unique  "
+                f"({info['unseen_row_pct']:.1f}% test rows)"
+            )
+            if info.get("unseen_values"):
+                vals_str = ", ".join(info["unseen_values"][:10])
+                lines.append(f"    values: {vals_str}")
+        lines.append("")
+
+    # Monotonicity detection
+    mono = eda_report.get("monotonicity", {})
+    mono_feats = {col: info for col, info in mono.items() if info.get("is_monotonic")}
+    if mono_feats:
+        lines.append("─" * 50)
+        lines.append("MONOTONICITY DETECTION (|Spearman rho| > 0.7 on binned target rates)")
+        lines.append("─" * 50)
+        for col, info in sorted(mono_feats.items(), key=lambda x: abs(x[1]["spearman_rho"]), reverse=True):
+            lines.append(
+                f"  {col:<35} rho={info['spearman_rho']:+.3f}  ({info['direction']})"
+            )
+        lines.append("  → Use monotone_constraints in gradient boosting for regularization.")
+        lines.append("")
+
+    # Cardinality profiles
+    card = eda_report.get("cardinality_profiles", {})
+    if card:
+        lines.append("─" * 50)
+        lines.append("CATEGORICAL CARDINALITY PROFILES")
+        lines.append("─" * 50)
+        for col, info in sorted(card.items(), key=lambda x: x[1]["normalized_entropy"]):
+            lines.append(
+                f"  {col:<30} shape={info['shape']:<10} "
+                f"top5={info['top5_share']:.0f}%  entropy={info['entropy']:.2f} "
+                f"(norm={info['normalized_entropy']:.2f})"
+            )
+        lines.append("")
+
+    # Target encoding preview
+    te = eda_report.get("te_preview", {})
+    if te:
+        lines.append("─" * 50)
+        lines.append("TARGET ENCODING PREVIEW (OOF, alpha=10)")
+        lines.append("─" * 50)
+        for col, info in te.items():
+            auc_str = f"  AUC={info['encoded_auc']:.4f}" if info.get("encoded_auc") is not None else ""
+            lines.append(
+                f"  {col:<35} corr={info['encoded_corr']:+.4f}{auc_str}"
+            )
+        lines.append("")
+
+    # Quick model baseline and feature importances
+    qm = eda_report.get("quick_model", {})
+    if qm and qm.get("baseline_score") is not None:
+        lines.append("─" * 50)
+        lines.append("QUICK MODEL BASELINE (RandomForest, 3-fold CV, no feature engineering)")
+        lines.append("─" * 50)
+        lines.append(f"  Baseline {qm['baseline_metric']}: {qm['baseline_score']:.4f}")
+        lines.append("")
+        imp = qm.get("feature_importances", {})
+        if imp:
+            lines.append("  Feature importances (top 15):")
+            for col, importance in list(imp.items())[:15]:
+                bar = "█" * int(importance * 200)
+                lines.append(f"    {col:<35} {importance:.4f}  {bar}")
+            lines.append("")
 
     # Preprocessing summary (scaling/transform signals for LLM)
     preproc = eda_report.get("preprocessing_summary", {})

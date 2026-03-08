@@ -6,9 +6,8 @@
 # components, giving ensemble diversity at a fraction of the cost.
 # Uses the same sklearn-compatible API as RealMLP (TabM_D_Classifier).
 #
-# Uses per-fold selection (selection_mode: per_fold) with rank-based
-# assembly — simpler than RealMLP's NSGA-II assembly but still captures
-# neural network stochasticity across folds.
+# Uses per-fold selection (selection_mode: per_fold) with NSGA-II
+# assembly — diversity-optimized composite selection like RealMLP.
 # =============================================================================
 
 name: TabM
@@ -134,7 +133,7 @@ feature_requirements:
 
 optuna:
   n_trials: 1000
-  qmc_warmup_trials: 20
+  qmc_warmup_trials: 30
   timeout: null
   pruner:
     type: median
@@ -145,5 +144,9 @@ optuna:
   selection_mode: per_fold
   fold_timeout: 120
   assembly:
-    mode: rank                                   # rank-based assembly (deterministic, simple)
+    mode: nsga2                                  # diversity-optimized assembly (like RealMLP)
     n_composites: 20
+    n_generations: 100
+    pop_size: 150
+    diversity_metric: spearman_neff              # rank-based diversity — suits AUC metric
+    diversity_weight: 0.3                        # fallback if knee-point detection fails

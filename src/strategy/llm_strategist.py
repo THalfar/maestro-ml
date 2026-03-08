@@ -230,6 +230,12 @@ def _build_strategy_prompt(
            - models: which models to include
            - overrides: per-model hyperparameter range adjustments
            - reasoning: explanation of choices
+           - preprocessing (optional): scaler_choices list and per_model
+             overrides for needs_scaling / scaler_choices
+           - monotone_constraints (optional): dict mapping feature name to
+             direction (-1, 0, 1) for catboost/xgboost/lightgbm
+           - drop_columns (optional): list of column names to drop before
+             feature engineering (e.g. noisy calculated features)
         5. Add guidelines:
            - Focus on narrowing search spaces, not guessing exact values.
            - Create features based on correlations and domain patterns.
@@ -316,12 +322,37 @@ overrides:
       low: 4
       high: 8
 
+# Optional: control scaler search for linear/distance models.
+# scaler_choices narrows Optuna's scaler options globally or per model.
+# Use "robust" if EDA shows outliers, "quantile" if high skew.
+# per_model overrides can also force scaling on/off for a specific model.
+preprocessing:
+  scaler_choices: ["robust", "quantile"]  # omit section if no strong signal
+  per_model:
+    ridge:
+      scaler_choices: ["robust"]
+    realmlp:
+      needs_scaling: true
+      scaler_choices: ["none", "robust"]
+
+# Optional: monotone constraints for gradient boosting (catboost/xgboost/lightgbm).
+# Only set when EDA shows a clear monotonic relationship (|rho| > 0.7).
+# Values: 1 = increasing, -1 = decreasing, 0 = unconstrained (omit instead).
+monotone_constraints:
+  feature_name: 1    # example: higher value → higher target probability
+
+# Optional: drop noisy or leaky columns before feature engineering.
+drop_columns:
+  - col_to_drop
+
 reasoning: >
   Brief explanation of your choices here.
 ```
 
 Only include features that make domain sense based on the correlation patterns.
 Only include models that will add meaningful diversity.
+Omit optional sections (preprocessing, monotone_constraints, drop_columns) when
+the EDA shows no strong signal justifying them.
 Return ONLY the YAML block above, with no other text before or after it.
 """
     return prompt
