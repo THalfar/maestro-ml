@@ -50,12 +50,12 @@ hyperparameters:
   d_block:
     type: int
     low: 64
-    high: 256
+    high: 192
     step: 16
   dropout:
     type: float
     low: 0.0
-    high: 0.5
+    high: 0.4
 
   # --- Numerical embeddings (PWL = Piecewise Linear) ---
   num_emb_type:
@@ -69,7 +69,7 @@ hyperparameters:
   num_emb_n_bins:
     type: int
     low: 16
-    high: 64
+    high: 48
 
   # --- Learning rate & regularization ---
   lr:
@@ -84,19 +84,19 @@ hyperparameters:
     log: true
   batch_size:
     type: int
-    low: 256
-    high: 2048
+    low: 1024
+    high: 8192
     log: true
 
 # ---------------------------------------------------------------------------
 # Fixed params — task-type keyed
 # ---------------------------------------------------------------------------
-# n_epochs is very high because TabM uses early stopping (patience=16).
+# n_epochs capped at 256 — patience=16 triggers early stopping well before this.
 # tfms: ['quantile_tabr'] applies the RTDL quantile transformation.
 # ---------------------------------------------------------------------------
 fixed_params:
   binary_classification:
-    n_epochs: 1000000000
+    n_epochs: 256
     patience: 16
     n_cv: 1
     n_refit: 0
@@ -106,7 +106,7 @@ fixed_params:
     verbosity: 0
     random_state: 42
   regression:
-    n_epochs: 1000000000
+    n_epochs: 256
     patience: 16
     n_cv: 1
     n_refit: 0
@@ -142,7 +142,7 @@ optuna:
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold
-  fold_timeout: 300
+  fold_timeout: 120
   assembly:
     mode: nsga2                                  # diversity-optimized assembly (like RealMLP)
     n_composites: 20
@@ -150,3 +150,16 @@ optuna:
     pop_size: 150
     diversity_metric: spearman_neff              # rank-based diversity — suits AUC metric
     diversity_weight: 0.3                        # fallback if knee-point detection fails
+  # --- Tracker diversity mode (optional, default: vanilla) ---
+  # See realmlp.yaml for detailed comments. Disabled by default.
+  # tracker:
+  #   diversity_mode: tiered
+  #   tier1_size: 5
+  #   tier2_corr_threshold: 0.99
+  # --- Diversity pruning (optional, disabled by default) ---
+  # See realmlp.yaml for detailed comments.
+  # diversity_pruning:
+  #   corr_threshold: 0.995
+  #   warmup_entries: 5
+  #   n_consecutive: 2
+  #   score_tolerance: 0.001

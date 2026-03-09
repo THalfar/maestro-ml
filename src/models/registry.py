@@ -11,10 +11,13 @@ This is the bridge between YAML configs and Python model objects.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import copy
 import importlib
+import io
 import logging
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -263,6 +266,8 @@ class ModelRegistry:
             "selection_mode": optuna_cfg.selection_mode,
             "fold_timeout": optuna_cfg.fold_timeout,
             "assembly": optuna_cfg.assembly,
+            "tracker": optuna_cfg.tracker,
+            "diversity_pruning": optuna_cfg.diversity_pruning,
         })
 
     def get_training_config(self, name: str) -> dict[str, Any]:
@@ -335,7 +340,13 @@ class ModelRegistry:
 
         try:
             model = self.get_model(name, hparams={}, task_type=task_type, gpu=True)
-            model.fit(X, y)
+            # Suppress CatBoost C++ GPU memory warnings on stderr
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()
+            try:
+                model.fit(X, y)
+            finally:
+                sys.stderr = old_stderr
             logger.info(f"GPU check passed for '{name}'")
             self._gpu_status[cache_key] = True
             return True

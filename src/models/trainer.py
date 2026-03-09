@@ -11,7 +11,11 @@ pruning configuration, and search space (from model YAML + LLM overrides).
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
+import sys
 import time
 import warnings
 from pathlib import Path
@@ -49,6 +53,17 @@ logging.getLogger("pytorch_lightning.accelerators.cuda").setLevel(logging.WARNIN
 
 # All supported scaler types for Optuna search
 ALL_SCALER_CHOICES: list[str] = ["none", "standard", "robust", "quantile"]
+
+
+@contextlib.contextmanager
+def _suppress_catboost_gpu_warnings():
+    """Suppress CatBoost C++ GPU memory warnings from stderr."""
+    old_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stderr = old_stderr
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -281,18 +296,54 @@ class PerFoldTracker:
     After Optuna, ``assemble()`` builds composite prediction arrays where
     each fold's slice comes from the k-th best trial for that fold.
 
+    Supports two modes controlled by ``diversity_mode``:
+
+    - ``"vanilla"`` (default): Pure top-N by score.  Original behaviour.
+    - ``"tiered"``: Two-tier insertion.  Tier-1 (``tier1_size`` slots) is
+      protected — always top-K by pure score, never replaced for diversity
+      reasons.  Tier-2 (remaining ``n_top - tier1_size`` slots) is
+      diversity-aware: new entries with max correlation ≥ ``tier2_corr_threshold``
+      to an existing tier-2 entry only replace *that closest entry* when
+      the new score is better (cluster-best logic).  Entries with lower
+      correlation are inserted normally.
+
     Attributes:
         n_top: Maximum entries to keep per fold.
         n_folds: Number of CV folds.
         maximize: True for metrics like AUC (higher=better), False for RMSE.
         fold_data: ``{fold_idx: [FoldEntry, ...]}`` — sorted best-first.
+        diversity_mode: ``"vanilla"`` or ``"tiered"``.
+        tier1_size: Number of score-protected slots (tiered mode only).
+        tier2_corr_threshold: Correlation threshold for tier-2 cluster
+            replacement (tiered mode only).  Default 0.99.
     """
 
-    def __init__(self, n_top: int, n_folds: int, maximize: bool) -> None:
+    def __init__(
+        self,
+        n_top: int,
+        n_folds: int,
+        maximize: bool,
+        diversity_mode: str = "vanilla",
+        tier1_size: int = 5,
+        tier2_corr_threshold: float = 0.99,
+    ) -> None:
         self.n_top = n_top
         self.n_folds = n_folds
         self.maximize = maximize
+        self.diversity_mode = diversity_mode
+        self.tier1_size = min(tier1_size, n_top)
+        self.tier2_corr_threshold = tier2_corr_threshold
         self.fold_data: dict[int, list[FoldEntry]] = {f: [] for f in range(n_folds)}
+
+    # ------------------------------------------------------------------
+    def n_entries(self, fold_idx: int) -> int:
+        """Return the number of entries stored for a given fold."""
+        return len(self.fold_data[fold_idx])
+
+    # ------------------------------------------------------------------
+    def _is_better(self, a: float, b: float) -> bool:
+        """Return True if score *a* is strictly better than *b*."""
+        return (a > b) if self.maximize else (a < b)
 
     # ------------------------------------------------------------------
     def update(
@@ -305,9 +356,19 @@ class PerFoldTracker:
         trial_number: int,
         params: dict[str, Any],
     ) -> None:
-        """Insert a fold result if it qualifies for the top-N leaderboard.
+        """Insert a fold result if it qualifies for the leaderboard.
 
-        Keeps the per-fold list sorted (best first) and bounded to n_top.
+        In ``"vanilla"`` mode, keeps the per-fold list sorted (best first)
+        and bounded to n_top by pure score.
+
+        In ``"tiered"`` mode, the first ``tier1_size`` slots are reserved
+        for the best scores (always kept).  Remaining slots use
+        diversity-aware insertion: if the new entry's max |correlation|
+        with existing tier-2 entries exceeds ``tier2_corr_threshold``,
+        it only replaces *that specific closest entry* when the new
+        score is better.  Otherwise it is inserted normally (displacing
+        the worst entry if full).
+
         All arrays are copied to avoid aliasing with trial-scope variables.
         """
         entry = FoldEntry(
@@ -320,17 +381,111 @@ class PerFoldTracker:
         )
         data = self.fold_data[fold_idx]
 
+        if self.diversity_mode == "tiered" and len(data) >= self.tier1_size:
+            self._tiered_insert(fold_idx, entry)
+        else:
+            # Vanilla mode (or tiered mode during warmup before tier1 is full)
+            self._vanilla_insert(fold_idx, entry)
+
+    # ------------------------------------------------------------------
+    def _vanilla_insert(self, fold_idx: int, entry: FoldEntry) -> None:
+        """Original top-N by score insertion."""
+        data = self.fold_data[fold_idx]
         if len(data) < self.n_top:
             data.append(entry)
             data.sort(key=lambda x: x.score, reverse=self.maximize)
         else:
             worst_score = data[-1].score
-            replace = (
-                (score > worst_score) if self.maximize else (score < worst_score)
-            )
-            if replace:
+            if self._is_better(entry.score, worst_score):
                 data[-1] = entry
                 data.sort(key=lambda x: x.score, reverse=self.maximize)
+
+    # ------------------------------------------------------------------
+    def _tiered_insert(self, fold_idx: int, entry: FoldEntry) -> None:
+        """Two-tier diversity-aware insertion.
+
+        Tier-1 (indices 0..tier1_size-1) is always sorted best-first by
+        score.  If the new entry qualifies for tier-1 (better than the
+        worst tier-1 entry), the displaced tier-1 entry cascades into
+        tier-2 processing.
+
+        Tier-2 (indices tier1_size..n_top-1) uses correlation-aware
+        cluster logic: redundant entries (max |corr| ≥ threshold) only
+        replace their closest match when the new score is better.
+        Diverse entries are added normally.
+        """
+        data = self.fold_data[fold_idx]
+
+        # --- Try tier-1 insertion first ---
+        tier1 = data[:self.tier1_size]
+        if len(tier1) < self.tier1_size:
+            # Tier-1 not full yet — insert by score
+            data.append(entry)
+            data.sort(key=lambda x: x.score, reverse=self.maximize)
+            return
+
+        worst_tier1 = tier1[-1]
+        if self._is_better(entry.score, worst_tier1.score):
+            # New entry enters tier-1; displaced entry cascades to tier-2
+            displaced = worst_tier1
+            data[self.tier1_size - 1] = entry
+            # Re-sort tier-1
+            tier1_new = data[:self.tier1_size]
+            tier1_new.sort(key=lambda x: x.score, reverse=self.maximize)
+            data[:self.tier1_size] = tier1_new
+            # Try to insert displaced into tier-2
+            self._tier2_insert(fold_idx, displaced)
+            return
+
+        # --- Doesn't qualify for tier-1, try tier-2 ---
+        self._tier2_insert(fold_idx, entry)
+
+    # ------------------------------------------------------------------
+    def _tier2_insert(self, fold_idx: int, entry: FoldEntry) -> None:
+        """Insert into tier-2 with diversity-aware cluster logic."""
+        data = self.fold_data[fold_idx]
+        tier2_start = self.tier1_size
+        tier2 = data[tier2_start:]
+        tier2_capacity = self.n_top - self.tier1_size
+
+        if tier2_capacity <= 0:
+            return  # No tier-2 slots configured
+
+        if not tier2:
+            # Tier-2 empty — just add
+            data.append(entry)
+            return
+
+        # Compute max |correlation| with existing tier-2 entries
+        max_corr = -1.0
+        closest_idx = -1  # index within full data list
+        for i in range(tier2_start, len(data)):
+            corr = abs(float(np.corrcoef(
+                entry.val_preds.ravel(),
+                data[i].val_preds.ravel(),
+            )[0, 1]))
+            if np.isnan(corr):
+                corr = 1.0  # constant predictions → treat as identical
+            if corr > max_corr:
+                max_corr = corr
+                closest_idx = i
+
+        if max_corr >= self.tier2_corr_threshold:
+            # Redundant — only replace the closest if score is better
+            if self._is_better(entry.score, data[closest_idx].score):
+                data[closest_idx] = entry
+        else:
+            # Diverse — insert normally
+            if len(tier2) < tier2_capacity:
+                data.append(entry)
+            else:
+                # Full — replace worst tier-2 entry
+                worst_idx = tier2_start
+                for i in range(tier2_start + 1, len(data)):
+                    if self._is_better(data[worst_idx].score, data[i].score):
+                        worst_idx = i
+                if self._is_better(entry.score, data[worst_idx].score):
+                    data[worst_idx] = entry
 
     # ------------------------------------------------------------------
     def assemble(
@@ -609,8 +764,12 @@ class PerFoldTracker:
                 all_trial_nums.add(entry.trial_number)
                 total_entries += 1
 
+        mode_str = f"mode={self.diversity_mode}"
+        if self.diversity_mode == "tiered":
+            mode_str += f" (tier1={self.tier1_size}, tier2_corr={self.tier2_corr_threshold})"
+
         logger.info(
-            f"[{model_name}] Per-fold selection: "
+            f"[{model_name}] Per-fold selection ({mode_str}): "
             f"{n_composites} composites from {len(all_trial_nums)} unique trials"
         )
 
@@ -623,10 +782,19 @@ class PerFoldTracker:
             best = data[0]
             worst = data[-1]
             all_scores.extend(e.score for e in data)
+
+            # Tier info for tiered mode
+            tier_info = ""
+            if self.diversity_mode == "tiered" and len(data) > self.tier1_size:
+                tier1_trials = {e.trial_number for e in data[:self.tier1_size]}
+                tier2_trials = {e.trial_number for e in data[self.tier1_size:]}
+                tier_info = f" [T1:{len(tier1_trials)} T2:{len(tier2_trials)} trials]"
+
             logger.info(
                 f"[{model_name}]   Fold {fold_idx:2d}: "
                 f"best={best.score:.6f} (trial #{best.trial_number}), "
                 f"{len(data)}th={worst.score:.6f} (trial #{worst.trial_number})"
+                f"{tier_info}"
             )
 
         if all_scores:
@@ -634,6 +802,28 @@ class PerFoldTracker:
                 f"[{model_name}] Per-fold score range: "
                 f"best={max(all_scores):.6f}, worst={min(all_scores):.6f}"
             )
+
+        # Diversity stats for tiered mode
+        if self.diversity_mode == "tiered":
+            # Compute average pairwise correlation within tier-2 for fold 0
+            fold0 = self.fold_data[0]
+            if len(fold0) > self.tier1_size:
+                tier2_preds = [e.val_preds for e in fold0[self.tier1_size:]]
+                if len(tier2_preds) >= 2:
+                    corrs = []
+                    for i in range(len(tier2_preds)):
+                        for j in range(i + 1, len(tier2_preds)):
+                            c = abs(float(np.corrcoef(
+                                tier2_preds[i].ravel(), tier2_preds[j].ravel()
+                            )[0, 1]))
+                            if not np.isnan(c):
+                                corrs.append(c)
+                    if corrs:
+                        logger.info(
+                            f"[{model_name}] Tier-2 avg |corr| (fold 0): "
+                            f"{np.mean(corrs):.4f} (min={min(corrs):.4f}, max={max(corrs):.4f})"
+                        )
+
         logger.info(
             f"[{model_name}] Unique trials across all composites: "
             f"{len(all_trial_nums)}"
@@ -789,14 +979,27 @@ def run_optuna_study(
                 f"assemble() will return an empty list. Pass test= to fix this."
             )
         maximize = task_type != "regression"
+
+        # Tracker diversity mode from optuna config
+        tracker_cfg = optuna_cfg.get("tracker", {}) or {}
+        diversity_mode = tracker_cfg.get("diversity_mode", "vanilla")
+        tier1_size = tracker_cfg.get("tier1_size", 5)
+        tier2_corr_threshold = tracker_cfg.get("tier2_corr_threshold", 0.99)
+
         tracker = PerFoldTracker(
             n_top=optuna_cfg["n_top_trials"],
             n_folds=cv_cfg.n_folds,
             maximize=maximize,
+            diversity_mode=diversity_mode,
+            tier1_size=tier1_size,
+            tier2_corr_threshold=tier2_corr_threshold,
+        )
+        mode_label = f"{diversity_mode}" if diversity_mode == "vanilla" else (
+            f"{diversity_mode} (tier1={tier1_size}, tier2_corr={tier2_corr_threshold})"
         )
         logger.info(
             f"[{model_name}] Per-fold selection enabled: "
-            f"tracking top {optuna_cfg['n_top_trials']} per fold"
+            f"tracking top {optuna_cfg['n_top_trials']} per fold, mode={mode_label}"
         )
 
     fold_timeout = optuna_cfg.get("fold_timeout")
@@ -845,6 +1048,9 @@ def run_optuna_study(
         else:
             monotone_constraints_list = None
 
+    # Diversity pruning config (only meaningful with per-fold tracker)
+    dp_cfg = optuna_cfg.get("diversity_pruning") if selection_mode == "per_fold" else None
+
     objective = _create_objective(
         model_name=model_name,
         train=train,
@@ -862,6 +1068,7 @@ def run_optuna_study(
         n_top_trials=optuna_cfg["n_top_trials"],
         scaler_choices=scaler_choices,
         monotone_constraints=monotone_constraints_list,
+        diversity_pruning=dp_cfg,
     )
 
     # Configure pruner
@@ -909,6 +1116,27 @@ def run_optuna_study(
             f"[{model_name}] No completed trials — all were pruned or failed."
         )
 
+    # Pruning summary
+    n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    n_pruned = len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])
+    n_failed = len(study.trials) - n_complete - n_pruned
+    # Count diversity-pruned trials (tagged by the objective)
+    n_div_pruned = sum(
+        1 for t in study.trials
+        if t.state == optuna.trial.TrialState.PRUNED
+        and hasattr(t, "user_attrs")
+        and t.user_attrs.get("diversity_pruned", False)
+    )
+    summary = (
+        f"[{model_name}] Study complete: {n_complete} completed, "
+        f"{n_pruned} pruned"
+    )
+    if dp_cfg:
+        summary += f" ({n_div_pruned} diversity-pruned)"
+    if n_failed > 0:
+        summary += f", {n_failed} failed"
+    logger.info(summary)
+
     return study, tracker
 
 
@@ -929,6 +1157,7 @@ def _create_objective(
     n_top_trials: int = 5,
     scaler_choices: list[str] | None = None,
     monotone_constraints: list[int] | None = None,
+    diversity_pruning: dict[str, Any] | None = None,
 ) -> Callable[[optuna.Trial], float]:
     """Create an Optuna objective function for a model.
 
@@ -945,6 +1174,14 @@ def _create_objective(
     When ``fold_timeout`` is set, each fold's training time is measured.
     If a single fold exceeds the timeout, the trial is pruned immediately.
 
+    When ``diversity_pruning`` is provided, after each fold the trial's
+    predictions are compared (Pearson |correlation|) against existing
+    tracker entries for that fold.  If the trial is redundant (high corr)
+    across ``n_consecutive`` consecutive folds AND its score is not the
+    new best, the trial is pruned to save compute.  This is especially
+    useful for low-signal data where neural nets converge to nearly
+    identical predictions.
+
     Args:
         model_name: Name of the model.
         train: Training DataFrame.
@@ -959,6 +1196,15 @@ def _create_objective(
         test: Test DataFrame (required when per_fold_tracker is set).
         per_fold_tracker: PerFoldTracker for per-fold selection mode.
         fold_timeout: Max seconds per fold; exceeding triggers TrialPruned.
+        diversity_pruning: Optional dict with keys:
+            - ``corr_threshold`` (float): Max |correlation| to consider
+              redundant (default 0.995).
+            - ``warmup_entries`` (int): Min entries per fold before
+              diversity pruning activates (default 5).
+            - ``n_consecutive`` (int): Consecutive redundant folds
+              required to prune (default 2).
+            - ``score_tolerance`` (float): Fraction of best score below
+              which diversity pruning applies (default 0.001).
 
     Returns:
         Callable that takes an optuna.Trial and returns the CV score.
@@ -1028,6 +1274,13 @@ def _create_objective(
         message=".*has just two bin edges.*",
         module=r"pytabkit\.models\.nn_models\.rtdl_num_embeddings",
     )
+
+    # Diversity pruning config (only active with per_fold_tracker)
+    dp_enabled = diversity_pruning is not None and per_fold_tracker is not None
+    dp_corr_threshold = diversity_pruning.get("corr_threshold", 0.995) if dp_enabled else 0.995
+    dp_warmup = diversity_pruning.get("warmup_entries", 5) if dp_enabled else 5
+    dp_n_consecutive = diversity_pruning.get("n_consecutive", 2) if dp_enabled else 2
+    dp_score_tolerance = diversity_pruning.get("score_tolerance", 0.001) if dp_enabled else 0.001
 
     def objective(trial: optuna.Trial) -> float:
         # Scaler selection (Optuna parameter when model needs scaling)
@@ -1169,31 +1422,35 @@ def _create_objective(
 
             fold_start = time.monotonic()
 
-            if needs_eval_set:
-                fit_params: dict[str, Any] = {
-                    "eval_set": [(X_val, y_val)],
-                    "verbose": False,  # suppress per-iteration eval output
-                }
-                if fold_weights is not None:
-                    fit_params["sample_weight"] = fold_weights
-                if is_lgbm:
-                    import lightgbm as lgb
-                    del fit_params["verbose"]  # LightGBM uses callbacks instead
-                    fit_params["callbacks"] = [
-                        lgb.early_stopping(
-                            stopping_rounds=early_stopping_rounds or 50,
-                            verbose=False,
-                        ),
-                        lgb.log_evaluation(-1),
-                    ]
-                elif early_stopping_rounds and not es_in_constructor:
-                    fit_params["early_stopping_rounds"] = early_stopping_rounds
-                model.fit(X_train, y_train, **fit_params)
-            else:
-                if fold_weights is not None:
-                    model.fit(X_train, y_train, sample_weight=fold_weights)
+            # Suppress CatBoost C++ GPU memory warnings on stderr
+            _fit_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+
+            with _fit_ctx:
+                if needs_eval_set:
+                    fit_params: dict[str, Any] = {
+                        "eval_set": [(X_val, y_val)],
+                        "verbose": False,  # suppress per-iteration eval output
+                    }
+                    if fold_weights is not None:
+                        fit_params["sample_weight"] = fold_weights
+                    if is_lgbm:
+                        import lightgbm as lgb
+                        del fit_params["verbose"]  # LightGBM uses callbacks instead
+                        fit_params["callbacks"] = [
+                            lgb.early_stopping(
+                                stopping_rounds=early_stopping_rounds or 50,
+                                verbose=False,
+                            ),
+                            lgb.log_evaluation(-1),
+                        ]
+                    elif early_stopping_rounds and not es_in_constructor:
+                        fit_params["early_stopping_rounds"] = early_stopping_rounds
+                    model.fit(X_train, y_train, **fit_params)
                 else:
-                    model.fit(X_train, y_train)
+                    if fold_weights is not None:
+                        model.fit(X_train, y_train, sample_weight=fold_weights)
+                    else:
+                        model.fit(X_train, y_train)
 
             fold_elapsed = time.monotonic() - fold_start
 
@@ -1228,6 +1485,53 @@ def _create_objective(
                     trial_number=trial.number,
                     params=hparams,
                 )
+
+            # Diversity pruning: check if this trial's fold predictions
+            # are redundant (highly correlated) with existing tracker entries.
+            # Only active when diversity_pruning config is provided AND
+            # per_fold_tracker is set AND enough warmup entries exist.
+            if dp_enabled and per_fold_tracker is not None:
+                tracker_entries = per_fold_tracker.fold_data[fold_idx]
+                if per_fold_tracker.n_entries(fold_idx) >= dp_warmup:
+                    # Check if this fold is redundant
+                    max_corr = 0.0
+                    for existing in tracker_entries:
+                        if existing.trial_number == trial.number:
+                            continue  # skip self (just inserted)
+                        corr = abs(float(np.corrcoef(
+                            fold_preds.ravel(),
+                            existing.val_preds.ravel(),
+                        )[0, 1]))
+                        if np.isnan(corr):
+                            corr = 1.0
+                        max_corr = max(max_corr, corr)
+
+                    # Check score gate: never diversity-prune if best score
+                    is_best_so_far = True
+                    try:
+                        best_val = trial.study.best_value
+                        if per_fold_tracker.maximize:
+                            is_best_so_far = fold_metric > best_val * (1 + dp_score_tolerance)
+                        else:
+                            is_best_so_far = fold_metric < best_val * (1 - dp_score_tolerance)
+                    except ValueError:
+                        is_best_so_far = True  # no completed trials yet
+
+                    if max_corr >= dp_corr_threshold and not is_best_so_far:
+                        if not hasattr(trial, "_diversity_flag_count"):
+                            trial._diversity_flag_count = 0  # type: ignore[attr-defined]
+                        trial._diversity_flag_count += 1  # type: ignore[attr-defined]
+
+                        if trial._diversity_flag_count >= dp_n_consecutive:  # type: ignore[attr-defined]
+                            logger.info(
+                                f"[{model_name}] Trial #{trial.number} diversity-pruned at fold "
+                                f"{fold_idx} (max |corr|={max_corr:.4f} >= {dp_corr_threshold})"
+                            )
+                            trial.set_user_attr("diversity_pruned", True)
+                            raise optuna.exceptions.TrialPruned()
+                    else:
+                        # Reset counter — must be consecutive
+                        trial._diversity_flag_count = 0  # type: ignore[attr-defined]
 
             # Fold timeout: if this fold took too long, prune to skip
             # remaining folds.  Completed fold's predictions are already saved.
@@ -1535,31 +1839,35 @@ def train_with_config(
                 task_type=task_type, gpu=gpu, results_dir=results_dir
             )
 
-            if needs_eval_set:
-                fit_params: dict[str, Any] = {
-                    "eval_set": [(X_fold_val, y_fold_val)],
-                    "verbose": False,  # suppress per-iteration eval output
-                }
-                if fold_weights is not None:
-                    fit_params["sample_weight"] = fold_weights
-                if is_lgbm:
-                    import lightgbm as lgb
-                    del fit_params["verbose"]  # LightGBM uses callbacks instead
-                    fit_params["callbacks"] = [
-                        lgb.early_stopping(
-                            stopping_rounds=early_stopping_rounds or 50,
-                            verbose=False,
-                        ),
-                        lgb.log_evaluation(-1),
-                    ]
-                elif early_stopping_rounds and not es_in_constructor:
-                    fit_params["early_stopping_rounds"] = early_stopping_rounds
-                model.fit(X_fold_train, y_fold_train, **fit_params)
-            else:
-                if fold_weights is not None:
-                    model.fit(X_fold_train, y_fold_train, sample_weight=fold_weights)
+            # Suppress CatBoost C++ GPU memory warnings on stderr
+            _fit_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+
+            with _fit_ctx:
+                if needs_eval_set:
+                    fit_params: dict[str, Any] = {
+                        "eval_set": [(X_fold_val, y_fold_val)],
+                        "verbose": False,  # suppress per-iteration eval output
+                    }
+                    if fold_weights is not None:
+                        fit_params["sample_weight"] = fold_weights
+                    if is_lgbm:
+                        import lightgbm as lgb
+                        del fit_params["verbose"]  # LightGBM uses callbacks instead
+                        fit_params["callbacks"] = [
+                            lgb.early_stopping(
+                                stopping_rounds=early_stopping_rounds or 50,
+                                verbose=False,
+                            ),
+                            lgb.log_evaluation(-1),
+                        ]
+                    elif early_stopping_rounds and not es_in_constructor:
+                        fit_params["early_stopping_rounds"] = early_stopping_rounds
+                    model.fit(X_fold_train, y_fold_train, **fit_params)
                 else:
-                    model.fit(X_fold_train, y_fold_train)
+                    if fold_weights is not None:
+                        model.fit(X_fold_train, y_fold_train, sample_weight=fold_weights)
+                    else:
+                        model.fit(X_fold_train, y_fold_train)
 
             if task_type == "binary_classification":
                 val_preds = model.predict_proba(X_fold_val)[:, 1]

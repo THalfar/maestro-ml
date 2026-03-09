@@ -92,6 +92,41 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - **Two-layer NSGA-II**: Inner (fold-level, in `trainer.py`) optimizes fold combinations into composites. Outer (model-level, in `run.py/diversity.py`) optimizes model weights across all prediction arrays.
 - **Global mode** (`selection_mode: global`, default): Existing behaviour — retrain top N configs with multiple seeds. All other models use this.
 
+## Tracker Diversity Mode (Tiered)
+
+Low-signal data (e.g., Porto Seguro, max corr 0.054) causes neural nets to converge to nearly identical predictions regardless of hyperparameters. A pure top-N-by-score tracker fills with redundant entries, making NSGA-II assembly trivial.
+
+- **Two modes**: `"vanilla"` (default, pure top-N by score) and `"tiered"` (diversity-aware).
+- **Tiered mode**: Tier-1 (`tier1_size` slots) is protected — always the best by pure score. Tier-2 (remaining slots) uses diversity-aware insertion: redundant entries (max |corr| ≥ `tier2_corr_threshold` with existing tier-2 entry) only replace their closest match when the new score is better. Diverse entries are inserted normally.
+- **Config** (in model YAML `optuna.tracker` or strategy YAML overrides):
+  ```yaml
+  optuna:
+    tracker:
+      diversity_mode: tiered    # "vanilla" | "tiered"
+      tier1_size: 5             # score-protected slots
+      tier2_corr_threshold: 0.99  # correlation threshold for cluster replacement
+  ```
+- **Backward compatible**: Default is `"vanilla"` — existing behaviour unchanged.
+
+## Diversity Pruning
+
+During Optuna trials, redundant trials (highly correlated predictions with existing tracker entries) can be pruned early to save compute. Especially useful for low-signal data where score-based pruning doesn't help (all trials score ~AUC ± 0.003).
+
+- **Score-gate**: Never diversity-prunes if the trial is a new best score. Only prunes "ok but not exceptional" trials that are also redundant.
+- **Warmup**: Diversity pruning activates only after `warmup_entries` entries exist per fold (prevents premature pruning).
+- **Consecutive folds**: Requires `n_consecutive` consecutive folds to be flagged as redundant before pruning. Two folds is sufficient — if fold 1 and 2 both correlate >0.995, fold 3-5 are almost certainly the same.
+- **Config** (in model YAML `optuna.diversity_pruning` or strategy YAML overrides):
+  ```yaml
+  optuna:
+    diversity_pruning:
+      corr_threshold: 0.995     # max |correlation| to flag as redundant
+      warmup_entries: 5         # min entries per fold before activation
+      n_consecutive: 2          # consecutive redundant folds to trigger prune
+      score_tolerance: 0.001    # fraction of best score for score-gate
+  ```
+- **Disabled by default**: No `diversity_pruning` key → no diversity pruning. Opt-in only.
+- **Only works with per-fold mode**: Requires `selection_mode: per_fold` and a `PerFoldTracker`.
+
 ## Ensemble & Diversity
 
 - **SOTA models only**: Only include strong models in the ensemble. Weak models (gaussian_nb, svm, knn, adaboost) dilute ensemble quality — their noisy predictions can hurt the meta-learner and final blend even with NSGA-II selection. Prefer: catboost, xgboost, lightgbm, realmlp, random_forest, extra_trees. NSGA-II handles diversity within strong models.
@@ -166,6 +201,7 @@ preprocessing:
 - **Cardinality profiles** (`cardinality_profiles`): Top-K share, Shannon entropy, normalized entropy per categorical. Classifies distribution shape as "uniform", "moderate", or "long_tail". Long-tail categoricals need frequency encoding or rare-category binning.
 - **Target encoding preview** (`te_preview`): OOF target encoding simulation (5-fold, alpha=10). Reports Pearson correlation and AUC of encoded column with target — concrete numbers for whether TE is worthwhile.
 - **Quick model baseline** (`quick_model`): 3-fold CV RandomForest (n_estimators=100, max_depth=8) with label-encoded categoricals. Returns baseline AUC/RMSE (performance floor without feature engineering) and feature importances (sees non-linear effects and interactions unlike univariate metrics). Subsamples to 50k rows for speed. Fully deterministic (seeded).
+- **Prediction diversity probe** (`prediction_diversity`): Trains 3 RF models with different seeds and measures signal-noise ratio (SNR = within_seed_std / across_seed_std). Within-seed std = how much predictions vary across samples (signal). Across-seed std = how much seeds change predictions (noise). Classification by SNR: `very_low` (<3), `low` (3-8), `moderate` (8-15), `high` (>15). **Note**: Pearson correlation alone is misleading for RF — noise features inflate seed-to-seed variation. SNR is robust because noise inflates both stds proportionally. Also reports Pearson correlations and Fisher z CI for reference. Subsamples to 50k. Guides LLM in setting tiered tracker/diversity pruning parameters.
 - **Fold context**: Dataset header shows per-fold train/val sizes for 5-fold and 10-fold CV to help calibrate min_leaf parameters.
 
 ## Pipeline YAML Key Features

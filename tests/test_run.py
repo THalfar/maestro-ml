@@ -205,9 +205,9 @@ class TestMain:
         oof = np.load(str(oof_path))
         assert len(oof) == 80  # n_train rows
 
-        # EDA report saved
+        # EDA report is skipped when strategy_input_path already exists
         eda_path = results_dir / "eda_report.json"
-        assert eda_path.exists(), "EDA report should be saved"
+        assert not eda_path.exists(), "EDA should be skipped when strategy exists"
 
         # Strategy saved
         strategy_out = results_dir / "strategy.yaml"

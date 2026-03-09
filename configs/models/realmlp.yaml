@@ -72,8 +72,8 @@ hyperparameters:
   # --- Regularization ---
   batch_size:
     type: int
-    low: 512
-    high: 4096
+    low: 1024
+    high: 8192
     log: true
     
   p_drop:
@@ -196,7 +196,25 @@ optuna:
   assembly:
     mode: nsga2                                  # "rank" (deterministic) | "nsga2" (diversity-optimized)
     n_composites: 20                             # how many composites from Pareto front
-    n_generations: 100                            # NSGA-II generations (each eval = array lookup, <1s total)
+    n_generations: 100                           # NSGA-II generations (each eval = array lookup, <1s total)
     pop_size: 150                                # NSGA-II population size
-    diversity_metric: ambiguity                    # pearson_neff | spearman_neff | ambiguity
-    diversity_weight: 0.3                          # 0=pure score, 1=pure diversity (Pareto front selection)
+    diversity_metric: ambiguity                  # pearson_neff | spearman_neff | ambiguity
+    diversity_weight: 0.3                        # 0=pure score, 1=pure diversity (Pareto front selection)
+  # --- Tracker diversity mode (optional, default: vanilla) ---
+  # "tiered" uses two-tier insertion: tier-1 = score-protected anchors,
+  # tier-2 = diversity-aware cluster-best. Prevents NSGA-II assembly from
+  # seeing 20 near-identical predictions on low-signal data.
+  # Disabled by default — enable via strategy YAML per competition.
+  # tracker:
+  #   diversity_mode: tiered
+  #   tier1_size: 5                              # top-5 by score always protected
+  #   tier2_corr_threshold: 0.99                 # |corr| >= 0.99 = same cluster
+  # --- Diversity pruning (optional, disabled by default) ---
+  # Prunes redundant trials (highly correlated with tracker) to save compute.
+  # Especially useful for low-signal data (e.g., Porto Seguro, max corr=0.054)
+  # where all trials produce AUC ± 0.003 but identical predictions.
+  # diversity_pruning:
+  #   corr_threshold: 0.995                      # |corr| >= 0.995 = redundant
+  #   warmup_entries: 5                          # wait for 5 entries before pruning
+  #   n_consecutive: 2                           # 2 consecutive redundant folds → prune
+  #   score_tolerance: 0.001                     # never prune new best score

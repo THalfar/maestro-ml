@@ -1275,6 +1275,182 @@ def _compute_quick_importance_and_baseline(
     }
 
 
+def _compute_prediction_diversity_probe(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    task_type: str,
+    seeds: tuple[int, ...] = (42, 123, 456),
+    n_folds: int = 3,
+    max_samples: int = 50000,
+) -> dict[str, Any]:
+    """Train quick RF models with different seeds and measure prediction stability.
+
+    Measures how much RF predictions change when only the random seed differs.
+    The primary metric is **signal-noise ratio** (SNR):
+
+    - ``within_seed_std``: how much predictions vary across *samples* within
+      one seed.  This reflects how much signal the model finds — strong
+      signal → predictions spread out from the class prior.
+    - ``prediction_std``: how much predictions vary across *seeds* for the
+      same sample.  This reflects seed-dependent noise — noise features
+      and bootstrap randomness inflate this.
+    - ``signal_noise_ratio = within_seed_std / prediction_std``: how much
+      of the model's output is stable signal vs random noise.
+
+    **Why not Pearson correlation?**  RF is inherently high-variance
+    (bootstrap + random feature selection).  On low-signal data with noise
+    features (e.g., Porto Seguro with 20 ps_calc_* noise columns), Pearson
+    correlation between seeds can be as low as 0.79 — *not* because models
+    find diverse solutions, but because noise features inject random
+    variation.  SNR is immune to this because noise features inflate both
+    within- and across-seed std proportionally.
+
+    Classification (based on SNR):
+
+    - SNR > 15: ``high`` — strong signal, models find robust patterns.
+      Standard per-fold settings are sufficient.
+    - SNR 8–15: ``moderate`` — decent signal.  Tiered tracker optional.
+    - SNR 3–8: ``low`` — weak signal relative to seed noise.  Tiered
+      tracker and diversity pruning recommended for neural nets.
+    - SNR < 3: ``very_low`` — seed noise dominates.  All models will
+      converge to near-identical predictions.  Aggressive diversity
+      management needed.
+
+    Also reports Pearson correlations and Fisher z-transform CI for
+    reference.
+
+    Args:
+        feature_df: Feature columns (categoricals will be label-encoded).
+        target_series: Target series.
+        task_type: ``'binary_classification'`` or ``'regression'``.
+        seeds: Random seeds for the RF models.
+        n_folds: Number of CV folds per seed.
+        max_samples: Subsample to this many rows for speed.
+
+    Returns:
+        Dict with:
+        - ``pairwise_correlations``: list of ``(seed_a, seed_b, corr)`` tuples
+        - ``mean_corr``: mean pairwise Pearson correlation
+        - ``min_corr``: minimum pairwise correlation
+        - ``prediction_std``: mean pointwise std across seeds
+        - ``within_seed_std``: mean std of predictions within each seed
+        - ``signal_noise_ratio``: within_seed_std / prediction_std (primary metric)
+        - ``diversity_class``: ``"very_low"`` / ``"low"`` / ``"moderate"`` / ``"high"``
+        - ``fisher_z_ci``: 95% CI for mean correlation via Fisher z-transform
+        - ``n_samples_used``: how many samples were used (after subsampling)
+    """
+    if feature_df.empty or len(target_series) == 0:
+        return {}
+
+    y = target_series.values.astype(float)
+    cols = list(feature_df.columns)
+
+    # Prepare X: label-encode categoricals, fill NaN
+    arrays: list[np.ndarray] = []
+    for col in cols:
+        series = feature_df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            codes, _ = pd.factorize(series, sort=False)
+            arrays.append(codes.astype(float))
+        else:
+            arrays.append(series.fillna(series.median()).values.astype(float))
+
+    X = np.column_stack(arrays) if arrays else np.empty((len(feature_df), 0))
+    X = np.nan_to_num(X, nan=0.0)
+
+    # Subsample for speed
+    rng = np.random.default_rng(42)
+    if len(X) > max_samples:
+        idx = rng.choice(len(X), max_samples, replace=False)
+        idx.sort()
+        X = X[idx]
+        y = y[idx]
+
+    n = len(y)
+    n_unique = len(np.unique(y[~np.isnan(y)]))
+    is_classification = task_type != "regression" and n_unique <= 30
+
+    # Collect OOF predictions per seed
+    oof_per_seed: list[np.ndarray] = []
+
+    for seed in seeds:
+        if is_classification:
+            cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            split_target = y
+            model_cls = RandomForestClassifier
+        else:
+            cv = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            split_target = None
+            model_cls = RandomForestRegressor
+
+        model_kwargs = dict(n_estimators=100, max_depth=8, random_state=seed, n_jobs=-1)
+        oof = np.zeros(n)
+
+        for train_idx, val_idx in cv.split(X, split_target):
+            model = model_cls(**model_kwargs)
+            model.fit(X[train_idx], y[train_idx])
+            if is_classification:
+                oof[val_idx] = model.predict_proba(X[val_idx])[:, 1]
+            else:
+                oof[val_idx] = model.predict(X[val_idx])
+
+        oof_per_seed.append(oof)
+
+    # Pairwise Pearson correlations
+    pairwise: list[tuple[int, int, float]] = []
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            corr = float(np.corrcoef(oof_per_seed[i], oof_per_seed[j])[0, 1])
+            if np.isnan(corr):
+                corr = 1.0  # constant predictions
+            pairwise.append((seeds[i], seeds[j], round(corr, 6)))
+
+    corr_values = [c for _, _, c in pairwise]
+    mean_corr = float(np.mean(corr_values))
+    min_corr = float(np.min(corr_values))
+
+    # Pointwise prediction std across seeds (seed noise)
+    stacked = np.column_stack(oof_per_seed)  # (n, n_seeds)
+    prediction_std = float(np.mean(np.std(stacked, axis=1)))
+
+    # Within-seed std: how much predictions vary across samples (signal strength)
+    within_seed_std = float(np.mean([np.std(oof) for oof in oof_per_seed]))
+
+    # Signal-noise ratio: primary classification metric
+    snr = within_seed_std / max(prediction_std, 1e-10)
+
+    # Fisher z-transform 95% CI for mean correlation (reference)
+    z_values = [0.5 * np.log((1 + r) / (1 - r + 1e-15)) for r in corr_values]
+    z_mean = float(np.mean(z_values))
+    se_z = 1.0 / np.sqrt(max(n - 3, 1))
+    z_lo = z_mean - 1.96 * se_z
+    z_hi = z_mean + 1.96 * se_z
+    ci_lo = float(np.tanh(z_lo))
+    ci_hi = float(np.tanh(z_hi))
+
+    # Classification based on SNR
+    if snr < 3:
+        diversity_class = "very_low"
+    elif snr < 8:
+        diversity_class = "low"
+    elif snr < 15:
+        diversity_class = "moderate"
+    else:
+        diversity_class = "high"
+
+    return {
+        "pairwise_correlations": pairwise,
+        "mean_corr": round(mean_corr, 6),
+        "min_corr": round(min_corr, 6),
+        "prediction_std": round(prediction_std, 6),
+        "within_seed_std": round(within_seed_std, 6),
+        "signal_noise_ratio": round(snr, 2),
+        "diversity_class": diversity_class,
+        "fisher_z_ci": [round(ci_lo, 6), round(ci_hi, 6)],
+        "n_samples_used": n,
+    }
+
+
 def run_eda(
     train_path: str | Path,
     test_path: str | Path,
@@ -1477,6 +1653,11 @@ def run_eda(
         feature_df, target_series, task_type
     )
 
+    # Prediction diversity probe (multi-seed RF correlation)
+    prediction_diversity = _compute_prediction_diversity_probe(
+        feature_df, target_series, task_type
+    )
+
     # Weak features
     weak_features = _identify_weak_features(target_correlations, threshold=0.05)
 
@@ -1493,6 +1674,7 @@ def run_eda(
         monotonicity=monotonicity,
         te_preview=te_preview,
         quick_model=quick_model,
+        prediction_diversity=prediction_diversity,
     )
 
     # Preprocessing summary: aggregate scaling/transform signals for LLM
@@ -1521,6 +1703,7 @@ def run_eda(
         "cardinality_profiles": cardinality_profiles,
         "te_preview": te_preview,
         "quick_model": quick_model,
+        "prediction_diversity": prediction_diversity,
     }
     return report, train, test
 
@@ -1611,6 +1794,7 @@ def _generate_recommendations(
     monotonicity: dict[str, dict] | None = None,
     te_preview: dict[str, dict] | None = None,
     quick_model: dict[str, Any] | None = None,
+    prediction_diversity: dict[str, Any] | None = None,
 ) -> list[str]:
     """Generate LLM-readable recommendation strings from EDA results."""
     recs = []
@@ -1666,6 +1850,36 @@ def _generate_recommendations(
             f"Quick RF baseline (no feature engineering): {metric}={score:.4f}. "
             f"This is the performance floor — feature engineering should improve on this."
         )
+
+    # Prediction diversity probe
+    if prediction_diversity and prediction_diversity.get("diversity_class"):
+        dc = prediction_diversity["diversity_class"]
+        snr = prediction_diversity.get("signal_noise_ratio", 0)
+        wss = prediction_diversity.get("within_seed_std", 0)
+        pstd = prediction_diversity.get("prediction_std", 0)
+        if dc == "very_low":
+            recs.append(
+                f"VERY LOW SIGNAL DIVERSITY: SNR={snr:.1f} "
+                f"(within-seed std={wss:.4f}, across-seed std={pstd:.4f}). "
+                f"Seed noise dominates — all models will converge to similar "
+                f"predictions. Enable tiered tracker (diversity_mode: tiered) and "
+                f"diversity pruning for neural nets. Use aggressive "
+                f"tier2_corr_threshold (0.99) and corr_threshold (0.995)."
+            )
+        elif dc == "low":
+            recs.append(
+                f"LOW SIGNAL DIVERSITY: SNR={snr:.1f} "
+                f"(within-seed std={wss:.4f}, across-seed std={pstd:.4f}). "
+                f"Weak signal relative to seed noise. Consider tiered tracker "
+                f"and diversity pruning for neural nets to avoid wasting compute "
+                f"on redundant trials."
+            )
+        elif dc == "moderate":
+            recs.append(
+                f"Moderate signal diversity: SNR={snr:.1f}. Some diversity "
+                f"benefit from tiered tracker; diversity pruning optional."
+            )
+        # "high" diversity — no special recommendation needed
 
     # Monotonicity signals
     if monotonicity:
@@ -2569,6 +2783,40 @@ def format_eda_for_llm(eda_report: dict) -> str:
                 bar = "█" * int(importance * 200)
                 lines.append(f"    {col:<35} {importance:.4f}  {bar}")
             lines.append("")
+
+    # Prediction diversity probe (multi-seed RF signal-noise analysis)
+    pd_probe = eda_report.get("prediction_diversity", {})
+    if pd_probe and pd_probe.get("signal_noise_ratio") is not None:
+        lines.append("─" * 50)
+        lines.append("PREDICTION DIVERSITY PROBE (3 RF seeds, signal-noise analysis)")
+        lines.append("─" * 50)
+        lines.append(f"  Within-seed std (signal)  : {pd_probe['within_seed_std']:.6f}")
+        lines.append(f"  Across-seed std (noise)   : {pd_probe['prediction_std']:.6f}")
+        lines.append(f"  Signal-noise ratio (SNR)  : {pd_probe['signal_noise_ratio']:.1f}")
+        lines.append(f"  Diversity classification  : {pd_probe['diversity_class'].upper()}")
+        lines.append(f"  Mean pairwise correlation : {pd_probe['mean_corr']:.6f}")
+        ci = pd_probe.get("fisher_z_ci", [0, 0])
+        lines.append(f"  95% CI (Fisher z)         : [{ci[0]:.6f}, {ci[1]:.6f}]")
+        lines.append(f"  Samples used              : {pd_probe.get('n_samples_used', 'N/A')}")
+        lines.append("")
+        pairs = pd_probe.get("pairwise_correlations", [])
+        if pairs:
+            lines.append("  Pairwise correlations:")
+            for sa, sb, corr in pairs:
+                lines.append(f"    seed {sa} vs {sb}: {corr:.6f}")
+            lines.append("")
+        lines.append("  SNR thresholds: <3 very_low | 3-8 low | 8-15 moderate | >15 high")
+        dc = pd_probe["diversity_class"]
+        if dc in ("very_low", "low"):
+            lines.append(f"  ⚠ {dc.upper()} signal diversity: Models find weak signal relative to")
+            lines.append(f"    seed noise. Neural nets with different hyperparameters will converge")
+            lines.append(f"    to similar predictions. Enable tiered tracker (diversity_mode: tiered)")
+            lines.append(f"    and diversity pruning to avoid redundant compute.")
+        elif dc == "moderate":
+            lines.append("  Moderate signal diversity — tiered tracker may help, diversity pruning optional.")
+        else:
+            lines.append("  High signal diversity — standard per-fold settings are sufficient.")
+        lines.append("")
 
     # Preprocessing summary (scaling/transform signals for LLM)
     preproc = eda_report.get("preprocessing_summary", {})

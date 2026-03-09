@@ -18,6 +18,7 @@ from src.eda.profiler import (
     _compute_iv_woe,
     _compute_mutual_information,
     _compute_psi_numeric,
+    _compute_prediction_diversity_probe,
     _compute_quick_importance_and_baseline,
     _compute_target_encoding_preview,
     _compute_univariate_auc,
@@ -104,6 +105,7 @@ class TestRunEda:
             "preprocessing_summary",
             "duplicates", "unseen_categories", "monotonicity",
             "cardinality_profiles", "te_preview", "quick_model",
+            "prediction_diversity",
         }
         assert set(report.keys()) == expected_keys
 
@@ -2033,6 +2035,112 @@ class TestQuickImportanceAndBaseline:
 
 
 # ---------------------------------------------------------------------------
+# Prediction Diversity Probe
+# ---------------------------------------------------------------------------
+class TestPredictionDiversityProbe:
+    """Tests for _compute_prediction_diversity_probe."""
+
+    def test_classification_returns_all_keys(self):
+        """Binary classification should return all expected keys."""
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.normal(0, 1, n)
+        y = (x1 > 0).astype(float)
+        df = pd.DataFrame({"x1": x1, "x2": rng.normal(0, 1, n)})
+        target = pd.Series(y)
+        result = _compute_prediction_diversity_probe(df, target, "binary_classification")
+        assert "mean_corr" in result
+        assert "min_corr" in result
+        assert "prediction_std" in result
+        assert "within_seed_std" in result
+        assert "signal_noise_ratio" in result
+        assert "diversity_class" in result
+        assert "fisher_z_ci" in result
+        assert "pairwise_correlations" in result
+        assert "n_samples_used" in result
+        assert len(result["pairwise_correlations"]) == 3  # 3 pairs from 3 seeds
+        assert result["fisher_z_ci"][0] <= result["mean_corr"] <= result["fisher_z_ci"][1]
+        # SNR should be positive
+        assert result["signal_noise_ratio"] > 0
+
+    def test_high_signal_data_has_higher_snr(self):
+        """Strong signal data should have higher SNR than noise data."""
+        rng = np.random.default_rng(42)
+        n = 200
+        x1 = rng.normal(0, 1, n)
+        x2 = rng.normal(0, 1, n)
+        # Strong signal: target is deterministic function of features
+        y = (x1 + x2 > 0).astype(float)
+        df = pd.DataFrame({"x1": x1, "x2": x2})
+        target = pd.Series(y)
+        signal_result = _compute_prediction_diversity_probe(df, target, "binary_classification")
+
+        # Noise data
+        noise_df = pd.DataFrame({"n1": rng.normal(0, 1, n), "n2": rng.normal(0, 1, n)})
+        noise_target = pd.Series(rng.choice([0, 1], n))
+        noise_result = _compute_prediction_diversity_probe(noise_df, noise_target, "binary_classification")
+
+        # Signal data should have higher SNR (more stable predictions relative to seed noise)
+        assert signal_result["signal_noise_ratio"] > noise_result["signal_noise_ratio"]
+
+    def test_snr_classification_thresholds(self):
+        """SNR-based classification should use correct thresholds."""
+        rng = np.random.default_rng(42)
+        n = 200
+        # Strong signal → high SNR → "high" or "moderate"
+        x1 = rng.normal(0, 1, n)
+        signal_df = pd.DataFrame({"x1": x1, "x2": rng.normal(0, 1, n)})
+        signal_target = pd.Series((x1 > 0).astype(float))
+        signal_result = _compute_prediction_diversity_probe(
+            signal_df, signal_target, "binary_classification"
+        )
+        assert signal_result["signal_noise_ratio"] > 3  # at least "low" SNR
+        assert signal_result["within_seed_std"] > signal_result["prediction_std"]
+
+    def test_regression_works(self):
+        """Regression should work and return valid results."""
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.normal(0, 1, n)
+        y = x1 * 2 + rng.normal(0, 0.5, n)
+        df = pd.DataFrame({"x1": x1})
+        target = pd.Series(y)
+        result = _compute_prediction_diversity_probe(df, target, "regression")
+        assert result["mean_corr"] > 0.5
+        assert result["diversity_class"] in ("high", "moderate", "low", "very_low")
+        assert result["n_samples_used"] == n
+
+    def test_empty_dataframe(self):
+        """Empty input should return empty dict."""
+        df = pd.DataFrame()
+        target = pd.Series([], dtype=float)
+        result = _compute_prediction_diversity_probe(df, target, "binary_classification")
+        assert result == {}
+
+    def test_custom_seeds(self):
+        """Custom seeds should be accepted and used."""
+        rng = np.random.default_rng(42)
+        n = 50
+        df = pd.DataFrame({"x": rng.normal(0, 1, n)})
+        target = pd.Series(rng.choice([0, 1], n))
+        result = _compute_prediction_diversity_probe(
+            df, target, "binary_classification", seeds=(10, 20),
+        )
+        assert len(result["pairwise_correlations"]) == 1  # 1 pair from 2 seeds
+
+    def test_subsampling(self):
+        """Large datasets should be subsampled."""
+        rng = np.random.default_rng(42)
+        n = 300
+        df = pd.DataFrame({"x": rng.normal(0, 1, n)})
+        target = pd.Series(rng.choice([0, 1], n))
+        result = _compute_prediction_diversity_probe(
+            df, target, "binary_classification", max_samples=50,
+        )
+        assert result["n_samples_used"] == 50
+
+
+# ---------------------------------------------------------------------------
 # Integration: new sections in run_eda and format_eda_for_llm
 # ---------------------------------------------------------------------------
 class TestNewEDASections:
@@ -2048,9 +2156,15 @@ class TestNewEDASections:
         assert "cardinality_profiles" in report
         assert "te_preview" in report
         assert "quick_model" in report
+        assert "prediction_diversity" in report
         # Quick model should have a valid baseline
         assert report["quick_model"]["baseline_score"] is not None
         assert report["quick_model"]["baseline_metric"] == "AUC"
+        # Prediction diversity should have valid results
+        pd_result = report["prediction_diversity"]
+        assert pd_result.get("signal_noise_ratio") is not None
+        assert pd_result.get("within_seed_std") is not None
+        assert pd_result["diversity_class"] in ("very_low", "low", "moderate", "high")
 
     def test_format_eda_includes_new_sections(self, binary_dataset):
         """format_eda_for_llm should include new section headers."""
@@ -2058,6 +2172,7 @@ class TestNewEDASections:
         report, _, _ = run_eda(train_path, test_path, "target", id_col="id")
         text = format_eda_for_llm(report)
         assert "QUICK MODEL BASELINE" in text
+        assert "PREDICTION DIVERSITY PROBE" in text
         # Fold context
         assert "fold CV" in text
 

@@ -36,7 +36,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 - **Extra data support** — Concat original (non-synthetic) datasets with configurable sample weights. Kaggle Playground Series competitions use synthetic data — weighting the original dataset higher (e.g., 10×) gives models cleaner training signal.
 - **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
 - **LLM-driven preprocessing** — EDA detects scaling signals (skewness, outliers, sentinels, scale range ratios) and the LLM selects appropriate scalers per model. Optuna optimizes scaler choice (StandardScaler, RobustScaler, QuantileTransformer, or none) as a hyperparameter — per fold, fit on train only. Only applied to models that benefit from scaling (Ridge, KNN, SVM, etc.); tree models are left untouched.
-- **Per-fold selection for neural nets** — RealMLP uses per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection.
+- **Per-fold selection for neural nets** — RealMLP and TabM use per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection. Supports **tiered tracker** (score-protected anchors + diversity-aware cluster insertion) and **diversity pruning** (prunes redundant trials via correlation check) for low-signal datasets.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
 - **Two modes** — Fully automated (LLM API) or human-in-the-loop (manual mode where you control the LLM conversation).
 - **GPU auto-detection** — Per-model micro-trial detects CUDA availability at startup, with automatic CPU fallback.
@@ -184,6 +184,7 @@ Analyzes raw CSVs and produces a structured JSON report:
 - **Categorical cardinality profiles** — entropy and concentration (uniform vs long-tail distribution shape)
 - **Target encoding preview** — OOF-simulated TE correlation and AUC per categorical (concrete go/no-go numbers)
 - **Quick model baseline** — 3-fold RandomForest gives baseline AUC/RMSE and feature importances (sees non-linear effects)
+- **Prediction diversity probe** — 3 RF models with different seeds measure signal-noise ratio (SNR): how much predictions vary across samples (signal) vs across seeds (noise). Low SNR (<8) indicates low-signal data where models converge — guides tiered tracker and diversity pruning configuration for neural nets. Uses SNR instead of Pearson correlation (which is misleading for RF on data with noise features)
 - **Fold context** — per-fold train/val sizes for 5-fold and 10-fold CV
 - Concrete LLM-readable recommendations
 
@@ -239,7 +240,8 @@ The LLM's job is to *narrow* the search space, not to do ML.
 | CatBoost | CUDA | eval_set | Native categoricals, ordered boosting |
 | XGBoost | CUDA | eval_set | `device="cuda"` (v2.0+) |
 | LightGBM | Special build | callbacks | CPU-only by default |
-| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, rectangular architecture with searchable depth/width, per-fold selection (no retraining), NSGA-II fold-level assembly |
+| RealMLP | CUDA | patience | PyTorch neural net via pytabkit, rectangular architecture with searchable depth/width, per-fold selection (no retraining), NSGA-II fold-level assembly, tiered tracker + diversity pruning |
+| TabM | CUDA | patience | Parameter-efficient ensemble NN via pytabkit, per-fold selection, tiered tracker + diversity pruning |
 | Ridge / LogReg | CPU | — | Fast linear baseline |
 | Elastic Net | CPU | — | L1+L2 linear regression |
 | KNN | CPU | — | Instance-based, adds diversity |
@@ -295,10 +297,13 @@ maestro-ml/
 │   ├── ps-s6e2/              # Kaggle PS S6E2 Heart Disease
 │   │   ├── pipeline.yaml
 │   │   └── strategy_output.yaml
-│   └── ps-s6e3/              # Kaggle PS S6E3 Customer Churn
+│   ├── ps-s6e3/              # Kaggle PS S6E3 Customer Churn
+│   │   ├── pipeline.yaml
+│   │   └── strategy_output.yaml
+│   └── porto-seguro-safe-driver-prediction/  # Porto Seguro (low-signal binary)
 │       ├── pipeline.yaml
 │       └── strategy_output.yaml
-├── tests/                    # 479 tests
+├── tests/                    # 757 tests
 ├── requirements.txt
 └── CLAUDE.md                 # AI-assisted development instructions
 ```
@@ -312,10 +317,10 @@ pytest tests/ -v
 ```
 
 ```
-723 passed, 22 skipped in ~30s
+757 passed, 22 skipped in ~60s
 ```
 
-Tests cover all modules: YAML loading, EDA profiling (including duplicate detection, unseen categories, monotonicity, cardinality profiles, target encoding preview, quick model baseline), feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights and NaN imputation), per-fold selection (PerFoldTracker, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
+Tests cover all modules: YAML loading, EDA profiling (including duplicate detection, unseen categories, monotonicity, cardinality profiles, target encoding preview, quick model baseline, prediction diversity probe), feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights and NaN imputation), per-fold selection (PerFoldTracker with vanilla and tiered modes, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics, diversity pruning), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
 
 ---
 
@@ -397,7 +402,10 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Automatic NaN imputation for models that don't handle missing values
 - [x] LLM-driven preprocessing: scaler selection (Standard/Robust/Quantile) as Optuna parameter, EDA sentinel detection, skewness/outlier analysis
 - [x] Configurable meta-models (LogReg + XGBoost) with Optuna-optimized hyperparameters
-- [x] 723 tests with full coverage
+- [x] Tiered PerFoldTracker (diversity-aware insertion for low-signal data)
+- [x] Diversity pruning (correlation-based redundant trial pruning)
+- [x] Prediction diversity probe (multi-seed RF correlation in EDA)
+- [x] 757 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [x] Feature importance analysis (quick model baseline in EDA)

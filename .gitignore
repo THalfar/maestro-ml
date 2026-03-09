@@ -229,3 +229,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Large competition data files
+competitions/**/train.csv
+competitions/**/test.csv
+competitions/**/sample_submission.csv

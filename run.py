@@ -327,26 +327,54 @@ def main(pipeline_yaml_path: str | Path) -> None:
     step_times["gpu_check"] = time.time() - gpu_start
 
     # -------------------------------------------------------------------------
-    # Step 3: Layer 1 — EDA
+    # Step 3 & 4: EDA + Strategy (skip EDA if strategy already exists)
     # -------------------------------------------------------------------------
+    # When strategy_input_path already exists (previous run), skip EDA entirely
+    # — it's expensive and the strategy is already generated.
     eda_start = time.time()
-    logger.info("Layer 1: Running EDA...")
-    eda_report, train, test = run_eda(
-        train_path=pipeline_config.train_path,
-        test_path=pipeline_config.test_path,
-        target_col=pipeline_config.target_column,
-        id_col=pipeline_config.id_column or None,
-        target_mapping=pipeline_config.target_mapping,
-        task_type=pipeline_config.task_type,
+    strategy_mode = pipeline_config.strategy.mode
+    manual_cfg = pipeline_config.strategy.manual or {}
+    strategy_input_path = manual_cfg.get("strategy_input_path")
+    skip_eda = (
+        strategy_mode == "manual"
+        and strategy_input_path
+        and Path(strategy_input_path).exists()
     )
-    eda_path = results_dir / "eda_report.json"
-    save_eda_report(eda_report, eda_path)
 
-    dataset_info = eda_report.get("dataset_info", {})
-    logger.info(
-        f"EDA complete: train={dataset_info.get('train_shape')}, "
-        f"test={dataset_info.get('test_shape')}"
-    )
+    if skip_eda:
+        logger.info(
+            f"Strategy file exists: {strategy_input_path} — skipping EDA"
+        )
+        # Load data directly (same as run_eda but without analysis)
+        train = pd.read_csv(pipeline_config.train_path)
+        test = pd.read_csv(pipeline_config.test_path)
+        if pipeline_config.target_mapping:
+            target_col = pipeline_config.target_column
+            train[target_col] = train[target_col].map(
+                pipeline_config.target_mapping
+            )
+        logger.info(
+            f"Data loaded: train={train.shape}, test={test.shape}"
+        )
+        eda_report = {}
+    else:
+        logger.info("Layer 1: Running EDA...")
+        eda_report, train, test = run_eda(
+            train_path=pipeline_config.train_path,
+            test_path=pipeline_config.test_path,
+            target_col=pipeline_config.target_column,
+            id_col=pipeline_config.id_column or None,
+            target_mapping=pipeline_config.target_mapping,
+            task_type=pipeline_config.task_type,
+        )
+        eda_path = results_dir / "eda_report.json"
+        save_eda_report(eda_report, eda_path)
+
+        dataset_info = eda_report.get("dataset_info", {})
+        logger.info(
+            f"EDA complete: train={dataset_info.get('train_shape')}, "
+            f"test={dataset_info.get('test_shape')}"
+        )
 
     # Apply log1p to target (e.g. for RMSLE competitions like House Prices)
     if pipeline_config.log_transform_target:
@@ -360,14 +388,15 @@ def main(pipeline_yaml_path: str | Path) -> None:
     if pipeline_config.extra_data:
         train = _concat_extra_data(train, pipeline_config, logger)
 
-    # Log top 5 correlated features
-    sorted_cols = sorted(
-        eda_report.get("columns", {}).items(),
-        key=lambda kv: abs(kv[1].get("target_correlation", 0)),
-        reverse=True,
-    )
-    for col, info in sorted_cols[:5]:
-        logger.info(f"  {col}: target_corr={info.get('target_correlation', 0):.4f}")
+    # Log top 5 correlated features (only if EDA was run)
+    if eda_report:
+        sorted_cols = sorted(
+            eda_report.get("columns", {}).items(),
+            key=lambda kv: abs(kv[1].get("target_correlation", 0)),
+            reverse=True,
+        )
+        for col, info in sorted_cols[:5]:
+            logger.info(f"  {col}: target_corr={info.get('target_correlation', 0):.4f}")
     step_times["eda"] = time.time() - eda_start
 
     # -------------------------------------------------------------------------

@@ -159,6 +159,11 @@ class OptunaModelConfig:
     assembly: dict[str, Any] = field(default_factory=lambda: {
         "mode": "rank",  # "rank" | "nsga2"
     })
+    tracker: dict[str, Any] = field(default_factory=dict)
+    # tracker config: {"diversity_mode": "vanilla"|"tiered", "tier1_size": 5, "tier2_corr_threshold": 0.99}
+    diversity_pruning: Optional[dict[str, Any]] = None
+    # diversity_pruning config: {"corr_threshold": 0.995, "warmup_entries": 5,
+    #                            "n_consecutive": 2, "score_tolerance": 0.001}
 
 
 @dataclass
@@ -428,6 +433,8 @@ def load_model_config(path: str | Path) -> ModelConfig:
         selection_mode=optuna_raw.get("selection_mode", "global"),
         fold_timeout=optuna_raw.get("fold_timeout", None),
         assembly=optuna_raw.get("assembly", {"mode": "rank"}),
+        tracker=optuna_raw.get("tracker", {}),
+        diversity_pruning=optuna_raw.get("diversity_pruning", None),
     )
 
     return ModelConfig(

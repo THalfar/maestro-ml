@@ -15,7 +15,8 @@
       "WebFetch(domain:www.pymoo.org)",
       "WebFetch(domain:blog.finxter.com)",
       "WebFetch(domain:zlatankr.github.io)",
-      "WebFetch(domain:chriskhanhtran.github.io)"
+      "WebFetch(domain:chriskhanhtran.github.io)",
+      "Bash(git push origin main)"
     ]
   }
 }
