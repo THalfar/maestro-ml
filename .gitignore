@@ -19,8 +19,8 @@ competitions/*/eda_report.json
 competitions/*/data_description.txt
 competitions/*/*.npy
 
-# prompts
-prompts/
+# prompts — included in repo for public visibility
+# prompts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

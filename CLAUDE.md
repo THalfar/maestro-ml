@@ -253,7 +253,7 @@ Testing: pytest
 Run Python scripts:
 ```bash
 conda run -n maestro python script.py
-conda run -n maestro python check_imports.py
+conda run -n maestro python scripts/check_imports.py
 ```
 
 Run tests:
@@ -297,4 +297,6 @@ src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_mo
 src/ensemble/diversity.py — run_nsga2_ensemble, select_from_pareto, effective_ensemble_size, _compute_diversity
 src/strategy/llm_strategist.py — generate_strategy (API + manual modes)
 run.py                   — main pipeline orchestrator (includes NSGA-II→meta chain logic)
+scripts/                 — Development utilities (check_imports.py, check_realmlp_gpu.py, check_realmlp_params.py)
+prompts/                 — LLM prompt templates (strategy_prompt.md, etc.)
 ```

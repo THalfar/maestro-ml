@@ -46,7 +46,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/maestro-ml.git
+git clone https://github.com/THalfar/maestro-ml.git
 cd maestro-ml
 pip install -r requirements.txt
 ```
@@ -260,6 +260,10 @@ Each model is configured in `configs/models/{name}.yaml` with its hyperparameter
 ```
 maestro-ml/
 ├── run.py                    # Pipeline entry point
+├── scripts/                  # Development utilities
+│   ├── check_imports.py
+│   ├── check_realmlp_gpu.py
+│   └── check_realmlp_params.py
 ├── configs/
 │   ├── models/               # Per-model YAML configs (12 models)
 │   │   ├── catboost.yaml
@@ -305,6 +309,7 @@ maestro-ml/
 │       └── strategy_output.yaml
 ├── tests/                    # 757 tests
 ├── requirements.txt
+├── LICENSE                   # MIT License
 └── CLAUDE.md                 # AI-assisted development instructions
 ```
 
