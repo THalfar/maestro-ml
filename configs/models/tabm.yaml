@@ -145,7 +145,7 @@ optuna:
   fold_timeout: 120
   assembly:
     mode: nsga2                                  # diversity-optimized assembly (like RealMLP)
-    n_composites: 20
+    n_composites: 10
     n_generations: 100
     pop_size: 150
     diversity_metric: spearman_neff              # rank-based diversity — suits AUC metric

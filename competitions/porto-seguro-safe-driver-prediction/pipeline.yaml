@@ -70,8 +70,8 @@ features:
 ensemble:
   strategy: "nsga2"
   nsga2_trials: 10000
-  diversity_weight: 0.2
-  diversity_metric: "spearman_neff"
+  diversity_weight: 0.3   
+  diversity_metric: "spearman_neff" 
   meta_models: ["logreg", "xgboost"]
   meta_cv_folds: 15
   meta_trials:
@@ -82,11 +82,11 @@ optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    catboost: "3h"
-    xgboost: "3h"
-    lightgbm: "3h"
-    realmlp: "4h"
-    tabm: "4h"
+    catboost: "2h"
+    xgboost: "2h"
+    lightgbm: "2h"
+    realmlp: "5h"
+    tabm: "5h"
 
 runtime:
   gpu_check: true

@@ -66,6 +66,79 @@ def _suppress_catboost_gpu_warnings():
         sys.stderr = old_stderr
 
 
+def _free_gpu_memory() -> None:
+    """Release GPU memory between model training runs."""
+    import gc
+    gc.collect()
+    # Only attempt torch cleanup if it was already imported (avoids Windows DLL issues)
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _deduplicate_composites(
+    composites: list[dict[str, Any]],
+    corr_threshold: float = 0.9999,
+    maximize: bool = True,
+) -> list[dict[str, Any]]:
+    """Remove near-duplicate composites based on OOF correlation.
+
+    Composites with pairwise Pearson correlation above ``corr_threshold``
+    are considered duplicates.  Only the one with the best ``avg_score``
+    is kept.
+
+    Args:
+        composites: List of composite dicts with ``oof_preds`` and ``avg_score``.
+        corr_threshold: Correlation threshold for deduplication.
+        maximize: Whether higher scores are better.
+
+    Returns:
+        Deduplicated list of composites (order preserved).
+    """
+    if len(composites) <= 1:
+        return composites
+
+    n = len(composites)
+    keep = [True] * n
+
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            oof_i = composites[i]["oof_preds"].ravel()
+            oof_j = composites[j]["oof_preds"].ravel()
+            corr = abs(float(np.corrcoef(oof_i, oof_j)[0, 1]))
+            if np.isnan(corr):
+                corr = 1.0
+            if corr >= corr_threshold:
+                # Keep the one with better score
+                i_better = (
+                    composites[i]["avg_score"] >= composites[j]["avg_score"]
+                    if maximize
+                    else composites[i]["avg_score"] <= composites[j]["avg_score"]
+                )
+                if i_better:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break  # i is gone, stop comparing it
+
+    original = n
+    result = [c for c, k in zip(composites, keep) if k]
+    if len(result) < original:
+        logger.info(
+            f"Composite deduplication: {original} → {len(result)} "
+            f"(removed {original - len(result)} with corr ≥ {corr_threshold})"
+        )
+    return result
+
+
 def _deep_merge(base: dict, overrides: dict) -> dict:
     """Recursively merge *overrides* into *base* in-place.
 
@@ -607,7 +680,11 @@ class PerFoldTracker:
             return []
 
         def _build_composite(indices: list[int]) -> tuple[np.ndarray, np.ndarray, list[int], list[float]]:
-            """Build a single composite from fold-index selections."""
+            """Build a single composite from fold-index selections.
+
+            When different trials are mixed across folds, rank-normalizes
+            per fold to fix calibration mismatch between trials.
+            """
             is_multiclass = task_type == "multiclass"
             if is_multiclass:
                 sample_preds = self.fold_data[0][0].val_preds
@@ -1020,8 +1097,8 @@ def run_optuna_study(
     if needs_scaling:
         # Default: all scalers. Strategy can narrow to a subset.
         scaler_choices = model_preproc.get("scaler_choices") or preprocessing.get("scaler_choices") or list(ALL_SCALER_CHOICES)
-        # Ensure "none" is always an option so Optuna can decide
-        if "none" not in scaler_choices:
+        # Add "none" so Optuna can opt out — UNLESS strategy locked to a single scaler
+        if len(scaler_choices) > 1 and "none" not in scaler_choices:
             scaler_choices = ["none"] + list(scaler_choices)
         logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
 
@@ -2139,6 +2216,13 @@ def run_all_studies(
                     )
                 tracker.log_summary(model_name)
 
+                # Deduplicate near-identical composites (corr ≥ 0.9999)
+                composites = _deduplicate_composites(
+                    composites,
+                    corr_threshold=0.9999,
+                    maximize=(task_type != "regression"),
+                )
+
                 all_oof = [c["oof_preds"] for c in composites]
                 all_test = [c["test_preds"] for c in composites]
                 labels = train[pipeline_config.target_column].values
@@ -2230,6 +2314,9 @@ def run_all_studies(
 
         except Exception as exc:
             logger.error(f"Model '{model_name}' failed: {exc}", exc_info=True)
+
+        # Free GPU memory between models to avoid OOM
+        _free_gpu_memory()
 
     total_training = time.time() - all_models_start
     total_m, total_s = divmod(int(total_training), 60)

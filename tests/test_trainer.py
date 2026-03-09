@@ -980,6 +980,28 @@ class TestPerFoldTracker:
             composites[0]["test_preds"], [0.6, 0.4]
         )
 
+    def test_deduplicate_composites(self):
+        """Near-identical composites should be deduplicated."""
+        from src.models.trainer import _deduplicate_composites
+
+        rng = np.random.default_rng(42)
+        base = rng.random(100)
+
+        composites = [
+            {"oof_preds": base, "avg_score": 0.65, "test_preds": base},
+            {"oof_preds": base + 1e-10, "avg_score": 0.64, "test_preds": base},  # near-dup
+            {"oof_preds": rng.random(100), "avg_score": 0.63, "test_preds": rng.random(100)},  # different
+            {"oof_preds": base * 1.0, "avg_score": 0.66, "test_preds": base},  # exact dup (better score)
+        ]
+
+        result = _deduplicate_composites(composites, corr_threshold=0.9999)
+        # Should keep: composite 3 (best of the dups), composite 2 (different)
+        assert len(result) == 2
+        # Best dup (score 0.66) should be kept
+        scores = [r["avg_score"] for r in result]
+        assert 0.66 in scores
+        assert 0.63 in scores
+
     def test_pruned_trials_contribute(self):
         """Pruned trials' completed folds should be tracked."""
         from src.models.trainer import PerFoldTracker

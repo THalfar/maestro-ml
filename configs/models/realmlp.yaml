@@ -195,7 +195,7 @@ optuna:
   fold_timeout: 180
   assembly:
     mode: nsga2                                  # "rank" (deterministic) | "nsga2" (diversity-optimized)
-    n_composites: 20                             # how many composites from Pareto front
+    n_composites: 10                             # how many composites from Pareto front
     n_generations: 100                           # NSGA-II generations (each eval = array lookup, <1s total)
     pop_size: 150                                # NSGA-II population size
     diversity_metric: ambiguity                  # pearson_neff | spearman_neff | ambiguity
