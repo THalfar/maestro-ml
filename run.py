@@ -28,6 +28,12 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # unless torch is already loaded in the process)
 try:
     import torch  # noqa: F401
+
+    # Enable TF32 for all PyTorch matmuls/convolutions on Ampere+ GPUs
+    # (RTX 30xx, 40xx, 50xx). ~2x faster with negligible precision loss.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")  # TF32 for torch.compile too
 except (ImportError, OSError):
     pass
 

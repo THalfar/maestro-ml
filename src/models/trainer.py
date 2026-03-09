@@ -1166,6 +1166,17 @@ def run_optuna_study(
 
     study = optuna.create_study(direction=direction, pruner=pruner)
 
+    # Enqueue pre-specified trials (e.g., known good configs from previous runs
+    # or LLM-suggested starting points). These run first, before QMC/TPE.
+    enqueue_trials = optuna_cfg.get("enqueue_trials", []) or []
+    if enqueue_trials:
+        for trial_params in enqueue_trials:
+            study.enqueue_trial(dict(trial_params))
+        logger.info(
+            f"[{model_name}] Enqueued {len(enqueue_trials)} trial(s) "
+            f"(run before QMC/TPE)"
+        )
+
     # Pipeline-level timeout override takes precedence over model YAML timeout
     effective_timeout = timeout_override if timeout_override is not None else optuna_cfg.get("timeout")
     if effective_timeout:

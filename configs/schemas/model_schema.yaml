@@ -53,3 +53,6 @@ optuna:
     n_startup_trials: int     # Trials completed before pruning activates (default: 10)
   n_top_trials: int           # Top configurations to keep for ensemble (default: 5)
   n_seeds: int                # Seeds per top config for stability (default: 3)
+  enqueue_trials: list[dict]  # OPTIONAL — pre-specified trials to evaluate before QMC/TPE
+                              # Each dict maps param_name → value (partial params OK)
+                              # Use for known-good configs from previous runs or LLM suggestions

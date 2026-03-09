@@ -3532,3 +3532,104 @@ class TestDiversityPruning:
         assert tracker.diversity_mode == "tiered"
         assert tracker.tier1_size == 2
         assert tracker.tier2_corr_threshold == 0.98
+
+
+# ---------------------------------------------------------------------------
+# Enqueue trials
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueTrials:
+    """Tests for enqueue_trials feature — pre-specified trials run before QMC/TPE."""
+
+    def test_enqueue_trial_runs_first(
+        self, ridge_configs_dir, binary_data, pipeline_config
+    ):
+        """Enqueued trial params should appear in the study's first trial."""
+        train, test_df = binary_data
+        registry = ModelRegistry(str(ridge_configs_dir))
+
+        # Enqueue a specific C value via strategy overrides
+        strategy = {
+            "overrides": {
+                "ridge": {
+                    "optuna": {
+                        "enqueue_trials": [{"C": 0.42}],
+                    }
+                }
+            }
+        }
+
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+            test=test_df,
+        )
+
+        # First trial should have the enqueued C value
+        assert study.trials[0].params["C"] == pytest.approx(0.42)
+        # Study should have more trials (QMC + TPE ran after enqueue)
+        assert len(study.trials) >= 2
+
+    def test_enqueue_multiple_trials(
+        self, ridge_configs_dir, binary_data, pipeline_config
+    ):
+        """Multiple enqueued trials should all appear at the start."""
+        train, test_df = binary_data
+        registry = ModelRegistry(str(ridge_configs_dir))
+
+        strategy = {
+            "overrides": {
+                "ridge": {
+                    "optuna": {
+                        "enqueue_trials": [
+                            {"C": 0.1},
+                            {"C": 5.0},
+                        ],
+                    }
+                }
+            }
+        }
+
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy=strategy,
+            gpu=False,
+            test=test_df,
+        )
+
+        assert study.trials[0].params["C"] == pytest.approx(0.1)
+        assert study.trials[1].params["C"] == pytest.approx(5.0)
+
+    def test_no_enqueue_trials_is_default(
+        self, ridge_configs_dir, binary_data, pipeline_config
+    ):
+        """Without enqueue_trials, study should still work normally."""
+        train, test_df = binary_data
+        registry = ModelRegistry(str(ridge_configs_dir))
+
+        study, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+            test=test_df,
+        )
+
+        # Should complete with the default n_trials
+        assert len(study.trials) >= 2

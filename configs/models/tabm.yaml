@@ -105,6 +105,8 @@ fixed_params:
     val_metric_name: 1-auc_ovr
     verbosity: 0
     random_state: 42
+    allow_amp: true              # bfloat16 mixed precision on RTX 5090 → ~1.5-2x speedup
+    compile_model: true          # torch.compile → fused kernels, less overhead
   regression:
     n_epochs: 256
     patience: 16
@@ -115,6 +117,8 @@ fixed_params:
     val_metric_name: rmse
     verbosity: 0
     random_state: 42
+    allow_amp: true
+    compile_model: true
 
 training:
   early_stopping: false                          # TabM handles early stopping internally

@@ -204,6 +204,24 @@ preprocessing:
 - **Prediction diversity probe** (`prediction_diversity`): Trains 3 RF models with different seeds and measures signal-noise ratio (SNR = within_seed_std / across_seed_std). Within-seed std = how much predictions vary across samples (signal). Across-seed std = how much seeds change predictions (noise). Classification by SNR: `very_low` (<3), `low` (3-8), `moderate` (8-15), `high` (>15). **Note**: Pearson correlation alone is misleading for RF — noise features inflate seed-to-seed variation. SNR is robust because noise inflates both stds proportionally. Also reports Pearson correlations and Fisher z CI for reference. Subsamples to 50k. Guides LLM in setting tiered tracker/diversity pruning parameters.
 - **Fold context**: Dataset header shows per-fold train/val sizes for 5-fold and 10-fold CV to help calibrate min_leaf parameters.
 
+## Enqueue Trials
+
+- **`enqueue_trials`** in model YAML or strategy YAML `overrides.<model>.optuna.enqueue_trials`: List of hyperparameter dicts to evaluate before QMC/TPE search begins.
+- Partial params OK — unspecified params are sampled from the active sampler.
+- Enqueued trials are "free" comparison points — they don't reduce the n_trials budget.
+- Use cases: known-good configs from previous runs, LLM-suggested starting points, baseline configs.
+- The LLM strategist can add these in the strategy YAML to seed Optuna with educated guesses.
+- Example:
+  ```yaml
+  overrides:
+    xgboost:
+      optuna:
+        enqueue_trials:
+          - max_depth: 6
+            learning_rate: 0.03
+            n_estimators: 2000
+  ```
+
 ## Pipeline YAML Key Features
 
 - **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).

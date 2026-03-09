@@ -76,6 +76,11 @@ overrides:                             # OPTIONAL — narrow default ranges
     max_depth:
       low: 3
       high: 8
+    optuna:                              # OPTIONAL — enqueue known-good configs
+      enqueue_trials:
+        - max_depth: 6
+          learning_rate: 0.03
+          n_estimators: 2000
 
 reasoning: >
   Explain your choices in 2-5 sentences. Why these features?
@@ -98,6 +103,16 @@ reasoning: >
 | gaussian_nb | `var_smoothing` [1e-12 - 1e-3] (log scale) |
 | mlp | `hidden_layer_sizes` [[128], [128,64], ...], `alpha` [1e-5 - 0.01], `learning_rate_init` [1e-4 - 0.01] |
 | adaboost | `n_estimators` [50-500], `learning_rate` [0.01-1.0] (log scale) |
+
+### Enqueue trials (optional)
+
+You can enqueue specific hyperparameter configurations to be evaluated **before** Optuna's search begins. These are free comparison points — they don't reduce the search budget. Use cases:
+
+- **Known good configs** from previous competition runs or papers
+- **Educated guesses** based on dataset characteristics (e.g., you know low learning rate + high iterations works for imbalanced data)
+- **Baseline configs** to establish a reference point early
+
+Place `enqueue_trials` under `overrides.<model>.optuna.enqueue_trials` as a list of param dicts. You don't need to specify every parameter — unspecified ones are sampled normally.
 
 ### Feature engineering notes
 
