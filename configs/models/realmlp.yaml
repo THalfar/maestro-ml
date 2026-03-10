@@ -218,3 +218,23 @@ optuna:
   #   warmup_entries: 5                          # wait for 5 entries before pruning
   #   n_consecutive: 2                           # 2 consecutive redundant folds → prune
   #   score_tolerance: 0.001                     # never prune new best score
+  # --- Substudy: warm-start from small-data QMC exploration (optional) ---
+  # Runs pure QMC on a stratified data subset, then rank-samples trials
+  # for main study enqueue. Main study skips QMC and runs pure TPE.
+  # Especially useful for slow neural nets on large datasets (>100k rows).
+  # substudy:
+  #   enabled: true
+  #   sample_fraction: 0.10                      # 10% of training data
+  #   n_folds: 3                                 # lighter CV than main study
+  #   timeout: "15m"                             # own time budget
+  #   n_trials: 100                              # pure QMC trials
+  #   n_enqueue: 20                              # rank-sampled trials for main study
+  #   temperature: 0.3                           # sampling sharpness (lower = more top-heavy)
+  #   lock_scaler: true                          # lock main study to best scaler found
+  # --- TPE settings (optional, applied to main study Phase 2) ---
+  # Custom gamma function: 15% of trials classified as "good" (project default).
+  # Per-model override via strategy YAML: overrides.<model>.optuna.tpe
+  # tpe:
+  #   gamma_ratio: 0.15                          # fraction of good trials
+  #   gamma_min: 5                               # minimum good trials floor
+  #   n_startup_trials: 0                        # 0 when QMC/substudy explored

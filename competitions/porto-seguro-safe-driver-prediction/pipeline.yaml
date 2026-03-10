@@ -19,12 +19,12 @@
 # - RealMLP: neural net, per-fold NSGA-II assembly
 # - TabM: parameter-efficient ensemble NN, per-fold NSGA-II assembly
 #
-# 16h budget allocation (~15.5h Optuna + ~30min ensemble/retrain):
-# - CatBoost 3h30m: GPU, symmetric growth, Logloss metric
-# - XGBoost 3h: GPU, level-wise growth, AUC metric
-# - LightGBM 3h: CPU/GPU, leaf-wise growth — fast per trial
-# - RealMLP 3h: GPU, per-fold = ~10× cost vs global (10 folds each trial)
-# - TabM 3h: GPU, per-fold, parameter-efficient = faster per trial
+# 16h budget allocation:
+# - RealMLP 6h: 1h substudy (10% data, QMC) + 5h main TPE (per-fold NSGA-II)
+# - TabM 6h: 1h substudy (10% data, QMC) + 5h main TPE (per-fold NSGA-II)
+# - CatBoost 1h20m: GPU, symmetric growth, Logloss metric
+# - XGBoost 1h20m: GPU, level-wise growth, AUC metric
+# - LightGBM 1h20m: CPU/GPU, leaf-wise growth — fast per trial
 # =============================================================================
 
 data:
@@ -51,11 +51,11 @@ strategy:
     strategy_input_path: "competitions/porto-seguro-safe-driver-prediction/strategy_output.yaml"
 
 models:
+  - realmlp
   - tabm
   - catboost
   - xgboost
   - lightgbm
-  - realmlp
   
 
 features:
@@ -82,11 +82,11 @@ optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    catboost: "2h"
-    xgboost: "2h"
-    lightgbm: "2h"
-    realmlp: "5h"
-    tabm: "5h"
+    catboost: "1h20m"
+    xgboost: "1h20m"
+    lightgbm: "1h20m"
+    realmlp: "6h"              # 1h substudy + 5h main TPE
+    tabm: "6h"                 # 1h substudy + 5h main TPE
 
 runtime:
   gpu_check: true

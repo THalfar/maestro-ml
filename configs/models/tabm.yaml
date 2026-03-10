@@ -106,7 +106,7 @@ fixed_params:
     verbosity: 0
     random_state: 42
     allow_amp: true              # bfloat16 mixed precision on RTX 5090 → ~1.5-2x speedup
-    compile_model: true          # torch.compile → fused kernels, less overhead
+    # compile_model: true        # Requires Triton — not available on Windows
   regression:
     n_epochs: 256
     patience: 16
@@ -167,3 +167,19 @@ optuna:
   #   warmup_entries: 5
   #   n_consecutive: 2
   #   score_tolerance: 0.001
+  # --- Substudy: warm-start from small-data QMC exploration (optional) ---
+  # See realmlp.yaml for detailed comments. Disabled by default.
+  # substudy:
+  #   enabled: true
+  #   sample_fraction: 0.10
+  #   n_folds: 3
+  #   timeout: "15m"
+  #   n_trials: 100
+  #   n_enqueue: 20
+  #   temperature: 0.3
+  #   lock_scaler: true
+  # --- TPE settings (optional, applied to main study Phase 2) ---
+  # tpe:
+  #   gamma_ratio: 0.15
+  #   gamma_min: 5
+  #   n_startup_trials: 0

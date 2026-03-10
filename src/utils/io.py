@@ -164,6 +164,14 @@ class OptunaModelConfig:
     diversity_pruning: Optional[dict[str, Any]] = None
     # diversity_pruning config: {"corr_threshold": 0.995, "warmup_entries": 5,
     #                            "n_consecutive": 2, "score_tolerance": 0.001}
+    substudy: Optional[dict[str, Any]] = None
+    # substudy config: {"enabled": true, "sample_fraction": 0.10, "n_folds": 3,
+    #                    "timeout": "15m", "n_trials": 100, "n_enqueue": 20,
+    #                    "temperature": 0.3, "lock_scaler": true}
+    enqueue_trials: Optional[list[dict[str, Any]]] = None
+    # enqueue_trials: list of hparam dicts evaluated before QMC/TPE; partial params OK
+    tpe: Optional[dict[str, Any]] = None
+    # tpe config: {"gamma_ratio": 0.15, "gamma_min": 5, "n_startup_trials": 0}
 
 
 @dataclass
@@ -435,6 +443,9 @@ def load_model_config(path: str | Path) -> ModelConfig:
         assembly=optuna_raw.get("assembly", {"mode": "rank"}),
         tracker=optuna_raw.get("tracker", {}),
         diversity_pruning=optuna_raw.get("diversity_pruning", None),
+        substudy=optuna_raw.get("substudy", None),
+        enqueue_trials=optuna_raw.get("enqueue_trials", None),
+        tpe=optuna_raw.get("tpe", None),
     )
 
     return ModelConfig(

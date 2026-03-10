@@ -16,7 +16,8 @@
       "WebFetch(domain:blog.finxter.com)",
       "WebFetch(domain:zlatankr.github.io)",
       "WebFetch(domain:chriskhanhtran.github.io)",
-      "Bash(git push origin main)"
+      "Bash(git push origin main)",
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE conda run -n maestro python -c \"import torch; torch.set_float32_matmul_precision\\(''high''\\); torch.backends.cuda.matmul.allow_tf32 = True; print\\(torch.get_float32_matmul_precision\\(\\)\\)\")"
     ]
   }
 }

@@ -31,9 +31,12 @@ try:
 
     # Enable TF32 for all PyTorch matmuls/convolutions on Ampere+ GPUs
     # (RTX 30xx, 40xx, 50xx). ~2x faster with negligible precision loss.
+    # Use ONLY the legacy API — pytabkit internally toggles allow_tf32
+    # (sets False, then restores). If we use set_float32_matmul_precision(),
+    # pytabkit's legacy write creates a mixed-API state → PyTorch 2.10+
+    # throws RuntimeError in get_float32_matmul_precision().
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")  # TF32 for torch.compile too
 except (ImportError, OSError):
     pass
 

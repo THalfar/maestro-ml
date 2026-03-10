@@ -222,6 +222,48 @@ preprocessing:
             n_estimators: 2000
   ```
 
+## Substudy (Neural Net Warm-Start)
+
+Neural network models (RealMLP, TabM) are slow on large datasets (~8-10 min/trial on 595k rows). A substudy runs a cheap Optuna study on a stratified subset with fewer CV folds, then enqueues the best configs into the main study as warm-start points.
+
+- **Pure QMC only**: Substudy uses only QMC sampling (space-filling exploration). No TPE phase.
+- **Main study skips QMC**: When substudy provides warm-start, main study sets `qmc_warmup_trials=0` and runs pure TPE from the start. Enqueued trials serve as the warmup that QMC would normally provide.
+- **Rank-weighted importance sampling**: Instead of just top-N, samples `n_enqueue` trials using exponential rank-weighting (`np.exp(-temperature * ranks / n)`). Includes some bad trials so TPE learns where NOT to search. Safety cap: `min(n_enqueue, n_completed // 3)`.
+- **Scaler lock**: Substudy tests all scaler choices cheaply. If `lock_scaler: true`, the main study is locked to the best scaler found → enables prescaling optimization.
+- **Small data skip**: Substudy is skipped if subsample has fewer than `n_folds * 10` rows.
+- **Config** (in model YAML `optuna.substudy` or strategy YAML `overrides.<model>.optuna.substudy`):
+  ```yaml
+  optuna:
+    substudy:
+      enabled: true              # opt-in, default disabled
+      sample_fraction: 0.10      # fraction of train data (stratified)
+      n_folds: 3                 # lighter CV than main study
+      timeout: "15m"             # own time budget (parse_timeout format)
+      n_trials: 100              # pure QMC trials
+      n_enqueue: 20              # rank-sampled trials for main study
+      temperature: 0.3           # sampling sharpness (0.1=top-heavy, 1.0=uniform)
+      lock_scaler: true          # lock main study to best scaler found
+  ```
+- **Expected speedup**: ~10x per trial (10% data + CV=3 vs CV=5). A 15 min substudy covers as much hyperparameter space as 2.5h of full-data search.
+
+## TPE Configuration
+
+Custom TPE gamma function is the **project default** for all models. Controls the "good vs bad" trial split in TPE's surrogate model.
+
+- **Default values** (applied automatically in `_run_two_phase_study()`):
+  - `gamma_ratio=0.15` — 15% of completed trials classified as "good"
+  - `gamma_min=5` — minimum floor for small histories
+  - `n_startup_trials=0` — 0 for Phase 2 since QMC already explored
+- **Per-model override** via model YAML or strategy YAML:
+  ```yaml
+  optuna:
+    tpe:
+      gamma_ratio: 0.15          # fraction of good trials
+      gamma_min: 5               # minimum good trials floor
+      n_startup_trials: 0        # 0 when QMC/substudy explored
+  ```
+- When substudy is active, `n_startup_trials` defaults to 0 (substudy already explored). When substudy is not active, these settings still apply to the TPE phase.
+
 ## Pipeline YAML Key Features
 
 - **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).

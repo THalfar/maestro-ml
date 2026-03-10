@@ -792,6 +792,144 @@ class TestLoadModelConfigPerFold:
 # save_eda_report — np.bool_ handling (NumPy 2.x)
 # ---------------------------------------------------------------------------
 
+class TestLoadModelConfigNewFields:
+    """Tests for newer OptunaModelConfig fields: tracker, diversity_pruning,
+    substudy, enqueue_trials, tpe."""
+
+    def test_tracker_config_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "TrackerModel",
+            "optuna": {
+                "tracker": {
+                    "diversity_mode": "tiered",
+                    "tier1_size": 5,
+                    "tier2_corr_threshold": 0.99,
+                },
+            },
+        }
+        path = tmp_dir / "tracker.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.tracker["diversity_mode"] == "tiered"
+        assert cfg.optuna.tracker["tier1_size"] == 5
+        assert cfg.optuna.tracker["tier2_corr_threshold"] == 0.99
+
+    def test_tracker_default_empty(self, tmp_dir: Path):
+        content = {"name": "NoTracker"}
+        path = tmp_dir / "no_tracker.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.tracker == {}
+
+    def test_diversity_pruning_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "DivPrune",
+            "optuna": {
+                "diversity_pruning": {
+                    "corr_threshold": 0.995,
+                    "warmup_entries": 5,
+                    "n_consecutive": 2,
+                    "score_tolerance": 0.001,
+                },
+            },
+        }
+        path = tmp_dir / "divprune.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.diversity_pruning is not None
+        assert cfg.optuna.diversity_pruning["corr_threshold"] == 0.995
+        assert cfg.optuna.diversity_pruning["n_consecutive"] == 2
+
+    def test_diversity_pruning_default_none(self, tmp_dir: Path):
+        content = {"name": "NoDivPrune"}
+        path = tmp_dir / "no_divprune.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.diversity_pruning is None
+
+    def test_substudy_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "SubstudyModel",
+            "optuna": {
+                "substudy": {
+                    "enabled": True,
+                    "sample_fraction": 0.10,
+                    "n_folds": 3,
+                    "timeout": "15m",
+                    "n_trials": 100,
+                    "n_enqueue": 20,
+                    "temperature": 0.3,
+                    "lock_scaler": True,
+                },
+            },
+        }
+        path = tmp_dir / "substudy.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.substudy is not None
+        assert cfg.optuna.substudy["enabled"] is True
+        assert cfg.optuna.substudy["sample_fraction"] == 0.10
+        assert cfg.optuna.substudy["timeout"] == "15m"
+        assert cfg.optuna.substudy["lock_scaler"] is True
+
+    def test_substudy_default_none(self, tmp_dir: Path):
+        content = {"name": "NoSubstudy"}
+        path = tmp_dir / "no_sub.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.substudy is None
+
+    def test_enqueue_trials_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "EnqueueModel",
+            "optuna": {
+                "enqueue_trials": [
+                    {"max_depth": 6, "learning_rate": 0.03},
+                    {"max_depth": 8},
+                ],
+            },
+        }
+        path = tmp_dir / "enqueue.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.enqueue_trials is not None
+        assert len(cfg.optuna.enqueue_trials) == 2
+        assert cfg.optuna.enqueue_trials[0]["max_depth"] == 6
+        assert cfg.optuna.enqueue_trials[1] == {"max_depth": 8}
+
+    def test_enqueue_trials_default_none(self, tmp_dir: Path):
+        content = {"name": "NoEnqueue"}
+        path = tmp_dir / "no_enqueue.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.enqueue_trials is None
+
+    def test_tpe_config_parsed(self, tmp_dir: Path):
+        content = {
+            "name": "TpeModel",
+            "optuna": {
+                "tpe": {
+                    "gamma_ratio": 0.15,
+                    "gamma_min": 5,
+                    "n_startup_trials": 0,
+                },
+            },
+        }
+        path = tmp_dir / "tpe.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.tpe is not None
+        assert cfg.optuna.tpe["gamma_ratio"] == 0.15
+        assert cfg.optuna.tpe["gamma_min"] == 5
+
+    def test_tpe_default_none(self, tmp_dir: Path):
+        content = {"name": "NoTpe"}
+        path = tmp_dir / "no_tpe.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_model_config(path)
+        assert cfg.optuna.tpe is None
+
+
 class TestSaveEdaReportNpBool:
     def test_numpy_bool_in_report(self, tmp_dir: Path):
         """np.bool_ must be converted to native bool for JSON serialization.

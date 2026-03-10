@@ -16,7 +16,7 @@ conda run -n maestro pytest -k "test_blend" -v
 conda run -n maestro pytest tests/ -x -v
 ```
 
-Expected: **479 tests, ~6s** (no GPU, no real Optuna studies — all use tiny synthetic data).
+Expected: **775 passed, 22 skipped, ~55s** (no GPU, no real Optuna studies — all use tiny synthetic data).
 
 ## Test File → Source Module Mapping
 

@@ -220,7 +220,7 @@ class TestGetOptunaConfig:
         expected_keys = {
             "n_trials", "qmc_warmup_trials", "timeout", "pruner",
             "n_top_trials", "n_seeds", "selection_mode", "fold_timeout",
-            "assembly", "tracker", "diversity_pruning",
+            "assembly", "tracker", "diversity_pruning", "substudy", "enqueue_trials", "tpe",
         }
         assert set(cfg.keys()) == expected_keys
         assert cfg["qmc_warmup_trials"] == 6
@@ -231,6 +231,9 @@ class TestGetOptunaConfig:
         assert cfg["assembly"]["mode"] == "rank"  # default
         assert cfg["tracker"] == {}  # default
         assert cfg["diversity_pruning"] is None  # default
+        assert cfg["substudy"] is None  # default
+        assert cfg["enqueue_trials"] is None  # default
+        assert cfg["tpe"] is None  # default
 
     def test_unknown_model_raises(self, registry: ModelRegistry):
         with pytest.raises(KeyError):

@@ -268,6 +268,9 @@ class ModelRegistry:
             "assembly": optuna_cfg.assembly,
             "tracker": optuna_cfg.tracker,
             "diversity_pruning": optuna_cfg.diversity_pruning,
+            "substudy": optuna_cfg.substudy,
+            "enqueue_trials": optuna_cfg.enqueue_trials,
+            "tpe": optuna_cfg.tpe,
         })
 
     def get_training_config(self, name: str) -> dict[str, Any]:

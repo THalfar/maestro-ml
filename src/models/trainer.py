@@ -31,7 +31,7 @@ from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.preprocessing import StandardScaler, RobustScaler, QuantileTransformer
 
 from src.models.registry import ModelRegistry
-from src.utils.io import PipelineConfig
+from src.utils.io import PipelineConfig, parse_timeout
 
 
 class FoldEntry(NamedTuple):
@@ -199,6 +199,50 @@ def _identify_scale_cols(X: pd.DataFrame) -> list[str]:
                 continue  # ordinal integer
         scale_cols.append(col)
     return scale_cols
+
+
+def _apply_prescaling(
+    train: pd.DataFrame,
+    test: pd.DataFrame | None,
+    feature_cols: list[str],
+    scaler_type: str,
+    model_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, bool]:
+    """Pre-scale train and test DataFrames with a single locked scaler.
+
+    Fits the scaler on the full training data and transforms both train
+    and test.  Returns new DataFrames (no mutation).
+
+    Args:
+        train: Training DataFrame.
+        test: Optional test DataFrame.
+        feature_cols: Feature column names.
+        scaler_type: Scaler type string ("standard", "robust", "quantile").
+        model_name: For logging.
+
+    Returns:
+        Tuple of (train, test, was_scaled).  ``was_scaled`` is True when
+        scaling was actually applied (scaler_type != "none" and scale_cols
+        were found).
+    """
+    if scaler_type == "none":
+        return train, test, False
+    scale_cols = _identify_scale_cols(train[feature_cols])
+    if not scale_cols:
+        return train, test, False
+    scaler_obj = _make_scaler(scaler_type)
+    if scaler_obj is None:
+        return train, test, False
+    train = train.copy()
+    train[scale_cols] = scaler_obj.fit_transform(train[scale_cols])
+    if test is not None:
+        test = test.copy()
+        test[scale_cols] = scaler_obj.transform(test[scale_cols])
+    logger.info(
+        f"[{model_name}] Pre-scaled {len(scale_cols)} columns with "
+        f"'{scaler_type}' (locked scaler — skipping per-fold scaling)"
+    )
+    return train, test, True
 
 
 def _apply_scaler_fold(
@@ -952,6 +996,220 @@ def _get_eval_metric_value(training: dict, task_type: str, gpu: bool) -> str | N
     return str(em)
 
 
+def _run_substudy(
+    model_name: str,
+    train: pd.DataFrame,
+    feature_cols: list[str],
+    target_col: str,
+    registry: ModelRegistry,
+    task_type: str,
+    gpu: bool,
+    results_dir: Path,
+    substudy_cfg: dict[str, Any],
+    search_space: dict[str, dict[str, Any]],
+    scaler_choices: list[str] | None,
+    global_seed: int,
+    pruner_cfg: dict[str, Any],
+    monotone_constraints: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Run a substudy on a stratified data subset to find good starting configs.
+
+    Creates a stratified subsample of training data, runs a pure QMC Optuna
+    study (no TPE) with fewer CV folds and its own timeout, then rank-samples
+    trial configurations for enqueue into the main study.
+
+    Also determines the best scaler when ``lock_scaler`` is True.
+
+    Args:
+        model_name: Model name for logging.
+        train: Full training DataFrame.
+        feature_cols: Feature columns.
+        target_col: Target column name.
+        registry: ModelRegistry instance.
+        task_type: Task type string.
+        gpu: Whether to use GPU.
+        results_dir: For model artifacts.
+        substudy_cfg: Substudy configuration dict.
+        search_space: Optuna search space (same as main study).
+        scaler_choices: Scaler choices (None if no scaling needed).
+        global_seed: Seed for reproducibility.
+        pruner_cfg: Pruner configuration from main study.
+        monotone_constraints: Optional monotone constraints list.
+
+    Returns:
+        Tuple of:
+        - List of trial param dicts (rank-sampled configs to enqueue).
+        - Best scaler string (or None if lock_scaler is False or no scaling).
+    """
+    from sklearn.model_selection import train_test_split
+
+    # Parse substudy config with defaults
+    sample_fraction = substudy_cfg.get("sample_fraction", 0.10)
+    n_folds = substudy_cfg.get("n_folds", 3)
+    timeout_raw = substudy_cfg.get("timeout", "15m")
+    timeout = parse_timeout(timeout_raw)
+    n_trials = substudy_cfg.get("n_trials", 100)
+    n_enqueue = substudy_cfg.get("n_enqueue", 20)
+    temperature = substudy_cfg.get("temperature", 0.3)
+    lock_scaler = substudy_cfg.get("lock_scaler", True)
+
+    # Stratified subsample
+    y = train[target_col].values
+    subsample_seed = global_seed + 9999
+    if task_type != "regression":
+        sub_train, _ = train_test_split(
+            train, train_size=sample_fraction,
+            stratify=y, random_state=subsample_seed,
+        )
+    else:
+        sub_train, _ = train_test_split(
+            train, train_size=sample_fraction,
+            random_state=subsample_seed,
+        )
+    sub_train = sub_train.reset_index(drop=True)
+
+    # Min size check
+    min_rows = n_folds * 10
+    if len(sub_train) < min_rows:
+        logger.warning(
+            f"[{model_name}] Substudy skipped: subsample has {len(sub_train)} rows "
+            f"(need ≥{min_rows} for {n_folds}-fold CV)"
+        )
+        return [], None
+
+    logger.info(
+        f"[{model_name}] Substudy: {len(sub_train)} rows ({sample_fraction:.0%} of "
+        f"{len(train)}), {n_folds} folds, {n_trials} QMC trials, "
+        f"timeout={timeout_raw}"
+    )
+
+    # Create lightweight CV splitter
+    if task_type != "regression":
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=global_seed)
+    else:
+        cv = KFold(n_splits=n_folds, shuffle=True, random_state=global_seed)
+
+    # Create objective — global mode, no per-fold tracker, no test, no diversity pruning
+    objective = _create_objective(
+        model_name=model_name,
+        train=sub_train,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        cv=cv,
+        search_space=search_space,
+        registry=registry,
+        task_type=task_type,
+        gpu=gpu,
+        results_dir=results_dir,
+        test=None,
+        per_fold_tracker=None,
+        fold_timeout=None,
+        n_top_trials=n_enqueue,
+        scaler_choices=scaler_choices,
+        prescaled_scaler=None,
+        monotone_constraints=monotone_constraints,
+        diversity_pruning=None,
+    )
+
+    # Configure pruner (same as main study)
+    pruner_type = pruner_cfg.get("type", "median")
+    if pruner_type == "median":
+        pruner = optuna.pruners.MedianPruner(
+            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 3),
+            n_startup_trials=pruner_cfg.get("n_startup_trials", 10),
+        )
+    elif pruner_type == "hyperband":
+        pruner = optuna.pruners.HyperbandPruner()
+    else:
+        pruner = optuna.pruners.NopPruner()
+
+    # Study direction
+    direction = "minimize" if task_type == "regression" else "maximize"
+    study = optuna.create_study(direction=direction, pruner=pruner)
+
+    # Pure QMC — no TPE phase
+    start_time = time.time()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="QMCSampler is experimental")
+        study.sampler = optuna.samplers.QMCSampler(
+            seed=global_seed,
+            warn_independent_sampling=False,
+            independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
+        )
+
+    # Enable Optuna's built-in trial logging for substudies
+    # (shows "Trial X finished with value: ... and parameters: {...}")
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    try:
+        study.optimize(
+            objective, n_trials=n_trials, timeout=timeout,
+            callbacks=[_duration_callback],
+        )
+    finally:
+        # Restore quiet mode for main study
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    elapsed = time.time() - start_time
+
+    # Extract completed trials
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    n_completed = len(completed)
+
+    if n_completed == 0:
+        logger.warning(
+            f"[{model_name}] Substudy: 0 completed trials in {elapsed:.0f}s — "
+            f"no configs to enqueue"
+        )
+        return [], None
+
+    # Sort by score (best first)
+    maximize = direction == "maximize"
+    completed.sort(key=lambda t: t.value, reverse=maximize)
+
+    logger.info(
+        f"[{model_name}] Substudy done: {n_completed} completed, "
+        f"best={completed[0].value:.6f}, {elapsed:.0f}s"
+    )
+
+    # Rank-weighted importance sampling
+    effective_n_enqueue = min(n_enqueue, n_completed // 3)
+    if effective_n_enqueue < 1:
+        effective_n_enqueue = min(n_enqueue, n_completed)
+
+    rng = np.random.default_rng(global_seed)
+    ranks = np.arange(n_completed)
+    weights = np.exp(-temperature * ranks / n_completed)
+    weights /= weights.sum()
+
+    indices = rng.choice(
+        n_completed, size=effective_n_enqueue, replace=False, p=weights,
+    )
+    indices = sorted(indices)  # Keep sorted for deterministic order
+
+    enqueue_params = []
+    for i in indices:
+        params = dict(completed[i].params)
+        params.pop("scaler", None)  # Scaler handled separately
+        enqueue_params.append(params)
+
+    logger.info(
+        f"[{model_name}] Substudy sampled {effective_n_enqueue} trials "
+        f"(temperature={temperature}, from {n_completed} completed)"
+    )
+
+    # Determine best scaler
+    best_scaler: str | None = None
+    if lock_scaler and scaler_choices:
+        try:
+            best_scaler = study.best_trial.params.get("scaler")
+        except ValueError:
+            pass  # No best trial
+
+    return enqueue_params, best_scaler
+
+
 def run_optuna_study(
     model_name: str,
     train: pd.DataFrame,
@@ -1094,16 +1352,33 @@ def run_optuna_study(
         needs_scaling = bool(model_preproc["needs_scaling"])
 
     scaler_choices: list[str] | None = None
+    prescaled_scaler: str | None = None  # Set when we pre-scale once upfront
     if needs_scaling:
         # Default: all scalers. Strategy can narrow to a subset.
         scaler_choices = model_preproc.get("scaler_choices") or preprocessing.get("scaler_choices") or list(ALL_SCALER_CHOICES)
         # Add "none" so Optuna can opt out — UNLESS strategy locked to a single scaler
         if len(scaler_choices) > 1 and "none" not in scaler_choices:
             scaler_choices = ["none"] + list(scaler_choices)
-        logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
+
+        # Optimisation: if locked to a single scaler (no Optuna choice), pre-scale
+        # train+test ONCE upfront instead of per-fold × per-trial.
+        # With 595k rows × 10 folds × 100+ trials this saves thousands of scaler fits.
+        # Slight leakage (fit on full train, not 90%) is negligible at large N.
+        if len(scaler_choices) == 1 and scaler_choices[0] != "none":
+            prescaled_scaler = scaler_choices[0]
+            train, test, was_scaled = _apply_prescaling(
+                train, test, feature_cols, prescaled_scaler, model_name,
+            )
+            if was_scaled:
+                scaler_choices = None  # Don't pass to objective — already scaled
+            else:
+                prescaled_scaler = None
+        else:
+            logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
 
     # Resolve monotone constraints from strategy (feature_name → direction)
     # into a positional list matching feature_cols order.
+    # NOTE: moved before substudy block so constraints are available there too.
     monotone_constraints_list: list[int] | None = None
     mc_dict = strategy.get("monotone_constraints", {}) or {}
     if mc_dict and model_name in ("catboost", "xgboost", "lightgbm"):
@@ -1125,6 +1400,50 @@ def run_optuna_study(
         else:
             monotone_constraints_list = None
 
+    # --- Substudy: warm-start from small-data QMC exploration ---
+    substudy_cfg = optuna_cfg.get("substudy")
+    substudy_ran = False
+    if substudy_cfg and substudy_cfg.get("enabled", False):
+        substudy_enqueue, substudy_scaler = _run_substudy(
+            model_name=model_name,
+            train=train,
+            feature_cols=feature_cols,
+            target_col=target_col,
+            registry=registry,
+            task_type=task_type,
+            gpu=gpu,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=scaler_choices,
+            global_seed=pipeline_config.optuna.global_seed,
+            pruner_cfg=optuna_cfg.get("pruner", {}) or {},
+            monotone_constraints=monotone_constraints_list,
+        )
+
+        # Scaler lock: replace scaler_choices with single winner
+        if substudy_scaler and scaler_choices:
+            logger.info(
+                f"[{model_name}] Substudy scaler lock: '{substudy_scaler}' "
+                f"(was: {scaler_choices})"
+            )
+            scaler_choices = [substudy_scaler]
+            train, test, was_scaled = _apply_prescaling(
+                train, test, feature_cols, substudy_scaler, model_name,
+            )
+            if was_scaled:
+                scaler_choices = None
+                prescaled_scaler = substudy_scaler
+
+        # Prepend substudy configs to enqueue_trials
+        if substudy_enqueue:
+            existing = optuna_cfg.get("enqueue_trials", []) or []
+            optuna_cfg["enqueue_trials"] = substudy_enqueue + list(existing)
+            logger.info(
+                f"[{model_name}] Substudy enqueued {len(substudy_enqueue)} configs"
+            )
+            substudy_ran = True
+
     # Diversity pruning config (only meaningful with per-fold tracker)
     dp_cfg = optuna_cfg.get("diversity_pruning") if selection_mode == "per_fold" else None
 
@@ -1144,6 +1463,7 @@ def run_optuna_study(
         fold_timeout=fold_timeout,
         n_top_trials=optuna_cfg["n_top_trials"],
         scaler_choices=scaler_choices,
+        prescaled_scaler=prescaled_scaler,
         monotone_constraints=monotone_constraints_list,
         diversity_pruning=dp_cfg,
     )
@@ -1182,14 +1502,18 @@ def run_optuna_study(
     if effective_timeout:
         logger.info(f"[{model_name}] Timeout: {effective_timeout}s ({effective_timeout / 3600:.1f}h)")
 
+    # When substudy provided warm-start, skip QMC → pure TPE
+    effective_qmc = 0 if substudy_ran else optuna_cfg["qmc_warmup_trials"]
+    tpe_cfg = optuna_cfg.get("tpe", {}) or {}
+
     _run_two_phase_study(
         study=study,
         objective=objective,
         n_trials=optuna_cfg["n_trials"],
-        qmc_warmup_trials=optuna_cfg["qmc_warmup_trials"],
+        qmc_warmup_trials=effective_qmc,
         timeout=effective_timeout,
         global_seed=pipeline_config.optuna.global_seed,
-        verbose=pipeline_config.runtime.verbose,
+        tpe_cfg=tpe_cfg,
     )
 
     try:
@@ -1244,6 +1568,7 @@ def _create_objective(
     fold_timeout: int | None = None,
     n_top_trials: int = 5,
     scaler_choices: list[str] | None = None,
+    prescaled_scaler: str | None = None,
     monotone_constraints: list[int] | None = None,
     diversity_pruning: dict[str, Any] | None = None,
 ) -> Callable[[optuna.Trial], float]:
@@ -1374,6 +1699,11 @@ def _create_objective(
         # Scaler selection (Optuna parameter when model needs scaling)
         if scaler_choices and scale_cols:
             scaler_type = trial.suggest_categorical("scaler", scaler_choices)
+        elif prescaled_scaler:
+            # Data was pre-scaled upfront — record the scaler type for
+            # train_with_config() but don't apply per-fold.
+            scaler_type = "none"
+            trial.set_user_attr("prescaled_scaler", prescaled_scaler)
         else:
             scaler_type = "none"
 
@@ -1654,6 +1984,19 @@ def _create_objective(
     return objective
 
 
+def _duration_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Log trial duration after each completed/pruned trial."""
+    if trial.duration is not None:
+        secs = trial.duration.total_seconds()
+        if secs >= 60:
+            mins = int(secs // 60)
+            remaining = secs - mins * 60
+            dur_str = f"{mins}m {remaining:.0f}s"
+        else:
+            dur_str = f"{secs:.1f}s"
+        logger.info(f"  Trial {trial.number} duration: {dur_str}")
+
+
 def _run_two_phase_study(
     study: optuna.Study,
     objective: Callable[[optuna.Trial], float],
@@ -1661,114 +2004,123 @@ def _run_two_phase_study(
     qmc_warmup_trials: int,
     timeout: int | None = None,
     global_seed: int = 42,
-    verbose: int = 1,
+    tpe_cfg: dict[str, Any] | None = None,
 ) -> None:
     """Run a two-phase Optuna study: QMC warmup then TPE.
 
     Phase 1 (QMC): Uses Quasi-Monte Carlo sampling for space-filling
     exploration of the search space. This provides better initial coverage
-    than random sampling.
+    than random sampling.  Skipped when ``qmc_warmup_trials`` is 0
+    (e.g. when a substudy already provided warm-start configs).
 
     Phase 2 (TPE): Switches to Tree-structured Parzen Estimator for
-    Bayesian optimization guided by Phase 1 results.
+    Bayesian optimization guided by Phase 1 results (or enqueued warm-start).
 
     Args:
         study: Optuna study object (already created with pruner).
         objective: Objective function to optimize.
         n_trials: Total number of trials (QMC + TPE combined).
-        qmc_warmup_trials: Number of QMC warmup trials (e.g. 50).
+        qmc_warmup_trials: Number of QMC warmup trials. Set to 0 to skip
+            QMC entirely (e.g. when substudy provides warm-start).
         timeout: Optional timeout in seconds for the entire study.
         global_seed: Seed for reproducibility.
+        tpe_cfg: Optional TPE sampler configuration dict with keys:
+            - ``gamma_ratio`` (float): Fraction of trials classified as
+              "good" (default 0.15).
+            - ``gamma_min`` (int): Minimum good trials floor (default 5).
+            - ``n_startup_trials`` (int): TPE startup random trials
+              (default 0 since QMC/substudy already explored).
 
     Steps:
-        1. Use n_qmc = qmc_warmup_trials directly.
+        1. Use n_qmc = qmc_warmup_trials directly (0 = skip QMC).
         2. Calculate n_tpe = n_trials - n_qmc.
         3. Phase 1: Set study.sampler to QMCSampler(seed=global_seed).
            Run study.optimize(objective, n_trials=n_qmc, timeout=timeout).
-        4. Phase 2: Set study.sampler to TPESampler(seed=global_seed,
-           n_startup_trials=0) (startup=0 because QMC already explored).
+        4. Phase 2: Set study.sampler to TPESampler with custom gamma.
            Run study.optimize(objective, n_trials=n_tpe, timeout=remaining).
         5. Log phase completion summaries.
     """
-    n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
-    n_tpe = n_trials - n_qmc  # QMC + TPE = n_trials exactly
+    if qmc_warmup_trials <= 0:
+        n_qmc = 0
+        n_tpe = n_trials
+    else:
+        n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
+        n_tpe = n_trials - n_qmc
 
     start_time = time.time()
 
-    # Progress callback
-    log_interval = max(1, n_trials // 8)  # ~8 progress updates per study (verbose=1)
-
-    def _progress_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        n_done = len(study.trials)
-        try:
-            best_val = study.best_value
-        except ValueError:
-            best_val = float("nan")
-        elapsed = time.time() - start_time
-        if verbose >= 2:
-            # Show every trial with its own score — check state, not value,
-            # because Optuna 3.x sets trial.value to last intermediate for pruned trials
-            if trial.state == optuna.trial.TrialState.COMPLETE:
-                trial_val = f"{trial.value:.6f}"
-            elif trial.state == optuna.trial.TrialState.PRUNED:
-                trial_val = "pruned"
-            else:
-                trial_val = "failed"
-            logger.info(
-                f"  Trial {n_done}/{n_trials} | "
-                f"score={trial_val} | "
-                f"best={best_val:.6f} | "
-                f"{elapsed:.0f}s"
+    # Enable Optuna's built-in trial logging (shows params + value per trial)
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    try:
+        # Phase 1: QMC — categorical params fall back to RandomSampler automatically
+        # Skipped when qmc_warmup_trials=0 (e.g. substudy already provided warm-start)
+        qmc_elapsed = 0.0
+        if n_qmc > 0:
+            logger.info(f"Phase 1 (QMC): {n_qmc} trials")
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="QMCSampler is experimental")
+                study.sampler = optuna.samplers.QMCSampler(
+                    seed=global_seed,
+                    independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
+                    warn_independent_sampling=False,
+                )
+            study.optimize(
+                objective,
+                n_trials=n_qmc,
+                timeout=timeout,
+                show_progress_bar=False,
+                callbacks=[_duration_callback],
             )
-        elif n_done % log_interval == 0 or n_done == n_qmc:
+            qmc_elapsed = time.time() - start_time
             logger.info(
-                f"  Trial {n_done}/{n_trials} | "
-                f"best={best_val:.6f} | "
-                f"elapsed={elapsed:.0f}s"
+                f"Phase 1 done: {len(study.trials)} trials completed in {qmc_elapsed:.1f}s"
             )
+        else:
+            logger.info("Phase 1 (QMC): skipped (substudy warm-start)")
 
-    # Phase 1: QMC — categorical params fall back to RandomSampler automatically
-    logger.info(f"Phase 1 (QMC): {n_qmc} trials")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="QMCSampler is experimental")
-        study.sampler = optuna.samplers.QMCSampler(
-            seed=global_seed,
-            independent_sampler=optuna.samplers.RandomSampler(seed=global_seed),
-            warn_independent_sampling=False,
-        )
-    study.optimize(
-        objective,
-        n_trials=n_qmc,
-        timeout=timeout,
-        callbacks=[_progress_callback],
-        show_progress_bar=False,
-    )
-    qmc_elapsed = time.time() - start_time
-    logger.info(
-        f"Phase 1 done: {len(study.trials)} trials completed in {qmc_elapsed:.1f}s"
-    )
+        # Phase 2: TPE — skipped when all trials were consumed by QMC (e.g. n_trials=1)
+        if n_tpe > 0:
+            remaining_timeout = None
+            if timeout is not None:
+                remaining_timeout = max(1, timeout - int(qmc_elapsed))
 
-    # Phase 2: TPE — skipped when all trials were consumed by QMC (e.g. n_trials=1)
-    if n_tpe > 0:
-        remaining_timeout = None
-        if timeout is not None:
-            remaining_timeout = max(1, timeout - int(qmc_elapsed))
+            # Build TPE sampler with custom gamma if configured.
+            # Project defaults: gamma_ratio=0.15, gamma_min=5 — 15% of completed
+            # trials classified as "good", scales dynamically with history size.
+            tpe_cfg = tpe_cfg or {}
+            gamma_ratio = tpe_cfg.get("gamma_ratio", 0.15)
+            gamma_min = tpe_cfg.get("gamma_min", 5)
+            n_startup = tpe_cfg.get("n_startup_trials", 0)
 
-        logger.info(f"Phase 2 (TPE): {n_tpe} trials")
-        study.sampler = optuna.samplers.TPESampler(
-            seed=global_seed, n_startup_trials=0
-        )
-        study.optimize(
-            objective,
-            n_trials=n_tpe,
-            timeout=remaining_timeout,
-            callbacks=[_progress_callback],
-            show_progress_bar=False,
-        )
-        total_elapsed = time.time() - start_time
-        logger.info(
-            f"Phase 2 done: {len(study.trials)} total trials in {total_elapsed:.1f}s"
-        )
+            import math
+            tpe_kwargs: dict[str, Any] = {
+                "seed": global_seed,
+                "n_startup_trials": n_startup,
+                "gamma": lambda x, _gr=gamma_ratio, _gm=gamma_min: max(
+                    int(math.ceil(_gr * x)), _gm
+                ),
+            }
+
+            logger.info(
+                f"Phase 2 (TPE): {n_tpe} trials "
+                f"(gamma_ratio={gamma_ratio}, gamma_min={gamma_min}, "
+                f"n_startup={n_startup})"
+            )
+            study.sampler = optuna.samplers.TPESampler(**tpe_kwargs)
+            study.optimize(
+                objective,
+                n_trials=n_tpe,
+                timeout=remaining_timeout,
+                show_progress_bar=False,
+                callbacks=[_duration_callback],
+            )
+            total_elapsed = time.time() - start_time
+            logger.info(
+                f"Phase 2 done: {len(study.trials)} total trials in {total_elapsed:.1f}s"
+            )
+    finally:
+        # Restore quiet mode after study completes
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def train_with_config(
@@ -2274,6 +2626,19 @@ def run_all_studies(
                         mc_list = [int(mc_dict.get(col, 0)) for col in feature_cols]
                         if not any(v != 0 for v in mc_list):
                             mc_list = None
+
+                # When run_optuna_study prescaled train/test upfront (single locked scaler),
+                # the objective stored prescaled_scaler as a trial user attr instead of a param.
+                # Inject it into cfg["params"] so train_with_config applies per-fold scaling
+                # on the original DataFrames (per-fold scaling is correct — no leakage).
+                trial_by_number = {t.number: t for t in study.trials}
+                for cfg in top_configs:
+                    if "scaler" not in cfg["params"]:
+                        trial = trial_by_number.get(cfg["trial_number"])
+                        if trial is not None:
+                            ps = trial.user_attrs.get("prescaled_scaler")
+                            if ps:
+                                cfg["params"]["scaler"] = ps
 
                 for cfg_idx, cfg in enumerate(top_configs, 1):
                     logger.debug(

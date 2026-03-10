@@ -114,7 +114,7 @@ def _detect_sentinels(
                 continue
             val_f = float(val)
             is_common = val_f in common_sentinels
-            is_extreme = iqr > 0 and val_f < q1 - 3 * iqr
+            is_extreme = iqr > 0 and (val_f < q1 - 3 * iqr or val_f > q3 + 3 * iqr)
             if is_common or is_extreme:
                 detected.append({
                     "value": val_f,
@@ -1116,7 +1116,6 @@ def _compute_target_encoding_preview(
                  "ordinal"}
     result: dict[str, dict[str, Any]] = {}
     y = target_series.values.astype(float)
-    global_mean = float(np.nanmean(y))
     is_binary = len(np.unique(y[~np.isnan(y)])) == 2
 
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -1131,6 +1130,9 @@ def _compute_target_encoding_preview(
         encoded = np.full(len(y), np.nan)
 
         for train_idx, val_idx in kf.split(series):
+            # Fold-specific mean (train fold only) — prevents val leakage into
+            # unseen-category fallback and smoothing prior.
+            global_mean = float(np.nanmean(y[train_idx]))
             # Smoothed target encoding on train fold
             cat_stats: dict[Any, tuple[float, int]] = {}
             for i in train_idx:
@@ -1339,6 +1341,10 @@ def _compute_prediction_diversity_probe(
         - ``fisher_z_ci``: 95% CI for mean correlation via Fisher z-transform
         - ``n_samples_used``: how many samples were used (after subsampling)
     """
+    # DISPUTE: Extracting a shared _prepare_X_y() helper modifies two call sites
+    # and risks subtle interface mismatches (subsample logic, column handling).
+    # CLAUDE.md: "skip if risky" for PERF. The duplication is 10 lines — below
+    # the abstraction threshold. Leave as-is.
     if feature_df.empty or len(target_series) == 0:
         return {}
 
