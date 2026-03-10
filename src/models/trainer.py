@@ -1009,14 +1009,14 @@ def _run_substudy(
     search_space: dict[str, dict[str, Any]],
     scaler_choices: list[str] | None,
     global_seed: int,
-    pruner_cfg: dict[str, Any],
     monotone_constraints: list[int] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run a substudy on a stratified data subset to find good starting configs.
 
     Creates a stratified subsample of training data, runs a pure QMC Optuna
     study (no TPE) with fewer CV folds and its own timeout, then rank-samples
-    trial configurations for enqueue into the main study.
+    trial configurations for enqueue into the main study.  No pruning — trials
+    are fast on the small subset and should always complete.
 
     Also determines the best scaler when ``lock_scaler`` is True.
 
@@ -1033,7 +1033,6 @@ def _run_substudy(
         search_space: Optuna search space (same as main study).
         scaler_choices: Scaler choices (None if no scaling needed).
         global_seed: Seed for reproducibility.
-        pruner_cfg: Pruner configuration from main study.
         monotone_constraints: Optional monotone constraints list.
 
     Returns:
@@ -1111,17 +1110,9 @@ def _run_substudy(
         diversity_pruning=None,
     )
 
-    # Configure pruner (same as main study)
-    pruner_type = pruner_cfg.get("type", "median")
-    if pruner_type == "median":
-        pruner = optuna.pruners.MedianPruner(
-            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 3),
-            n_startup_trials=pruner_cfg.get("n_startup_trials", 10),
-        )
-    elif pruner_type == "hyperband":
-        pruner = optuna.pruners.HyperbandPruner()
-    else:
-        pruner = optuna.pruners.NopPruner()
+    # No pruning in substudy — trials are fast (1-5s on 10% data),
+    # pruning wastes potential good configs
+    pruner = optuna.pruners.NopPruner()
 
     # Study direction
     direction = "minimize" if task_type == "regression" else "maximize"
@@ -1172,6 +1163,20 @@ def _run_substudy(
         f"[{model_name}] Substudy done: {n_completed} completed, "
         f"best={completed[0].value:.6f}, {elapsed:.0f}s"
     )
+
+    # Hyperparameter importance (fANOVA) — useful signal before main study
+    try:
+        importances = optuna.importance.get_param_importances(study)
+        if importances:
+            imp_lines = [
+                f"  {name}: {val:.3f}" for name, val in importances.items()
+            ]
+            logger.info(
+                f"[{model_name}] Substudy hyperparameter importance:\n"
+                + "\n".join(imp_lines)
+            )
+    except Exception:
+        pass  # Not enough completed trials or other issue
 
     # Rank-weighted importance sampling
     effective_n_enqueue = min(n_enqueue, n_completed // 3)
@@ -1417,7 +1422,6 @@ def run_optuna_study(
             search_space=search_space,
             scaler_choices=scaler_choices,
             global_seed=pipeline_config.optuna.global_seed,
-            pruner_cfg=optuna_cfg.get("pruner", {}) or {},
             monotone_constraints=monotone_constraints_list,
         )
 
