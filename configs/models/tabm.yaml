@@ -140,9 +140,9 @@ optuna:
   qmc_warmup_trials: 10
   timeout: null
   pruner:
-    type: median
-    n_warmup_steps: 1
-    n_startup_trials: 10
+    type: median                                 # median | percentile | hyperband | none
+    n_warmup_steps: 1                            # steps before pruning (fold index)
+    n_startup_trials: 10                         # trials that always complete in full
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold
@@ -171,13 +171,15 @@ optuna:
   # See realmlp.yaml for detailed comments. Disabled by default.
   # substudy:
   #   enabled: true
-  #   sample_fraction: 0.10
+  #   sample_fraction: 0.10                      # 10% of training data (1.0 = full data)
   #   n_folds: 3
   #   timeout: "15m"
   #   n_trials: 100
   #   n_enqueue: 20
   #   temperature: 0.3
   #   lock_scaler: true
+  #   pruner:                                    # substudy pruner (default: none)
+  #     type: none                               # none | percentile | median
   # --- TPE settings (optional, applied to main study Phase 2) ---
   # tpe:
   #   gamma_ratio: 0.15

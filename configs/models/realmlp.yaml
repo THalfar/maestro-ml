@@ -186,9 +186,9 @@ optuna:
   qmc_warmup_trials: 10
   timeout: null
   pruner:
-    type: median                                 # prune bad trials after a few folds
-    n_warmup_steps: 1                            # evaluate at least 2 folds before pruning
-    n_startup_trials: 10
+    type: median                                 # median | percentile | hyperband | none
+    n_warmup_steps: 1                            # steps before pruning (fold index)
+    n_startup_trials: 10                         # trials that always complete in full
   n_top_trials: 20
   n_seeds: 1
   selection_mode: per_fold                       # per-fold best selection (no retraining)
@@ -224,13 +224,18 @@ optuna:
   # Especially useful for slow neural nets on large datasets (>100k rows).
   # substudy:
   #   enabled: true
-  #   sample_fraction: 0.10                      # 10% of training data
+  #   sample_fraction: 0.10                      # 10% of training data (1.0 = full data)
   #   n_folds: 3                                 # lighter CV than main study
   #   timeout: "15m"                             # own time budget
   #   n_trials: 100                              # pure QMC trials
   #   n_enqueue: 20                              # rank-sampled trials for main study
   #   temperature: 0.3                           # sampling sharpness (lower = more top-heavy)
   #   lock_scaler: true                          # lock main study to best scaler found
+  #   pruner:                                    # substudy pruner (default: none)
+  #     type: none                               # none | percentile | median
+  #     # percentile: 25.0                       # (percentile type) prune bottom 25%
+  #     # n_warmup_steps: 0                      # (percentile/median) steps before pruning
+  #     # n_startup_trials: 20                   # (percentile/median) always-complete trials
   # --- TPE settings (optional, applied to main study Phase 2) ---
   # Custom gamma function: 15% of trials classified as "good" (project default).
   # Per-model override via strategy YAML: overrides.<model>.optuna.tpe

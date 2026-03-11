@@ -996,6 +996,46 @@ def _get_eval_metric_value(training: dict, task_type: str, gpu: bool) -> str | N
     return str(em)
 
 
+def _build_pruner(pruner_cfg: dict[str, Any]) -> optuna.pruners.BasePruner:
+    """Build an Optuna pruner from a config dict.
+
+    Supported types:
+        - ``median``: MedianPruner (default). Prunes trials below the median
+          of intermediate reports at the same step.
+        - ``percentile``: PercentilePruner. Prunes trials in the bottom
+          ``percentile`` % — useful when substudy warm-start raises the
+          baseline and you want to keep more of the "ok" range for TPE.
+        - ``hyperband``: HyperbandPruner.
+        - ``none``: NopPruner (no pruning).
+
+    Config keys (all optional):
+        - ``type`` (str): Pruner type. Default ``"median"``.
+        - ``n_warmup_steps`` (int): Steps before pruning activates.
+          Default 1 for median, 0 for percentile.
+        - ``n_startup_trials`` (int): Trials that always run in full.
+          Default 10 for median, 20 for percentile.
+        - ``percentile`` (float): Bottom % to prune (percentile type only).
+          Default 25.0.
+    """
+    pruner_type = pruner_cfg.get("type", "median")
+
+    if pruner_type == "median":
+        return optuna.pruners.MedianPruner(
+            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 1),
+            n_startup_trials=pruner_cfg.get("n_startup_trials", 10),
+        )
+    elif pruner_type == "percentile":
+        return optuna.pruners.PercentilePruner(
+            percentile=pruner_cfg.get("percentile", 25.0),
+            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 0),
+            n_startup_trials=pruner_cfg.get("n_startup_trials", 20),
+        )
+    elif pruner_type == "hyperband":
+        return optuna.pruners.HyperbandPruner()
+    else:
+        return optuna.pruners.NopPruner()
+
+
 def _run_substudy(
     model_name: str,
     train: pd.DataFrame,
@@ -1049,23 +1089,27 @@ def _run_substudy(
     timeout = parse_timeout(timeout_raw)
     n_trials = substudy_cfg.get("n_trials", 100)
     n_enqueue = substudy_cfg.get("n_enqueue", 20)
+    top_n = substudy_cfg.get("top_n", 3)
     temperature = substudy_cfg.get("temperature", 0.3)
     lock_scaler = substudy_cfg.get("lock_scaler", True)
 
-    # Stratified subsample
-    y = train[target_col].values
-    subsample_seed = global_seed + 9999
-    if task_type != "regression":
-        sub_train, _ = train_test_split(
-            train, train_size=sample_fraction,
-            stratify=y, random_state=subsample_seed,
-        )
+    # Stratified subsample (or full data when fraction >= 1.0)
+    if sample_fraction >= 1.0:
+        sub_train = train.reset_index(drop=True)
     else:
-        sub_train, _ = train_test_split(
-            train, train_size=sample_fraction,
-            random_state=subsample_seed,
-        )
-    sub_train = sub_train.reset_index(drop=True)
+        y = train[target_col].values
+        subsample_seed = global_seed + 9999
+        if task_type != "regression":
+            sub_train, _ = train_test_split(
+                train, train_size=sample_fraction,
+                stratify=y, random_state=subsample_seed,
+            )
+        else:
+            sub_train, _ = train_test_split(
+                train, train_size=sample_fraction,
+                random_state=subsample_seed,
+            )
+        sub_train = sub_train.reset_index(drop=True)
 
     # Min size check
     min_rows = n_folds * 10
@@ -1110,9 +1154,13 @@ def _run_substudy(
         diversity_pruning=None,
     )
 
-    # No pruning in substudy — trials are fast (1-5s on 10% data),
-    # pruning wastes potential good configs
-    pruner = optuna.pruners.NopPruner()
+    # Substudy pruner: default NopPruner (no pruning). Substudy trials are
+    # fast (15-30s) so pruning saves little time but loses data points for
+    # importance analysis and rank-weighted sampling. Configurable via YAML.
+    substudy_pruner_cfg = substudy_cfg.get("pruner", {}) or {}
+    if not substudy_pruner_cfg.get("type"):
+        substudy_pruner_cfg["type"] = "none"
+    pruner = _build_pruner(substudy_pruner_cfg)
 
     # Study direction
     direction = "minimize" if task_type == "regression" else "maximize"
@@ -1178,30 +1226,43 @@ def _run_substudy(
     except Exception:
         pass  # Not enough completed trials or other issue
 
-    # Rank-weighted importance sampling
-    effective_n_enqueue = min(n_enqueue, n_completed // 3)
+    # Top-N: always include the best trials unconditionally
+    actual_top_n = min(top_n, n_completed)
+    top_indices: set[int] = set(range(actual_top_n))
+
+    # Rank-weighted importance sampling for remaining slots
+    n_remaining = n_enqueue - actual_top_n
+    effective_n_enqueue = min(n_remaining, n_completed // 3)
     if effective_n_enqueue < 1:
-        effective_n_enqueue = min(n_enqueue, n_completed)
+        effective_n_enqueue = min(n_remaining, n_completed)
+    effective_n_enqueue = max(effective_n_enqueue, 0)
 
-    rng = np.random.default_rng(global_seed)
-    ranks = np.arange(n_completed)
-    weights = np.exp(-temperature * ranks / n_completed)
-    weights /= weights.sum()
+    sampled_indices: list[int] = []
+    if effective_n_enqueue > 0:
+        # Build weights over non-top-N candidates only
+        candidate_indices = [i for i in range(n_completed) if i not in top_indices]
+        if candidate_indices:
+            n_candidates = len(candidate_indices)
+            rng = np.random.default_rng(global_seed)
+            ranks = np.arange(n_candidates)
+            weights = np.exp(-temperature * ranks / n_candidates)
+            weights /= weights.sum()
+            n_sample = min(effective_n_enqueue, n_candidates)
+            chosen = rng.choice(n_candidates, size=n_sample, replace=False, p=weights)
+            sampled_indices = [candidate_indices[j] for j in chosen]
 
-    indices = rng.choice(
-        n_completed, size=effective_n_enqueue, replace=False, p=weights,
-    )
-    indices = sorted(indices)  # Keep sorted for deterministic order
+    all_indices = sorted(top_indices) + sorted(sampled_indices)
 
     enqueue_params = []
-    for i in indices:
+    for i in all_indices:
         params = dict(completed[i].params)
         params.pop("scaler", None)  # Scaler handled separately
         enqueue_params.append(params)
 
     logger.info(
-        f"[{model_name}] Substudy sampled {effective_n_enqueue} trials "
-        f"(temperature={temperature}, from {n_completed} completed)"
+        f"[{model_name}] Substudy sampled {len(enqueue_params)} trials "
+        f"(top_n={actual_top_n} guaranteed + {len(sampled_indices)} rank-weighted, "
+        f"temperature={temperature}, from {n_completed} completed)"
     )
 
     # Determine best scaler
@@ -1474,16 +1535,7 @@ def run_optuna_study(
 
     # Configure pruner
     pruner_cfg = optuna_cfg.get("pruner", {}) or {}
-    pruner_type = pruner_cfg.get("type", "median")
-    if pruner_type == "median":
-        pruner = optuna.pruners.MedianPruner(
-            n_warmup_steps=pruner_cfg.get("n_warmup_steps", 3),
-            n_startup_trials=pruner_cfg.get("n_startup_trials", 10),
-        )
-    elif pruner_type == "hyperband":
-        pruner = optuna.pruners.HyperbandPruner()
-    else:
-        pruner = optuna.pruners.NopPruner()
+    pruner = _build_pruner(pruner_cfg)
 
     # Study direction
     direction = "minimize" if task_type == "regression" else "maximize"
