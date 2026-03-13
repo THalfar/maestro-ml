@@ -10,12 +10,23 @@ Three layers:
 - **Layer 2: Strategy** (`src/strategy/`) — LLM reads EDA report, generates feature engineering plan and model selection as YAML. Supports API mode (automatic) and manual mode (human-in-the-loop).
 - **Layer 3: Engine** (`src/models/`, `src/features/`, `src/ensemble/`) — Executes the strategy: feature engineering, Optuna hyperparameter optimization, diversity-aware ensemble selection.
 
+## Documentation Maintenance
+
+**IMPORTANT: Whenever you make changes to source code, YAML schemas, or add/modify features, you MUST update CLAUDE.md and README.md in the same session to keep them accurate.** This applies to:
+- New features or classes added to `src/`
+- Changed function signatures or return types
+- New YAML config fields or sections
+- Bug fixes that affect documented behavior
+- Any change to how selection modes, trackers, or assemblers work
+
+Never leave CLAUDE.md or README.md out of date. The docs are the spec.
+
 ## Key Principles
 
 - **YAML is the source of truth.** Never hardcode hyperparameter ranges, feature lists, or model configs in Python code. Everything comes from `configs/models/*.yaml` and the strategy YAML.
 - **Architect/coder pattern.** Python files contain function signatures + detailed docstrings. The docstrings ARE the specification — implement exactly what they describe.
 - **Type hints everywhere.** Use `from __future__ import annotations` at the top of every file.
-- **Functions over classes** except for `ModelRegistry`, `PerFoldTracker` (in `trainer.py`), and dataclasses in `src/utils/io.py`.
+- **Functions over classes** except for `ModelRegistry`, `PerFoldTracker`, `TrialOOFStore` (in `trainer.py`), and dataclasses in `src/utils/io.py`.
 - **No in-place DataFrame mutation.** Every function that takes a DataFrame should return a new one unless explicitly documented otherwise.
 - **Deterministic where possible.** Always pass random seeds. Same config = same results.
 
@@ -90,7 +101,28 @@ Neural networks benefit from stochasticity — a trial may excel on one fold but
 - **Config**: Set `selection_mode: per_fold` and `fold_timeout: 180` in the model YAML's `optuna` section.
 - **NSGA-II integration**: Per-fold composites have the same format as global-mode arrays — `(n_train,)` OOF + `(n_test,)` test. The outer model-level NSGA-II (in `run.py`) doesn't know or care about the difference.
 - **Two-layer NSGA-II**: Inner (fold-level, in `trainer.py`) optimizes fold combinations into composites. Outer (model-level, in `run.py/diversity.py`) optimizes model weights across all prediction arrays.
-- **Global mode** (`selection_mode: global`, default): Existing behaviour — retrain top N configs with multiple seeds. All other models use this.
+- **Rank normalisation** (`rank_normalize: bool = True` in `assemble()` / `assemble_nsga2()`): Before stitching fold predictions, each fold's val/test arrays are rank-normalised to (0, 1] via `rankdata(arr)/len(arr)`. Removes scale mismatch when different trials used different scalers. Applied automatically — disable only if you need raw probability outputs.
+- **Global mode** (`selection_mode: global`, default): Retrain top N configs with multiple seeds. All other models use this.
+
+## Fold-Coverage Selection (RealMLP, TabM alternative)
+
+Empirically, per-fold stitching of different trials can create calibration errors on low-signal data (Porto Seguro: solos 0.593-0.597 vs expected 0.640+). Fold-coverage mode stores a **complete OOF** per trial (no mixing), then selects diverse complete trials:
+
+- **During Optuna**: `TrialOOFStore` stores complete OOF + test predictions per **committed** (non-pruned) trial. Pruned trials are implicitly discarded (commit never called). Memory: ~2.4 MB per trial on 595k rows.
+- **After Optuna — Assembly** (`oof_store.select()`):
+  - **Round 1** (fold-best): round-robin over folds 0→n_folds-1, picks each fold's best trial not yet selected → up to `n_fold_best` unique trials.
+  - **Round 2** (mean-best): adds top `n_mean_best` trials by mean CV score, skipping already selected ones.
+- **No retraining, no rank-norm needed**: Each composite is one trial's complete OOF — no scale mismatch.
+- **Diversity pruning does NOT activate** with fold_coverage (requires `per_fold_tracker` which is None). All trials run full n_folds.
+- **Config** (`optuna.assembly` in strategy YAML):
+  ```yaml
+  optuna:
+    selection_mode: fold_coverage
+    assembly:
+      n_fold_best: 10    # round-robin fold-best trials
+      n_mean_best: 5     # additional top-mean trials
+  ```
+- **`run_optuna_study()` returns 3-tuple**: `(study, PerFoldTracker | None, TrialOOFStore | None)`. All callers must unpack 3 values.
 
 ## Tracker Diversity Mode (Tiered)
 
@@ -125,7 +157,7 @@ During Optuna trials, redundant trials (highly correlated predictions with exist
       score_tolerance: 0.001    # fraction of best score for score-gate
   ```
 - **Disabled by default**: No `diversity_pruning` key → no diversity pruning. Opt-in only.
-- **Only works with per-fold mode**: Requires `selection_mode: per_fold` and a `PerFoldTracker`.
+- **Only works with per-fold mode**: Requires `selection_mode: per_fold` and a `PerFoldTracker`. Does NOT activate for `fold_coverage` mode (tracker is None).
 
 ## Ensemble & Diversity
 

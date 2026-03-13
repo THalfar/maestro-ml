@@ -80,6 +80,23 @@ def _free_gpu_memory() -> None:
             pass
 
 
+def _rank_norm_1d(arr: np.ndarray) -> np.ndarray:
+    """Rank-normalize a 1D array to (0, 1] preserving order.
+
+    Maps values to their rank divided by n, giving a uniform distribution
+    over (1/n, 1].  Used to remove scale differences between predictions
+    from trials trained with different scalers or architectures before
+    stitching per-fold predictions into a composite.
+
+    Args:
+        arr: 1D prediction array.
+
+    Returns:
+        Rank-normalized array of the same shape.
+    """
+    return rankdata(arr) / len(arr)
+
+
 def _deduplicate_composites(
     composites: list[dict[str, Any]],
     corr_threshold: float = 0.9999,
@@ -610,12 +627,26 @@ class PerFoldTracker:
         n_samples: int,
         n_test: int,
         task_type: str = "binary_classification",
+        rank_normalize: bool = True,
     ) -> list[dict[str, Any]]:
         """Build composite OOF + test arrays from per-fold bests.
 
         For the k-th composite:
         - OOF: ``oof[val_idx] = k-th best trial's val_preds`` for each fold.
         - Test: average of per-fold test predictions (``+= fold_test / n_folds``).
+
+        When ``rank_normalize=True`` (default), per-fold predictions are
+        rank-normalized to (0, 1] before stitching.  This removes scale
+        differences caused by different scalers or architectures across
+        trials, which would otherwise distort cross-fold comparisons and
+        metric computation on the assembled OOF.
+
+        Args:
+            n_samples: Total training samples (OOF length).
+            n_test: Test set size.
+            task_type: Task type string.
+            rank_normalize: If True, rank-normalize per-fold predictions to
+                (0, 1] before stitching (binary/regression only).
 
         Returns:
             List of dicts, each with keys: ``oof_preds``, ``test_preds``,
@@ -627,6 +658,7 @@ class PerFoldTracker:
         )
 
         is_multiclass = task_type == "multiclass"
+        do_rank = rank_normalize and not is_multiclass
 
         results: list[dict[str, Any]] = []
         for k in range(n_composites):
@@ -645,8 +677,13 @@ class PerFoldTracker:
 
             for fold_idx in range(self.n_folds):
                 entry = self.fold_data[fold_idx][k]
-                oof[entry.val_idx] = entry.val_preds
-                test_preds += entry.test_preds / self.n_folds
+                val_p = entry.val_preds
+                test_p = entry.test_preds
+                if do_rank:
+                    val_p = _rank_norm_1d(val_p)
+                    test_p = _rank_norm_1d(test_p)
+                oof[entry.val_idx] = val_p
+                test_preds += test_p / self.n_folds
                 fold_trials.append(entry.trial_number)
                 fold_scores.append(entry.score)
 
@@ -672,6 +709,7 @@ class PerFoldTracker:
         diversity_metric: str = "pearson_neff",
         diversity_weight: float = 0.3,
         seed: int = 42,
+        rank_normalize: bool = True,
     ) -> list[dict[str, Any]]:
         """Build composite arrays via NSGA-II fold-level optimization.
 
@@ -723,13 +761,16 @@ class PerFoldTracker:
         if n_per_fold == 0:
             return []
 
+        is_multiclass = task_type == "multiclass"
+        do_rank = rank_normalize and not is_multiclass
+
         def _build_composite(indices: list[int]) -> tuple[np.ndarray, np.ndarray, list[int], list[float]]:
             """Build a single composite from fold-index selections.
 
-            When different trials are mixed across folds, rank-normalizes
-            per fold to fix calibration mismatch between trials.
+            Rank-normalizes per-fold predictions to (0, 1] before stitching
+            when ``rank_normalize=True``, removing scale differences between
+            trials trained with different scalers or architectures.
             """
-            is_multiclass = task_type == "multiclass"
             if is_multiclass:
                 sample_preds = self.fold_data[0][0].val_preds
                 n_classes = sample_preds.shape[1] if sample_preds.ndim > 1 else 1
@@ -744,8 +785,13 @@ class PerFoldTracker:
 
             for fold_idx in range(self.n_folds):
                 entry = self.fold_data[fold_idx][indices[fold_idx]]
-                oof[entry.val_idx] = entry.val_preds
-                test_preds += entry.test_preds / self.n_folds
+                val_p = entry.val_preds
+                test_p = entry.test_preds
+                if do_rank:
+                    val_p = _rank_norm_1d(val_p)
+                    test_p = _rank_norm_1d(test_p)
+                oof[entry.val_idx] = val_p
+                test_preds += test_p / self.n_folds
                 fold_trials.append(entry.trial_number)
                 fold_scores.append(entry.score)
 
@@ -1368,9 +1414,31 @@ def run_optuna_study(
 
     results_dir = Path(pipeline_config.output.results_dir)
 
-    # Per-fold selection: create tracker if enabled
+    # Selection mode: global / per_fold / fold_coverage
     selection_mode = optuna_cfg.get("selection_mode", "global")
     tracker: PerFoldTracker | None = None
+    trial_oof_store: TrialOOFStore | None = None
+
+    if selection_mode == "fold_coverage":
+        if test is None:
+            logger.warning(
+                f"[{model_name}] selection_mode='fold_coverage' requires test "
+                f"DataFrame for test predictions, but test=None was passed — "
+                f"test_preds will be zeros."
+            )
+        n_test_rows = len(test) if test is not None else 0
+        maximize = task_type != "regression"
+        trial_oof_store = TrialOOFStore(
+            n_samples=len(train),
+            n_test=n_test_rows,
+            n_folds=cv_cfg.n_folds,
+            maximize=maximize,
+        )
+        logger.info(
+            f"[{model_name}] Fold-coverage selection enabled: "
+            f"{len(train)} samples, {cv_cfg.n_folds} folds"
+        )
+
     if selection_mode == "per_fold":
         if test is None:
             logger.warning(
@@ -1525,6 +1593,7 @@ def run_optuna_study(
         results_dir=results_dir,
         test=test,
         per_fold_tracker=tracker,
+        trial_oof_store=trial_oof_store,
         fold_timeout=fold_timeout,
         n_top_trials=optuna_cfg["n_top_trials"],
         scaler_choices=scaler_choices,
@@ -1605,7 +1674,173 @@ def run_optuna_study(
         summary += f", {n_failed} failed"
     logger.info(summary)
 
-    return study, tracker
+    return study, tracker, trial_oof_store
+
+
+class TrialOOFStore:
+    """Store complete OOF arrays per trial for fold-coverage selection.
+
+    Used with ``selection_mode='fold_coverage'``.  Every completed trial's
+    full OOF vector (all folds, same config, no stitching) is stored during
+    Optuna.  After the study, :meth:`select` applies fold-coverage selection:
+
+    - **Round 1**: For each fold 0 → n_folds-1, pick the best-scoring trial
+      for that fold not yet selected (round-robin, deduplicated).  Continues
+      until ``n_fold_best`` unique trials are collected or all folds are
+      exhausted.
+    - **Round 2**: Add the top ``n_mean_best`` trials by mean CV score,
+      skipping already selected ones.
+
+    Because each composite is one trial's complete OOF there is no scale
+    mismatch across folds — rank normalisation is not needed.
+
+    Memory: ~2.4 MB per trial on 595k rows (float32).  Only committed
+    (all-folds-complete, non-pruned) trials are stored long-term; partial
+    OOF arrays from pruned trials are discarded at commit time (never called).
+    """
+
+    def __init__(
+        self,
+        n_samples: int,
+        n_test: int,
+        n_folds: int,
+        maximize: bool = True,
+    ) -> None:
+        self.n_samples = n_samples
+        self.n_test = n_test
+        self.n_folds = n_folds
+        self.maximize = maximize
+
+        # In-progress (pruned trials never reach commit, so partial data is
+        # implicitly discarded when they fall out of scope)
+        self._partial_oof: dict[int, np.ndarray] = {}
+        self._partial_test: dict[int, np.ndarray] = {}
+        self._partial_fold_scores: dict[int, dict[int, float]] = {}
+
+        # Finalized after commit_trial()
+        self._oof: dict[int, np.ndarray] = {}
+        self._test: dict[int, np.ndarray] = {}
+        self._fold_scores: dict[int, list[float]] = {}
+        self._mean_scores: dict[int, float] = {}
+
+        # Best trial (and score) seen per fold across ALL updates
+        self._fold_best: dict[int, tuple[int, float]] = {}  # fold → (trial_num, score)
+
+    def update(
+        self,
+        trial_num: int,
+        fold_idx: int,
+        fold_score: float,
+        val_preds: np.ndarray,
+        val_idx: np.ndarray,
+        test_preds: np.ndarray,
+    ) -> None:
+        """Accumulate one fold's predictions. Called once per fold per trial."""
+        if trial_num not in self._partial_oof:
+            self._partial_oof[trial_num] = np.zeros(self.n_samples)
+            self._partial_test[trial_num] = np.zeros(self.n_test)
+            self._partial_fold_scores[trial_num] = {}
+
+        self._partial_oof[trial_num][val_idx] = val_preds
+        self._partial_test[trial_num] += test_preds / self.n_folds
+        self._partial_fold_scores[trial_num][fold_idx] = fold_score
+
+        # Update per-fold best (using only committed trials would require
+        # a second pass; tracking here is a negligible overestimate that is
+        # corrected in select() by checking self._oof membership)
+        better = (
+            fold_idx not in self._fold_best
+            or (self.maximize and fold_score > self._fold_best[fold_idx][1])
+            or (not self.maximize and fold_score < self._fold_best[fold_idx][1])
+        )
+        if better:
+            self._fold_best[fold_idx] = (trial_num, fold_score)
+
+    def commit_trial(self, trial_num: int) -> None:
+        """Finalise a completed (non-pruned) trial. Must be called once after
+        all folds finish, just before the objective returns its score."""
+        if trial_num not in self._partial_oof:
+            return
+        scores_dict = self._partial_fold_scores.pop(trial_num, {})
+        fold_scores = [scores_dict.get(f, 0.0) for f in range(self.n_folds)]
+        self._oof[trial_num] = self._partial_oof.pop(trial_num)
+        self._test[trial_num] = self._partial_test.pop(trial_num)
+        self._fold_scores[trial_num] = fold_scores
+        self._mean_scores[trial_num] = float(np.mean(fold_scores))
+
+    def select(
+        self,
+        n_fold_best: int = 10,
+        n_mean_best: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Fold-coverage selection → composites in PerFoldTracker.assemble() format.
+
+        Returns list of dicts with keys: ``oof_preds``, ``test_preds``,
+        ``fold_trials``, ``fold_scores``, ``avg_score``.
+        """
+        if not self._oof:
+            return []
+
+        selected: list[int] = []
+        selected_set: set[int] = set()
+
+        # Round 1: per-fold best — round-robin, deduplicated
+        for fold_idx in range(self.n_folds):
+            if len(selected) >= n_fold_best:
+                break
+            # Find best COMMITTED trial for this fold
+            fold_candidates = [
+                (t, self._fold_scores[t][fold_idx])
+                for t in self._oof
+                if fold_idx < len(self._fold_scores.get(t, []))
+            ]
+            if not fold_candidates:
+                continue
+            fold_candidates.sort(key=lambda x: x[1], reverse=self.maximize)
+            for t, _ in fold_candidates:
+                if t not in selected_set:
+                    selected.append(t)
+                    selected_set.add(t)
+                    break
+
+        # Round 2: top by mean CV score, skip already selected
+        remaining = sorted(
+            [(t, s) for t, s in self._mean_scores.items() if t not in selected_set],
+            key=lambda x: x[1],
+            reverse=self.maximize,
+        )
+        for t, _ in remaining[:n_mean_best]:
+            selected.append(t)
+            selected_set.add(t)
+
+        results: list[dict[str, Any]] = []
+        for t in selected:
+            results.append({
+                "oof_preds": self._oof[t].copy(),
+                "test_preds": self._test[t].copy(),
+                "fold_trials": [t] * self.n_folds,
+                "fold_scores": self._fold_scores[t],
+                "avg_score": self._mean_scores[t],
+            })
+        return results
+
+    def log_summary(self, model_name: str) -> None:
+        """Log fold-best trial per fold and overall statistics."""
+        n = len(self._oof)
+        if n == 0:
+            logger.info(f"[{model_name}] TrialOOFStore: no completed trials")
+            return
+        scores = sorted(self._mean_scores.values(), reverse=self.maximize)
+        logger.info(
+            f"[{model_name}] Fold-coverage store: {n} completed trials, "
+            f"best={scores[0]:.6f}, worst={scores[-1]:.6f}"
+        )
+        for fold_idx in sorted(self._fold_best.keys()):
+            trial_num, score = self._fold_best[fold_idx]
+            if trial_num in self._oof:
+                logger.info(
+                    f"  Fold {fold_idx}: best trial #{trial_num} score={score:.6f}"
+                )
 
 
 def _create_objective(
@@ -1621,6 +1856,7 @@ def _create_objective(
     results_dir: Path,
     test: pd.DataFrame | None = None,
     per_fold_tracker: PerFoldTracker | None = None,
+    trial_oof_store: TrialOOFStore | None = None,
     fold_timeout: int | None = None,
     n_top_trials: int = 5,
     scaler_choices: list[str] | None = None,
@@ -1884,6 +2120,8 @@ def _create_objective(
             if monotone_constraints is not None:
                 if model_name == "catboost" and gpu:
                     pass  # CatBoost GPU doesn't support monotone_constraints
+                elif model_name == "catboost":
+                    model_hparams["monotone_constraints"] = list(monotone_constraints)
                 else:
                     model_hparams["monotone_constraints"] = tuple(monotone_constraints)
 
@@ -1958,6 +2196,24 @@ def _create_objective(
                     test_preds=test_fold_preds,
                     trial_number=trial.number,
                     params=hparams,
+                )
+
+            # Fold-coverage store: accumulate full OOF per trial.
+            # Runs whether or not per_fold_tracker is active.
+            if trial_oof_store is not None and X_test_fold is not None:
+                if task_type == "binary_classification":
+                    test_fold_preds_fc = model.predict_proba(X_test_fold)[:, 1]
+                elif task_type == "multiclass":
+                    test_fold_preds_fc = model.predict_proba(X_test_fold)
+                else:
+                    test_fold_preds_fc = model.predict(X_test_fold)
+                trial_oof_store.update(
+                    trial_num=trial.number,
+                    fold_idx=fold_idx,
+                    fold_score=fold_metric,
+                    val_preds=fold_preds,
+                    val_idx=val_idx,
+                    test_preds=test_fold_preds_fc,
                 )
 
             # Diversity pruning: check if this trial's fold predictions
@@ -2035,6 +2291,11 @@ def _create_objective(
             cutoff = sorted(prior_values, reverse=maximize)[n_top_trials - 1]
             if (maximize and overall_metric >= cutoff) or (not maximize and overall_metric <= cutoff):
                 trial.set_user_attr("oof_preds", oof)
+
+        # Fold-coverage: commit completed trial (must come after all folds finish)
+        if trial_oof_store is not None:
+            trial_oof_store.commit_trial(trial.number)
+
         return overall_metric
 
     return objective
@@ -2296,6 +2557,8 @@ def train_with_config(
         if monotone_constraints is not None:
             if model_name == "catboost" and gpu:
                 pass  # CatBoost GPU doesn't support monotone_constraints
+            elif model_name == "catboost":
+                hparams_seeded["monotone_constraints"] = list(monotone_constraints)
             else:
                 hparams_seeded["monotone_constraints"] = tuple(monotone_constraints)
 
@@ -2547,7 +2810,7 @@ def run_all_studies(
         model_timeout = pipeline_config.optuna.model_timeouts.get(model_name)
 
         try:
-            study, tracker = run_optuna_study(
+            study, tracker, oof_store = run_optuna_study(
                 model_name=model_name,
                 train=train,
                 feature_cols=feature_cols,
@@ -2600,6 +2863,15 @@ def run_all_studies(
                 pass  # Not enough completed trials or other issue
 
             optuna_cfg = registry.get_optuna_config(model_name)
+            # Apply strategy overrides (same merge as run_optuna_study uses)
+            strategy_overrides = strategy.get("overrides", {}).get(model_name, {}) or {}
+            optuna_overrides = strategy_overrides.get("optuna", {}) or {}
+            for k, v in optuna_overrides.items():
+                if isinstance(v, dict) and isinstance(optuna_cfg.get(k), dict):
+                    optuna_cfg[k] = {**optuna_cfg[k], **v}
+                else:
+                    optuna_cfg[k] = v
+
             n_top = optuna_cfg["n_top_trials"]
             n_seeds = optuna_cfg["n_seeds"]
             seeds = [global_seed + i for i in range(n_seeds)]
@@ -2610,10 +2882,46 @@ def run_all_studies(
             labels: np.ndarray | None = None
             retrain_elapsed = 0.0
 
-            if selection_mode == "per_fold" and tracker is not None:
+            if selection_mode == "fold_coverage" and oof_store is not None:
+                # --- Fold-coverage path: complete OOF per trial, no retraining ---
+                assembly_cfg = optuna_cfg.get("assembly", {}) or {}
+                n_fold_best = assembly_cfg.get("n_fold_best", pipeline_config.cv.n_folds)
+                n_mean_best = assembly_cfg.get("n_mean_best", 5)
+
+                oof_store.log_summary(model_name)
+                composites = oof_store.select(
+                    n_fold_best=n_fold_best,
+                    n_mean_best=n_mean_best,
+                )
+
+                if not composites:
+                    logger.warning(
+                        f"[{model_name}] Fold-coverage: no completed trials — "
+                        f"skipping model"
+                    )
+                else:
+                    all_oof = [c["oof_preds"] for c in composites]
+                    all_test = [c["test_preds"] for c in composites]
+                    labels = train[pipeline_config.target_column].values
+                    top_configs = [
+                        {
+                            "params": {},
+                            "value": c["avg_score"],
+                            "trial_number": c["fold_trials"][0],
+                        }
+                        for c in composites
+                    ]
+                    logger.info(
+                        f"[{model_name}] Fold-coverage assembly: "
+                        f"{len(all_oof)} composites (no retraining needed)"
+                    )
+
+            elif selection_mode == "per_fold" and tracker is not None:
                 # --- Per-fold path: OOF + test from tracker, no retraining ---
                 assembly_cfg = optuna_cfg.get("assembly", {"mode": "rank"})
                 assembly_mode = assembly_cfg.get("mode", "rank")
+
+                rank_normalize = assembly_cfg.get("rank_normalize", True)
 
                 if assembly_mode == "nsga2":
                     composites = tracker.assemble_nsga2(
@@ -2626,12 +2934,14 @@ def run_all_studies(
                         diversity_metric=assembly_cfg.get("diversity_metric", "pearson_neff"),
                         diversity_weight=assembly_cfg.get("diversity_weight", 0.3),
                         seed=global_seed,
+                        rank_normalize=rank_normalize,
                     )
                 else:
                     composites = tracker.assemble(
                         n_samples=len(train),
                         n_test=len(test),
                         task_type=task_type,
+                        rank_normalize=rank_normalize,
                     )
                 tracker.log_summary(model_name)
 

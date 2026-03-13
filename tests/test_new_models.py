@@ -423,7 +423,7 @@ class TestOptunaStudy:
         if model_name not in registry.list_models():
             pytest.skip(f"{model_name} not in minimal configs")
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name=model_name,
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -721,7 +721,7 @@ class TestTabMOptunaStudy:
             output=OutputConfig(results_dir=str(tmp_path / "results")),
         )
 
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="tabm",
             train=train,
             feature_cols=["f1", "f2", "f3"],

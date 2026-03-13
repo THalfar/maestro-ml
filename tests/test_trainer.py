@@ -150,7 +150,7 @@ class TestRunOptunaStudy:
     def test_completes_study(self, ridge_configs_dir: Path, binary_data, pipeline_config):
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -166,7 +166,7 @@ class TestRunOptunaStudy:
     def test_oof_preds_stored(self, ridge_configs_dir: Path, binary_data, pipeline_config):
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -186,7 +186,7 @@ class TestRunOptunaStudy:
         """OOF predictions should not all be zero (each fold fills its slice)."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -281,7 +281,7 @@ class TestGetTopConfigs:
     def test_returns_top_n(self, ridge_configs_dir: Path, binary_data, pipeline_config):
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -298,7 +298,7 @@ class TestGetTopConfigs:
     def test_sorted_descending_for_maximize(self, ridge_configs_dir: Path, binary_data, pipeline_config):
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -500,7 +500,7 @@ class TestRegressionPath:
         """Study should minimize RMSE for regression."""
         train, test = regression_data
         registry = ModelRegistry(ridge_regression_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -547,7 +547,7 @@ class TestRegressionPath:
         """Top configs should be sorted ascending for minimize (regression)."""
         train, _ = regression_data
         registry = ModelRegistry(ridge_regression_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -578,7 +578,7 @@ class TestGetTopConfigsExtra:
         """Requesting more configs than completed trials returns what's available."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -595,7 +595,7 @@ class TestGetTopConfigsExtra:
         """Each config dict should have params, value, and trial_number."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -679,7 +679,7 @@ class TestRunOptunaStudyExtra:
                 "ridge": {"C": {"low": 0.5, "high": 2.0}},
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -700,7 +700,7 @@ class TestRunOptunaStudyExtra:
         """timeout_override should be accepted without error."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -738,7 +738,7 @@ class TestMonotoneConstraints:
             }
         }
         # Should not raise — ridge is not in (catboost, xgboost, lightgbm)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -755,7 +755,7 @@ class TestMonotoneConstraints:
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
         strategy = {"monotone_constraints": {}}
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -946,7 +946,7 @@ class TestPerFoldTracker:
         tracker.update(1, 0.80, np.array([0.55, 0.44]), val_idx_1,
                        np.array([0.3, 0.3]), 40, {})
 
-        composites = tracker.assemble(n_samples=4, n_test=2)
+        composites = tracker.assemble(n_samples=4, n_test=2, rank_normalize=False)
 
         # Composite 0: fold 0 from trial 10, fold 1 from trial 30
         assert composites[0]["fold_trials"] == [10, 30]
@@ -959,6 +959,38 @@ class TestPerFoldTracker:
 
         # Composite 1: fold 0 from trial 20, fold 1 from trial 40
         assert composites[1]["fold_trials"] == [20, 40]
+
+    def test_assemble_rank_normalize(self):
+        """rank_normalize=True should map per-fold preds to (0, 1] via rankdata."""
+        from src.models.trainer import PerFoldTracker
+
+        tracker = PerFoldTracker(n_top=1, n_folds=2, maximize=True)
+
+        val_idx_0 = np.array([0, 1])
+        val_idx_1 = np.array([2, 3])
+
+        # Fold 0: raw preds [0.9, 0.3] → ranks [2, 1] → /2 = [1.0, 0.5]
+        tracker.update(0, 0.90, np.array([0.9, 0.3]), val_idx_0,
+                       np.array([0.8, 0.2]), 1, {})
+        # Fold 1: raw preds [0.7, 0.1] → ranks [2, 1] → /2 = [1.0, 0.5]
+        tracker.update(1, 0.85, np.array([0.7, 0.1]), val_idx_1,
+                       np.array([0.6, 0.4]), 2, {})
+
+        composites_raw = tracker.assemble(n_samples=4, n_test=2, rank_normalize=False)
+        composites_rn = tracker.assemble(n_samples=4, n_test=2, rank_normalize=True)
+
+        # Raw preds should differ from rank-normalized preds
+        assert not np.allclose(composites_raw[0]["oof_preds"], composites_rn[0]["oof_preds"])
+
+        # Rank-normalized OOF values should be in (0, 1]
+        rn_oof = composites_rn[0]["oof_preds"]
+        assert rn_oof.min() > 0.0
+        assert rn_oof.max() <= 1.0
+
+        # Relative order within each fold must be preserved
+        # Fold 0: oof[0] > oof[1] in both raw and rank-normalized
+        assert rn_oof[0] > rn_oof[1]
+        assert rn_oof[2] > rn_oof[3]
 
     def test_assemble_test_averaged_across_folds(self):
         """Test preds should be averaged across folds."""
@@ -974,7 +1006,7 @@ class TestPerFoldTracker:
         tracker.update(1, 0.85, np.array([0.7]), val_idx_1,
                        np.array([0.4, 0.2]), 2, {})
 
-        composites = tracker.assemble(n_samples=2, n_test=2)
+        composites = tracker.assemble(n_samples=2, n_test=2, rank_normalize=False)
         # test_preds = [0.8, 0.6] / 2 + [0.4, 0.2] / 2 = [0.6, 0.4]
         np.testing.assert_array_almost_equal(
             composites[0]["test_preds"], [0.6, 0.4]
@@ -1118,7 +1150,7 @@ class TestPerFoldIntegration:
 
         train, test = binary_data
         registry = ModelRegistry(per_fold_configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1139,7 +1171,7 @@ class TestPerFoldIntegration:
         """Tracker should assemble up to n_top_trials composites."""
         train, test = binary_data
         registry = ModelRegistry(per_fold_configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1160,7 +1192,7 @@ class TestPerFoldIntegration:
         """Assembled OOF predictions should be valid probabilities."""
         train, test = binary_data
         registry = ModelRegistry(per_fold_configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1523,7 +1555,7 @@ class TestParamTypeCoverage:
             optuna=OptunaGlobalConfig(global_seed=42),
             output=OutputConfig(results_dir=str(multi_type_configs_dir.parent / "results")),
         )
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1549,7 +1581,7 @@ class TestParamTypeCoverage:
                 "ridge": {"C": 1.0},  # scalar → fixed type
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1577,7 +1609,7 @@ class TestParamTypeCoverage:
                 }
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -1662,7 +1694,7 @@ class TestFoldTimeout:
             return counter["v"]
 
         with patch("src.models.trainer.time.monotonic", side_effect=fake_monotonic):
-            study, tracker = run_optuna_study(
+            study, tracker, _ = run_optuna_study(
                 model_name="ridge",
                 train=train,
                 feature_cols=["f1", "f2", "f3"],
@@ -1770,7 +1802,7 @@ class TestPerFoldTrackerEdgeCases:
         tracker.update(0, 0.90, np.array([0.9, 0.8, 0.7, 0.6]), val_idx, test_preds, 1, {})
         tracker.update(0, 0.85, np.array([0.5, 0.4, 0.3, 0.2]), val_idx, test_preds, 2, {})
 
-        composites = tracker.assemble(n_samples=4, n_test=2)
+        composites = tracker.assemble(n_samples=4, n_test=2, rank_normalize=False)
         assert len(composites) == 2
         # With 1 fold, test_preds = fold_test / 1 = fold_test
         np.testing.assert_array_almost_equal(composites[0]["test_preds"], test_preds)
@@ -1854,7 +1886,7 @@ class TestStepParamSupport:
             optuna=OptunaGlobalConfig(global_seed=42),
             output=OutputConfig(results_dir=str(step_configs_dir.parent / "results")),
         )
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2009,7 +2041,7 @@ class TestSampleWeightIntegration:
         cfg_path.write_text(yaml.dump(cfg))
 
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             test=test,
@@ -2029,7 +2061,7 @@ class TestSampleWeightIntegration:
         train["_sample_weight"] = 3.0  # column exists but not supported
 
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             test=test,
@@ -2150,7 +2182,7 @@ class TestNanImputation:
             optuna=OptunaGlobalConfig(global_seed=42),
             output=OutputConfig(results_dir=str(nan_configs_dir.parent / "results")),
         )
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2215,7 +2247,7 @@ class TestOofBounding:
         """Only the top n_top_trials trials should have oof_preds in user_attrs."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2246,7 +2278,7 @@ class TestOofBounding:
         """The worst trial should not have oof_preds when n_top_trials < n_trials."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2477,7 +2509,7 @@ class TestScalerOptuna:
         """Optuna should include scaler in trial params for needs_scaling models."""
         train, test = scaling_binary_data
         registry = ModelRegistry(ridge_configs_dir_scaling)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2505,7 +2537,7 @@ class TestScalerOptuna:
                 "scaler_choices": ["robust"],
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2536,7 +2568,7 @@ class TestScalerOptuna:
                 "scaler_choices": ["robust", "standard"],
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2627,7 +2659,7 @@ class TestScalerOptuna:
             optuna=OptunaGlobalConfig(global_seed=42),
             output=OutputConfig(results_dir=str(tmp_path / "results")),
         )
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="random_forest",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2657,7 +2689,7 @@ class TestScalerOptuna:
                 }
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -2801,7 +2833,7 @@ class TestStrategyOptunaOverrides:
 
         # Run with override — the study runs fine even though assembly.mode
         # changed (assembly is used after study, not during Optuna trials)
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="random_forest",
             train=rf_data,
             feature_cols=["f1", "f2", "f3"],
@@ -2850,7 +2882,7 @@ class TestStrategyOptunaOverrides:
                 }
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="random_forest",
             train=rf_data,
             feature_cols=["f1", "f2", "f3"],
@@ -3295,7 +3327,7 @@ class TestDiversityPruning:
         )
 
         registry = ModelRegistry(configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3382,7 +3414,7 @@ class TestDiversityPruning:
         )
 
         registry = ModelRegistry(configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3452,7 +3484,7 @@ class TestDiversityPruning:
         )
 
         registry = ModelRegistry(configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3545,7 +3577,7 @@ class TestDiversityPruning:
         }
 
         registry = ModelRegistry(configs_dir)
-        study, tracker = run_optuna_study(
+        study, tracker, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3589,7 +3621,7 @@ class TestEnqueueTrials:
             }
         }
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3626,7 +3658,7 @@ class TestEnqueueTrials:
             }
         }
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3648,7 +3680,7 @@ class TestEnqueueTrials:
         train, test_df = binary_data
         registry = ModelRegistry(str(ridge_configs_dir))
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3728,7 +3760,7 @@ class TestSubstudy:
         train, test_df = binary_data
         registry = ModelRegistry(str(substudy_configs_dir))
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3754,7 +3786,7 @@ class TestSubstudy:
         train, test_df = binary_data
         registry = ModelRegistry(str(ridge_configs_dir))
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3784,7 +3816,7 @@ class TestSubstudy:
                 }
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3814,7 +3846,7 @@ class TestSubstudy:
                 }
             }
         }
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3887,7 +3919,7 @@ class TestSubstudy:
         train, test_df = binary_data
         registry = ModelRegistry(str(configs_dir))
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -3962,7 +3994,7 @@ class TestSubstudy:
         train, test_df = binary_data
         registry = ModelRegistry(str(configs_dir))
 
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -4040,7 +4072,7 @@ class TestSubstudy:
         registry = ModelRegistry(str(configs_dir))
 
         # Should complete without error — substudy skipped with warning
-        study, _ = run_optuna_study(
+        study, _, _ = run_optuna_study(
             model_name="ridge",
             train=train,
             feature_cols=["f1", "f2", "f3"],
@@ -4071,7 +4103,7 @@ class TestSubstudy:
             return original_fn(*args, **kwargs)
 
         with patch.object(trainer_module, "_run_two_phase_study", side_effect=mock_two_phase):
-            study, _ = run_optuna_study(
+            study, _, _ = run_optuna_study(
                 model_name="ridge",
                 train=train,
                 feature_cols=["f1", "f2", "f3"],
@@ -4108,7 +4140,7 @@ class TestTPEConfig:
             return original_fn(*args, **kwargs)
 
         with patch.object(trainer_module, "_run_two_phase_study", side_effect=mock_two_phase):
-            study, _ = run_optuna_study(
+            study, _, _ = run_optuna_study(
                 model_name="ridge",
                 train=train,
                 feature_cols=["f1", "f2", "f3"],
@@ -4153,7 +4185,7 @@ class TestTPEConfig:
             return original_fn(*args, **kwargs)
 
         with patch.object(trainer_module, "_run_two_phase_study", side_effect=mock_two_phase):
-            study, _ = run_optuna_study(
+            study, _, _ = run_optuna_study(
                 model_name="ridge",
                 train=train,
                 feature_cols=["f1", "f2", "f3"],
@@ -4339,3 +4371,107 @@ class TestPrescalingRetrainConsistency:
                     "Known BUG: prescaled Optuna trial lacks 'scaler' key in params, "
                     "causing retrain to use unscaled data (REVIEW:BUG in run_all_studies)"
                 )
+
+
+class TestTrialOOFStore:
+    """Tests for TrialOOFStore — fold-coverage selection."""
+
+    def test_update_and_commit(self):
+        """update + commit should store OOF and per-fold scores."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=4, n_test=2, n_folds=2, maximize=True)
+
+        val_idx_0 = np.array([0, 1])
+        val_idx_1 = np.array([2, 3])
+
+        store.update(0, 0, 0.90, np.array([0.8, 0.7]), val_idx_0, np.array([0.5, 0.5]))
+        store.update(0, 1, 0.85, np.array([0.6, 0.5]), val_idx_1, np.array([0.4, 0.4]))
+        store.commit_trial(0)
+
+        assert 0 in store._oof
+        assert store._mean_scores[0] == pytest.approx(0.875)
+        np.testing.assert_array_almost_equal(store._oof[0], [0.8, 0.7, 0.6, 0.5])
+
+    def test_pruned_trial_not_committed(self):
+        """Pruned trials (commit never called) should not appear in select()."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=4, n_test=2, n_folds=2, maximize=True)
+
+        # Trial 0: complete
+        store.update(0, 0, 0.90, np.array([0.8, 0.7]), np.array([0, 1]), np.array([0.5, 0.5]))
+        store.update(0, 1, 0.85, np.array([0.6, 0.5]), np.array([2, 3]), np.array([0.4, 0.4]))
+        store.commit_trial(0)
+
+        # Trial 1: pruned after fold 0 — commit never called
+        store.update(1, 0, 0.95, np.array([0.9, 0.8]), np.array([0, 1]), np.array([0.6, 0.6]))
+        # (no commit_trial(1))
+
+        composites = store.select(n_fold_best=5, n_mean_best=5)
+        trial_nums = {c["fold_trials"][0] for c in composites}
+        assert 0 in trial_nums
+        assert 1 not in trial_nums  # pruned, not committed
+
+    def test_select_round1_fold_best(self):
+        """Round 1 should pick the best trial per fold (deduplicated)."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=4, n_test=2, n_folds=2, maximize=True)
+
+        for trial_num, s0, s1 in [(0, 0.80, 0.82), (1, 0.90, 0.70), (2, 0.75, 0.91)]:
+            store.update(trial_num, 0, s0, np.random.rand(2), np.array([0, 1]), np.random.rand(2))
+            store.update(trial_num, 1, s1, np.random.rand(2), np.array([2, 3]), np.random.rand(2))
+            store.commit_trial(trial_num)
+
+        composites = store.select(n_fold_best=2, n_mean_best=0)
+        trial_nums = [c["fold_trials"][0] for c in composites]
+
+        # Fold 0 best = trial 1 (0.90), fold 1 best = trial 2 (0.91)
+        assert set(trial_nums) == {1, 2}
+
+    def test_select_round2_mean_best(self):
+        """Round 2 should add top-N by mean, skipping already selected."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=4, n_test=2, n_folds=2, maximize=True)
+        rng = np.random.default_rng(42)
+
+        for trial_num, s0, s1 in [(0, 0.80, 0.80), (1, 0.90, 0.70), (2, 0.75, 0.91), (3, 0.85, 0.85)]:
+            store.update(trial_num, 0, s0, rng.random(2), np.array([0, 1]), rng.random(2))
+            store.update(trial_num, 1, s1, rng.random(2), np.array([2, 3]), rng.random(2))
+            store.commit_trial(trial_num)
+
+        # n_fold_best=0 so round 1 selects nothing, round 2 gets top-2 by mean
+        composites = store.select(n_fold_best=0, n_mean_best=2)
+        assert len(composites) == 2
+        # Best mean scores: trial3=0.85, trial0=0.80 (trial1=0.80 same, trial2=0.83)
+        means = {c["fold_trials"][0]: c["avg_score"] for c in composites}
+        assert all(v >= 0.80 for v in means.values())
+
+    def test_select_composite_format(self):
+        """select() output should match PerFoldTracker.assemble() format."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=4, n_test=2, n_folds=2, maximize=True)
+        store.update(0, 0, 0.85, np.array([0.8, 0.7]), np.array([0, 1]), np.array([0.5, 0.5]))
+        store.update(0, 1, 0.80, np.array([0.6, 0.5]), np.array([2, 3]), np.array([0.4, 0.4]))
+        store.commit_trial(0)
+
+        composites = store.select(n_fold_best=1, n_mean_best=0)
+        assert len(composites) == 1
+        c = composites[0]
+        assert "oof_preds" in c
+        assert "test_preds" in c
+        assert "fold_trials" in c
+        assert "fold_scores" in c
+        assert "avg_score" in c
+        assert c["oof_preds"].shape == (4,)
+        assert c["test_preds"].shape == (2,)
+
+    def test_empty_store_returns_empty(self):
+        """select() on empty store should return []."""
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=10, n_test=5, n_folds=3, maximize=True)
+        assert store.select() == []

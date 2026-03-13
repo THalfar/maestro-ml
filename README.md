@@ -36,7 +36,7 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 - **Extra data support** — Concat original (non-synthetic) datasets with configurable sample weights. Kaggle Playground Series competitions use synthetic data — weighting the original dataset higher (e.g., 10×) gives models cleaner training signal.
 - **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
 - **LLM-driven preprocessing** — EDA detects scaling signals (skewness, outliers, sentinels, scale range ratios) and the LLM selects appropriate scalers per model. Optuna optimizes scaler choice (StandardScaler, RobustScaler, QuantileTransformer, or none) as a hyperparameter — per fold, fit on train only. Only applied to models that benefit from scaling (Ridge, KNN, SVM, etc.); tree models are left untouched.
-- **Per-fold selection for neural nets** — RealMLP and TabM use per-fold selection: each Optuna trial's per-fold model predicts on test immediately, and a bounded leaderboard tracks top-N per fold (including pruned trials). After Optuna, composites are assembled without retraining — either by rank or via NSGA-II fold-level optimization with greedy diversity-aware selection. Supports **tiered tracker** (score-protected anchors + diversity-aware cluster insertion) and **diversity pruning** (prunes redundant trials via correlation check) for low-signal datasets.
+- **Per-fold and fold-coverage selection for neural nets** — RealMLP and TabM offer two retraining-free selection modes. `per_fold`: each fold's model predicts test immediately; a bounded per-fold leaderboard tracks top-N predictions (including pruned trials); after Optuna, composites assembled via rank or NSGA-II with greedy diversity-aware selection. `fold_coverage`: stores complete OOF per trial (no cross-fold mixing), then selects via round-robin fold-best + top mean — avoids calibration errors from mixing trials trained with different scalers or architectures on low-signal data. Both modes support per-fold **rank normalisation** before stitching. Supports **tiered tracker** and **diversity pruning** (per_fold only) for low-signal datasets.
 - **Substudy warm-start for neural nets** — Runs a fast QMC-only Optuna study on a data subset with fewer CV folds. Two-tier enqueue: `top_n` best configs are always included unconditionally, while the remaining slots use rank-weighted importance sampling (including some bad ones so TPE learns where NOT to search). Also resolves the scaler lock problem: tests all scaler choices cheaply and locks the main study to the best one. ~10× speedup per trial means a 15-minute substudy covers as much hyperparameter space as 2.5 hours of full-data search.
 - **Custom TPE gamma** — Project-wide default TPE configuration with dynamic gamma function (`gamma_ratio=0.15`, `gamma_min=5`). 15% of completed trials are classified as "good", scaling with history size. Per-model overridable via YAML.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
@@ -215,8 +215,9 @@ The LLM's job is to *narrow* the search space, not to do ML.
 - Phase 1: QMC warmup (space-filling exploration)
 - Phase 2: TPE with custom gamma function (Bayesian optimization)
 - **Global mode** (default): Top configs retrained with multiple seeds for stability
-- **Per-fold mode** (RealMLP, TabM): `PerFoldTracker` keeps top-N predictions per fold during Optuna (including pruned trials). After Optuna, composites assembled via rank or NSGA-II — no retraining needed. Per-fold timeout prunes slow trials while saving completed fold predictions.
-- **Substudy warm-start**: Optional QMC-only pre-study on stratified data subset with rank-weighted importance sampling for neural net warm-start. Resolves scaler choice and enqueues configs into main study.
+- **Per-fold mode** (RealMLP, TabM): `PerFoldTracker` keeps top-N predictions per fold during Optuna (including pruned trials). After Optuna, composites assembled via rank or NSGA-II — no retraining needed. Per-fold rank normalisation removes scale mismatch. Supports tiered tracker and diversity pruning.
+- **Fold-coverage mode** (RealMLP, TabM): `TrialOOFStore` stores a complete OOF+test array per committed trial. After Optuna, `select()` applies round-robin fold-best + top-mean selection — no retraining, no cross-trial mixing. Preferred over per_fold on low-signal data (Porto Seguro) where cross-fold mixing creates calibration errors.
+- **Substudy warm-start**: Optional QMC-only pre-study with two-tier enqueue: `top_n` best trials guaranteed + rank-weighted sampling for remaining slots. Resolves scaler choice cheaply and enqueues warm-start configs into main study.
 - Automatic median imputation for models with `handles_missing: false` (RealMLP, TabM, Ridge, etc.)
 - **Scaler as Optuna parameter** for models with `needs_scaling: true` — fit per fold, LLM constrains choices from EDA
 - Sample weight support for extra data weighting
@@ -357,7 +358,7 @@ Each model config in `configs/models/` defines:
 - `fixed_params` — Always-on parameters (can be task-type-keyed)
 - `gpu` — GPU params and CPU fallback
 - `training` — Early stopping, eval metric, seed parameter name
-- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings, `selection_mode` (`global`/`per_fold`), `fold_timeout`, `assembly` (mode, diversity_metric, diversity_weight), `substudy` (QMC warm-start on data subset), `tpe` (custom gamma function)
+- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings, `selection_mode` (`global`/`per_fold`/`fold_coverage`), `fold_timeout`, `assembly` (mode for per_fold or n_fold_best/n_mean_best for fold_coverage), `tracker` (vanilla/tiered), `diversity_pruning` (per_fold only), `substudy` (QMC warm-start, two-tier enqueue with top_n), `tpe` (custom gamma function)
 
 ---
 
@@ -416,6 +417,8 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Prediction diversity probe (multi-seed RF correlation in EDA)
 - [x] Substudy warm-start (QMC pre-study on data subset → two-tier enqueue: top_n guaranteed + rank-weighted for main TPE)
 - [x] Custom TPE gamma function (dynamic 15% good-trial ratio, per-model overridable)
+- [x] Fold-coverage selection mode (complete OOF per trial, round-robin + top-mean assembly, no retraining)
+- [x] Per-fold rank normalisation (removes scale mismatch from mixed-scaler trials)
 - [x] 775 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking

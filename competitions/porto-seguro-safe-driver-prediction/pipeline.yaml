@@ -82,11 +82,11 @@ optuna:
   global_seed: 42
   global_timeout: null
   model_timeouts:
-    catboost: "2h"
-    xgboost: "2h"
-    lightgbm: "3h"
-    realmlp: "6h"              # 1h substudy + 5h main TPE
-    tabm: "6h"                 # 1h substudy + 5h main TPE
+    realmlp: "5h"              # 1h substudy + ~4h main TPE (fold_coverage, 10-fold)
+    tabm: "5h"                 # 1h substudy + ~4h main TPE (fold_coverage, 10-fold)
+    catboost: "40m"            # GPU, symmetric trees
+    xgboost: "40m"             # GPU, level-wise
+    lightgbm: "40m"            # CPU, leaf-wise — fast
 
 runtime:
   gpu_check: true
