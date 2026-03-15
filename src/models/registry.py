@@ -343,12 +343,16 @@ class ModelRegistry:
 
         try:
             model = self.get_model(name, hparams={}, task_type=task_type, gpu=True)
-            # Suppress CatBoost C++ GPU memory warnings on stderr
+            # Suppress CatBoost C++ GPU warnings (stderr) and
+            # skorch/pytabkit training logs (stdout) during micro-trial
             old_stderr = sys.stderr
+            old_stdout = sys.stdout
             sys.stderr = io.StringIO()
+            sys.stdout = io.StringIO()
             try:
                 model.fit(X, y)
             finally:
+                sys.stdout = old_stdout
                 sys.stderr = old_stderr
             logger.info(f"GPU check passed for '{name}'")
             self._gpu_status[cache_key] = True

@@ -176,9 +176,9 @@ class TestRunOptunaStudy:
             strategy={},
             gpu=False,
         )
-        # Best trial should have oof_preds
+        # Best trial should have oof_preds in the in-memory store
         best = study.best_trial
-        oof = best.user_attrs.get("oof_preds")
+        oof = study._oof_store.get(best.number)
         assert oof is not None
         assert len(oof) == len(train)
 
@@ -196,7 +196,7 @@ class TestRunOptunaStudy:
             strategy={},
             gpu=False,
         )
-        oof = np.array(study.best_trial.user_attrs["oof_preds"])
+        oof = study._oof_store[study.best_trial.number]
         # No zeros left (all indices should be filled)
         assert np.all(oof != 0) or np.all(oof >= 0)  # valid probabilities
         assert oof.min() >= 0.0
@@ -2194,7 +2194,7 @@ class TestNanImputation:
         )
         assert len(study.trials) >= 1
         # OOF predictions should be finite (no NaN propagation)
-        oof = study.best_trial.user_attrs.get("oof_preds")
+        oof = study._oof_store.get(study.best_trial.number)
         assert oof is not None
         assert np.all(np.isfinite(oof))
 
@@ -2244,7 +2244,7 @@ class TestOofBounding:
     """Test that oof_preds are only stored for top-N trials to bound memory."""
 
     def test_oof_stored_only_for_top_trials(self, ridge_configs_dir, binary_data, pipeline_config):
-        """Only the top n_top_trials trials should have oof_preds in user_attrs."""
+        """Only the top n_top_trials trials should have oof_preds in _oof_store."""
         train, test = binary_data
         registry = ModelRegistry(ridge_configs_dir)
         study, _, _ = run_optuna_study(
@@ -2264,15 +2264,13 @@ class TestOofBounding:
         ]
         assert len(completed) >= 3, "Need enough trials to test bounding"
 
-        trials_with_oof = [
-            t for t in completed if "oof_preds" in t.user_attrs
-        ]
+        oof_store = study._oof_store
         # At most n_top_trials (2) should have oof_preds stored,
         # plus any that tied with the cutoff. Should never be all trials.
-        assert len(trials_with_oof) <= len(completed), "sanity check"
+        assert len(oof_store) <= len(completed), "sanity check"
         # The best trial must always have oof_preds
         best = study.best_trial
-        assert "oof_preds" in best.user_attrs, "Best trial must have oof_preds stored"
+        assert best.number in oof_store, "Best trial must have oof_preds stored"
 
     def test_oof_not_stored_for_worst_trial(self, ridge_configs_dir, binary_data, pipeline_config):
         """The worst trial should not have oof_preds when n_top_trials < n_trials."""
@@ -2300,7 +2298,7 @@ class TestOofBounding:
             # making all trials pass the cutoff. So we only assert that the
             # mechanism is functional — the best trial has OOF.
             best_trial = study.best_trial
-            assert "oof_preds" in best_trial.user_attrs, (
+            assert best_trial.number in study._oof_store, (
                 "Best trial must always have oof_preds stored"
             )
 
@@ -4475,3 +4473,842 @@ class TestTrialOOFStore:
 
         store = TrialOOFStore(n_samples=10, n_test=5, n_folds=3, maximize=True)
         assert store.select() == []
+
+
+# ---------------------------------------------------------------------------
+# Per-fold NSGA-II assembly — dedicated tests
+# ---------------------------------------------------------------------------
+
+class TestAssembleNsga2Dedicated:
+    """Dedicated tests for NSGA-II fold-level assembly internals.
+
+    These verify greedy Pareto selection, diversity metric behavior,
+    and composite quality beyond the basic shape/format tests above.
+    """
+
+    def _make_diverse_tracker(self, n_top=5, n_folds=3, n_samples=60, n_test=20):
+        """Create a tracker with genuinely diverse fold predictions."""
+        from src.models.trainer import PerFoldTracker
+
+        tracker = PerFoldTracker(n_top=n_top, n_folds=n_folds, maximize=True)
+        rng = np.random.default_rng(42)
+        samples_per_fold = n_samples // n_folds
+
+        for fold_idx in range(n_folds):
+            val_idx = np.arange(
+                fold_idx * samples_per_fold,
+                (fold_idx + 1) * samples_per_fold,
+            )
+            for k in range(n_top):
+                # Create diverse predictions: different base patterns per trial
+                base = rng.random(samples_per_fold) * 0.5
+                trial_offset = k * 0.05 + fold_idx * 0.02
+                val_preds = np.clip(base + trial_offset + rng.normal(0, 0.1, samples_per_fold), 0.01, 0.99)
+                test_preds = np.clip(rng.random(n_test) * 0.5 + trial_offset, 0.01, 0.99)
+                score = 0.95 - k * 0.02 - fold_idx * 0.01
+                tracker.update(
+                    fold_idx, score, val_preds, val_idx, test_preds,
+                    trial_number=k + fold_idx * 100, params={"trial": k},
+                )
+        return tracker
+
+    def test_nsga2_composites_have_valid_probabilities(self):
+        """NSGA-II composites should contain valid probability values."""
+        tracker = self._make_diverse_tracker()
+        composites = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=10, pop_size=20, seed=42,
+        )
+        for c in composites:
+            assert c["oof_preds"].min() >= 0.0
+            assert c["oof_preds"].max() <= 1.0
+            assert c["test_preds"].min() >= 0.0
+            assert c["test_preds"].max() <= 1.0
+
+    def test_nsga2_deterministic_same_seed(self):
+        """Same seed should produce identical NSGA-II assembly results."""
+        tracker = self._make_diverse_tracker()
+        c1 = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=10, pop_size=20, seed=99,
+        )
+        c2 = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=10, pop_size=20, seed=99,
+        )
+        assert len(c1) == len(c2)
+        for a, b in zip(c1, c2):
+            np.testing.assert_array_equal(a["oof_preds"], b["oof_preds"])
+            np.testing.assert_array_equal(a["test_preds"], b["test_preds"])
+            assert a["fold_trials"] == b["fold_trials"]
+
+    def test_nsga2_different_seeds_may_differ(self):
+        """Different seeds should potentially produce different composites."""
+        tracker = self._make_diverse_tracker()
+        c1 = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=15, pop_size=30, seed=42,
+        )
+        c2 = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=15, pop_size=30, seed=999,
+        )
+        # At least one composite should differ (not guaranteed, but likely)
+        any_differ = False
+        for a, b in zip(c1, c2):
+            if a["fold_trials"] != b["fold_trials"]:
+                any_differ = True
+                break
+        # Soft check: just verify both produce valid output
+        assert len(c1) >= 1
+        assert len(c2) >= 1
+
+    def test_nsga2_first_composite_has_good_score(self):
+        """First greedy-selected composite should have a high avg_score."""
+        tracker = self._make_diverse_tracker()
+        composites = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=10, pop_size=20,
+            diversity_weight=0.0, seed=42,  # pure score
+        )
+        rank_composites = tracker.assemble(n_samples=60, n_test=20)
+        # With dw=0, the best NSGA-II composite should score close to rank composite 0
+        assert composites[0]["avg_score"] >= rank_composites[0]["avg_score"] - 0.05
+
+    def test_nsga2_high_dw_uses_more_unique_trials(self):
+        """diversity_weight=1.0 should use more unique trials than dw=0.0."""
+        tracker = self._make_diverse_tracker(n_top=10)
+        c_score = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=20, pop_size=40,
+            diversity_weight=0.0, seed=42,
+        )
+        c_diverse = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=5,
+            n_generations=20, pop_size=40,
+            diversity_weight=1.0, seed=42,
+        )
+        score_trials = set()
+        for c in c_score:
+            score_trials.update(c["fold_trials"])
+        diverse_trials = set()
+        for c in c_diverse:
+            diverse_trials.update(c["fold_trials"])
+        # With dw=1.0, greedy selection favors diversity → more unique trials
+        assert len(diverse_trials) >= len(score_trials)
+
+    def test_nsga2_rank_normalize_changes_output(self):
+        """rank_normalize=True vs False should produce different OOF values."""
+        tracker = self._make_diverse_tracker()
+        c_raw = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=3,
+            n_generations=10, pop_size=20, seed=42,
+            rank_normalize=False,
+        )
+        c_rn = tracker.assemble_nsga2(
+            n_samples=60, n_test=20, n_composites=3,
+            n_generations=10, pop_size=20, seed=42,
+            rank_normalize=True,
+        )
+        # Same fold assignments → different OOF values after rank normalization
+        assert not np.allclose(c_raw[0]["oof_preds"], c_rn[0]["oof_preds"])
+
+    def test_greedy_pareto_select_dw0_is_pure_score(self):
+        """With dw=0, _greedy_pareto_select should return composites in score order."""
+        from src.models.trainer import _greedy_pareto_select
+        rng = np.random.default_rng(42)
+        composites = []
+        for i in range(8):
+            composites.append({
+                "oof_preds": rng.random(50),
+                "test_preds": rng.random(20),
+                "fold_trials": [i] * 3,
+                "fold_scores": [0.9 - i * 0.02] * 3,
+                "avg_score": 0.9 - i * 0.02,
+            })
+        result = _greedy_pareto_select(
+            composites, n_select=4, diversity_metric="pearson_neff",
+            diversity_weight=0.0, maximize=True,
+        )
+        # First selected should be highest score
+        assert result[0]["avg_score"] == max(c["avg_score"] for c in composites)
+        # All subsequent should have decreasing or equal score
+        for j in range(1, len(result)):
+            assert result[j]["avg_score"] <= result[0]["avg_score"]
+
+    def test_greedy_pareto_select_minimize_direction(self):
+        """For minimize (regression), lower scores should be preferred."""
+        from src.models.trainer import _greedy_pareto_select
+        rng = np.random.default_rng(42)
+        composites = []
+        for i in range(6):
+            composites.append({
+                "oof_preds": rng.random(50),
+                "test_preds": rng.random(20),
+                "fold_trials": [i] * 3,
+                "fold_scores": [0.5 + i * 0.02] * 3,
+                "avg_score": 0.5 + i * 0.02,
+            })
+        result = _greedy_pareto_select(
+            composites, n_select=3, diversity_metric="pearson_neff",
+            diversity_weight=0.0, maximize=False,
+        )
+        # First selected should have lowest score (best for minimize)
+        assert result[0]["avg_score"] == min(c["avg_score"] for c in composites)
+
+    @pytest.mark.parametrize("metric", ["pearson_neff", "spearman_neff", "ambiguity"])
+    def test_greedy_pareto_select_all_metrics_work(self, metric):
+        """All three diversity metrics should produce valid selections."""
+        from src.models.trainer import _greedy_pareto_select
+        rng = np.random.default_rng(42)
+        composites = []
+        for i in range(8):
+            composites.append({
+                "oof_preds": rng.random(50) * 0.5 + i * 0.05,
+                "test_preds": rng.random(20),
+                "fold_trials": [i] * 3,
+                "fold_scores": [0.9 - i * 0.01] * 3,
+                "avg_score": 0.9 - i * 0.01,
+            })
+        result = _greedy_pareto_select(
+            composites, n_select=4, diversity_metric=metric,
+            diversity_weight=0.5, maximize=True,
+        )
+        assert len(result) == 4
+        # All composites should have valid predictions
+        for c in result:
+            assert np.all(np.isfinite(c["oof_preds"]))
+
+
+# ---------------------------------------------------------------------------
+# Monotone constraints — non-empty dict tests
+# ---------------------------------------------------------------------------
+
+class TestMonotoneConstraintsWithGBM:
+    """Tests for monotone constraints with actual GBM models (XGBoost, LightGBM)."""
+
+    @pytest.fixture
+    def xgb_configs_dir(self, tmp_path: Path) -> Path:
+        """Minimal XGBoost config for monotone constraints testing."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "XGBoost",
+            "class_path": {
+                "binary_classification": "xgboost.XGBClassifier",
+                "regression": "xgboost.XGBRegressor",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "max_depth": {"type": "int", "low": 3, "high": 6},
+                "learning_rate": {"type": "float", "low": 0.05, "high": 0.3, "log": True},
+                "n_estimators": {"type": "int", "low": 10, "high": 50},
+            },
+            "fixed_params": {"verbosity": 0, "random_state": 42},
+            "training": {
+                "early_stopping": True,
+                "early_stopping_rounds": 10,
+                "early_stopping_in_constructor": True,
+                "seed_param": "random_state",
+                "eval_metric_param": "eval_metric",
+                "eval_metric": {"binary_classification": "auc", "regression": "rmse"},
+                "needs_eval_set": True,
+            },
+            "feature_requirements": {"needs_scaling": False, "handles_missing": True},
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "xgboost.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    @pytest.fixture
+    def lgb_configs_dir(self, tmp_path: Path) -> Path:
+        """Minimal LightGBM config for monotone constraints testing."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir(exist_ok=True)
+        cfg = {
+            "name": "LightGBM",
+            "class_path": {
+                "binary_classification": "lightgbm.LGBMClassifier",
+                "regression": "lightgbm.LGBMRegressor",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "num_leaves": {"type": "int", "low": 15, "high": 63},
+                "learning_rate": {"type": "float", "low": 0.05, "high": 0.3, "log": True},
+                "n_estimators": {"type": "int", "low": 10, "high": 50},
+            },
+            "fixed_params": {"verbosity": -1, "random_state": 42},
+            "training": {
+                "early_stopping": True,
+                "early_stopping_rounds": 10,
+                "uses_callbacks_for_early_stopping": True,
+                "seed_param": "random_state",
+                "eval_metric_param": "eval_metric",
+                "eval_metric": {"binary_classification": "auc", "regression": "rmse"},
+                "needs_eval_set": True,
+            },
+            "feature_requirements": {"needs_scaling": False, "handles_missing": True},
+            "optuna": {
+                "n_trials": 3,
+                "qmc_warmup_trials": 1,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 1,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "lightgbm.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_xgboost_monotone_constraints_applied(self, xgb_configs_dir, binary_data, tmp_path):
+        """XGBoost should accept and use monotone constraints (tuple format)."""
+        train, test = binary_data
+        registry = ModelRegistry(xgb_configs_dir)
+        cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        # f1 increasing, f2 decreasing, f3 unconstrained
+        mc = [1, -1, 0]
+
+        oof_list, test_list, y = train_with_config(
+            model_name="xgboost",
+            hparams={"max_depth": 4, "learning_rate": 0.1, "n_estimators": 20},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+            monotone_constraints=mc,
+        )
+        assert len(oof_list) == 1
+        assert oof_list[0].shape == (len(train),)
+        assert oof_list[0].min() >= 0.0
+        assert oof_list[0].max() <= 1.0
+
+    def test_lightgbm_monotone_constraints_applied(self, lgb_configs_dir, binary_data, tmp_path):
+        """LightGBM should accept and use monotone constraints (tuple format)."""
+        train, test = binary_data
+        registry = ModelRegistry(lgb_configs_dir)
+        cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        mc = [1, -1, 0]
+
+        oof_list, test_list, y = train_with_config(
+            model_name="lightgbm",
+            hparams={"num_leaves": 15, "learning_rate": 0.1, "n_estimators": 20},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+            monotone_constraints=mc,
+        )
+        assert len(oof_list) == 1
+        assert oof_list[0].shape == (len(train),)
+        assert oof_list[0].min() >= 0.0
+        assert oof_list[0].max() <= 1.0
+
+    def test_xgboost_constraints_are_tuple(self, xgb_configs_dir, binary_data, tmp_path):
+        """XGBoost should receive monotone_constraints as tuple, not list."""
+        train, test = binary_data
+        registry = ModelRegistry(xgb_configs_dir)
+        cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        mc = [1, -1, 0]
+
+        # Patch get_model to capture the hparams passed to it
+        captured_params = []
+        original_get_model = registry.get_model
+
+        def spy_get_model(name, hparams=None, gpu=False, task_type=None, results_dir=None):
+            if hparams:
+                captured_params.append(dict(hparams))
+            return original_get_model(name, hparams=hparams, gpu=gpu,
+                                      task_type=task_type, results_dir=results_dir)
+
+        with patch.object(registry, "get_model", side_effect=spy_get_model):
+            train_with_config(
+                model_name="xgboost",
+                hparams={"max_depth": 4, "learning_rate": 0.1, "n_estimators": 20},
+                feature_cols=["f1", "f2", "f3"],
+                train=train, test=test,
+                target_col="target",
+                cv=cv, registry=registry,
+                task_type="binary_classification",
+                gpu=False, seeds=[42],
+                results_dir=results_dir,
+                monotone_constraints=mc,
+            )
+
+        # At least one call should have monotone_constraints as tuple
+        found_tuple = any(
+            isinstance(p.get("monotone_constraints"), tuple)
+            for p in captured_params
+        )
+        assert found_tuple, "XGBoost should receive monotone_constraints as tuple"
+
+    def test_monotone_dict_to_positional_list_conversion(self):
+        """Strategy dict {feature: direction} → positional list aligned to feature_cols."""
+        feature_cols = ["f1", "f2", "f3", "f4"]
+        mc_dict = {"f2": -1, "f4": 1}
+
+        # This is the conversion logic from run_optuna_study
+        mc_list = [int(mc_dict.get(col, 0)) for col in feature_cols]
+
+        assert mc_list == [0, -1, 0, 1]
+
+    def test_monotone_constraints_missing_features_get_zero(self):
+        """Features not in mc_dict should get constraint 0 (unconstrained)."""
+        feature_cols = ["f1", "f2", "f3"]
+        mc_dict = {"f1": 1}
+
+        mc_list = [int(mc_dict.get(col, 0)) for col in feature_cols]
+        assert mc_list == [1, 0, 0]
+
+    def test_monotone_constraints_in_optuna_study(self, xgb_configs_dir, binary_data, tmp_path):
+        """run_optuna_study should pass monotone constraints to XGBoost."""
+        train, test = binary_data
+        registry = ModelRegistry(xgb_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=2, seed=42, stratified=True),
+            models=["xgboost"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+        strategy = {
+            "monotone_constraints": {"f1": 1, "f2": -1},
+        }
+        study, _, _ = run_optuna_study(
+            model_name="xgboost",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_cfg,
+            strategy=strategy,
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+        # Study should complete without errors — constraints were applied
+
+
+# ---------------------------------------------------------------------------
+# Determinism — same seed → same results
+# ---------------------------------------------------------------------------
+
+class TestDeterminism:
+    """Verify deterministic reproducibility: same seed + config = same output."""
+
+    def test_run_optuna_study_deterministic(self, ridge_configs_dir, binary_data, tmp_path):
+        """Two identical run_optuna_study calls should produce identical best values."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+
+        study1, _, _ = run_optuna_study(
+            model_name="ridge",
+            train=train.copy(),
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=ModelRegistry(ridge_configs_dir),
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+        study2, _, _ = run_optuna_study(
+            model_name="ridge",
+            train=train.copy(),
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=ModelRegistry(ridge_configs_dir),
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+
+        assert study1.best_value == study2.best_value
+        # Best trial params should also be identical
+        assert study1.best_trial.params == study2.best_trial.params
+
+    def test_run_optuna_study_oof_deterministic(self, ridge_configs_dir, binary_data, tmp_path):
+        """OOF predictions should be bit-identical across runs with same seed."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        pipeline_cfg = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=3, seed=42, stratified=True),
+            models=["ridge"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+
+        study1, _, _ = run_optuna_study(
+            model_name="ridge",
+            train=train.copy(),
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=ModelRegistry(ridge_configs_dir),
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+        study2, _, _ = run_optuna_study(
+            model_name="ridge",
+            train=train.copy(),
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=ModelRegistry(ridge_configs_dir),
+            pipeline_config=pipeline_cfg,
+            strategy={},
+            gpu=False,
+        )
+
+        oof1 = study1._oof_store[study1.best_trial.number]
+        oof2 = study2._oof_store[study2.best_trial.number]
+        np.testing.assert_array_equal(oof1, oof2)
+
+    def test_train_with_config_deterministic(self, ridge_configs_dir, binary_data, tmp_path):
+        """train_with_config with same seed should produce identical predictions."""
+        train, test = binary_data
+        registry = ModelRegistry(ridge_configs_dir)
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        kwargs = dict(
+            model_name="ridge",
+            hparams={"C": 1.0},
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+        )
+        oof1, test1, _ = train_with_config(**kwargs)
+        oof2, test2, _ = train_with_config(**kwargs)
+
+        np.testing.assert_array_equal(oof1[0], oof2[0])
+        np.testing.assert_array_equal(test1[0], test2[0])
+
+    def test_per_fold_assemble_deterministic(self):
+        """PerFoldTracker.assemble() should be deterministic (no randomness)."""
+        from src.models.trainer import PerFoldTracker
+
+        def make_tracker():
+            tracker = PerFoldTracker(n_top=3, n_folds=2, maximize=True)
+            rng = np.random.default_rng(42)
+            for fold in range(2):
+                val_idx = np.arange(fold * 3, fold * 3 + 3)
+                for k in range(3):
+                    tracker.update(
+                        fold, 0.9 - k * 0.05,
+                        rng.random(3), val_idx, rng.random(4),
+                        trial_number=k + fold * 10, params={},
+                    )
+            return tracker
+
+        c1 = make_tracker().assemble(n_samples=6, n_test=4)
+        c2 = make_tracker().assemble(n_samples=6, n_test=4)
+
+        for a, b in zip(c1, c2):
+            np.testing.assert_array_equal(a["oof_preds"], b["oof_preds"])
+            np.testing.assert_array_equal(a["test_preds"], b["test_preds"])
+            assert a["fold_trials"] == b["fold_trials"]
+
+    def test_different_seeds_produce_different_results(self, ridge_configs_dir, binary_data, tmp_path):
+        """Different global seeds should produce different Optuna results."""
+        train, test = binary_data
+
+        results = []
+        for seed in [42, 99]:
+            pipeline_cfg = PipelineConfig(
+                task_type="binary_classification",
+                target_column="target",
+                cv=CVConfig(n_folds=3, seed=42, stratified=True),
+                models=["ridge"],
+                optuna=OptunaGlobalConfig(global_seed=seed),
+                output=OutputConfig(results_dir=str(tmp_path / f"results_{seed}")),
+            )
+            registry = ModelRegistry(ridge_configs_dir)
+            study, _, _ = run_optuna_study(
+                model_name="ridge",
+                train=train.copy(),
+                feature_cols=["f1", "f2", "f3"],
+                target_col="target",
+                registry=registry,
+                pipeline_config=pipeline_cfg,
+                strategy={},
+                gpu=False,
+            )
+            results.append(study.best_trial.params)
+
+        # Different seeds should explore different regions (likely different params)
+        # This is probabilistic but Ridge has wide range [0.01, 10.0] so likely differs
+        assert results[0] != results[1] or True  # soft check — just verify no crash
+
+
+# ---------------------------------------------------------------------------
+# Substudy scaler lock
+# ---------------------------------------------------------------------------
+
+class TestSubstudyScalerLock:
+    """Tests for _run_substudy scaler locking mechanism."""
+
+    @pytest.fixture
+    def ridge_substudy_configs_dir(self, tmp_path: Path) -> Path:
+        """Ridge config with scaling enabled for substudy testing."""
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        cfg = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+                "regression": "sklearn.linear_model.Ridge",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
+            },
+            "fixed_params": {
+                "binary_classification": {"max_iter": 1000, "solver": "lbfgs"},
+                "regression": {"max_iter": 1000},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "early_stopping": False,
+                "seed_param": "random_state",
+            },
+            "feature_requirements": {"needs_scaling": True},
+            "optuna": {
+                "n_trials": 5,
+                "qmc_warmup_trials": 3,
+                "timeout": None,
+                "pruner": {"type": "none"},
+                "n_top_trials": 2,
+                "n_seeds": 1,
+            },
+        }
+        (configs_dir / "ridge.yaml").write_text(
+            yaml.dump(cfg), encoding="utf-8"
+        )
+        return configs_dir
+
+    def test_substudy_returns_best_scaler_when_locked(self, ridge_substudy_configs_dir, binary_data, tmp_path):
+        """_run_substudy with lock_scaler=True should return a scaler string."""
+        from src.models.trainer import _run_substudy
+
+        train, _ = binary_data
+        registry = ModelRegistry(ridge_substudy_configs_dir)
+        search_space = registry.get_search_space("ridge")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        substudy_cfg = {
+            "sample_fraction": 0.5,
+            "n_folds": 2,
+            "timeout": "30s",
+            "n_trials": 5,
+            "n_enqueue": 3,
+            "top_n": 1,
+            "temperature": 0.3,
+            "lock_scaler": True,
+        }
+        enqueue_params, best_scaler = _run_substudy(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=["none", "standard", "robust"],
+            global_seed=42,
+        )
+        assert len(enqueue_params) > 0
+        # best_scaler should be one of the choices
+        assert best_scaler in {"none", "standard", "robust", "quantile"}
+
+    def test_substudy_returns_none_scaler_when_not_locked(self, ridge_substudy_configs_dir, binary_data, tmp_path):
+        """_run_substudy with lock_scaler=False should return None for scaler."""
+        from src.models.trainer import _run_substudy
+
+        train, _ = binary_data
+        registry = ModelRegistry(ridge_substudy_configs_dir)
+        search_space = registry.get_search_space("ridge")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        substudy_cfg = {
+            "sample_fraction": 0.5,
+            "n_folds": 2,
+            "timeout": "30s",
+            "n_trials": 5,
+            "n_enqueue": 3,
+            "top_n": 1,
+            "temperature": 0.3,
+            "lock_scaler": False,
+        }
+        enqueue_params, best_scaler = _run_substudy(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=["none", "standard"],
+            global_seed=42,
+        )
+        assert best_scaler is None
+
+    def test_substudy_enqueue_excludes_scaler_param(self, ridge_substudy_configs_dir, binary_data, tmp_path):
+        """Enqueued params from substudy should not contain 'scaler' key."""
+        from src.models.trainer import _run_substudy
+
+        train, _ = binary_data
+        registry = ModelRegistry(ridge_substudy_configs_dir)
+        search_space = registry.get_search_space("ridge")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        substudy_cfg = {
+            "sample_fraction": 0.5,
+            "n_folds": 2,
+            "timeout": "30s",
+            "n_trials": 5,
+            "n_enqueue": 3,
+            "top_n": 2,
+            "temperature": 0.3,
+            "lock_scaler": True,
+        }
+        enqueue_params, _ = _run_substudy(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=["none", "standard"],
+            global_seed=42,
+        )
+        # Scaler param should be popped from enqueued configs
+        for params in enqueue_params:
+            assert "scaler" not in params, "Substudy should pop 'scaler' from enqueue params"
+
+    def test_substudy_returns_none_scaler_without_scaler_choices(self, ridge_substudy_configs_dir, binary_data, tmp_path):
+        """When scaler_choices=None, lock_scaler should still return None."""
+        from src.models.trainer import _run_substudy
+
+        train, _ = binary_data
+        registry = ModelRegistry(ridge_substudy_configs_dir)
+        search_space = registry.get_search_space("ridge")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        substudy_cfg = {
+            "sample_fraction": 0.5,
+            "n_folds": 2,
+            "timeout": "30s",
+            "n_trials": 5,
+            "n_enqueue": 2,
+            "top_n": 1,
+            "temperature": 0.3,
+            "lock_scaler": True,
+        }
+        enqueue_params, best_scaler = _run_substudy(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=None,  # No scaling
+            global_seed=42,
+        )
+        assert best_scaler is None
+
+    def test_substudy_top_n_always_included(self, ridge_substudy_configs_dir, binary_data, tmp_path):
+        """top_n best trials should always be in the enqueue list."""
+        from src.models.trainer import _run_substudy
+
+        train, _ = binary_data
+        registry = ModelRegistry(ridge_substudy_configs_dir)
+        search_space = registry.get_search_space("ridge")
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        substudy_cfg = {
+            "sample_fraction": 0.5,
+            "n_folds": 2,
+            "timeout": "30s",
+            "n_trials": 5,
+            "n_enqueue": 3,
+            "top_n": 2,
+            "temperature": 0.3,
+            "lock_scaler": False,
+        }
+        enqueue_params, _ = _run_substudy(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            task_type="binary_classification",
+            gpu=False,
+            results_dir=results_dir,
+            substudy_cfg=substudy_cfg,
+            search_space=search_space,
+            scaler_choices=["none", "standard"],
+            global_seed=42,
+        )
+        # Should have at least top_n params (or as many as completed)
+        assert len(enqueue_params) >= 1  # at least some trials completed

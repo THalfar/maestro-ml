@@ -1,4 +1,5 @@
-"""Tests for new models: SVM, Elastic Net, Gaussian NB, AdaBoost, RealMLP, TabM.
+"""Tests for new models: SVM, Elastic Net, Gaussian NB, AdaBoost, RealMLP, TabM,
+FT-Transformer.
 
 Verifies that all new model YAML configs load correctly, produce valid
 model instances, and work end-to-end through Optuna studies.
@@ -97,12 +98,14 @@ def pipeline_config(tmp_path: Path) -> PipelineConfig:
 class TestNewModelsRegistered:
     @pytest.mark.parametrize("model_name", [
         "svm", "elastic_net", "gaussian_nb", "adaboost", "realmlp",
+        pytest.param("ftt", marks=_SKIP_REALMLP),
     ])
     def test_model_registered(self, registry: ModelRegistry, model_name: str):
         assert model_name in registry.list_models()
 
     @pytest.mark.parametrize("model_name", [
         "svm", "elastic_net", "gaussian_nb", "adaboost", "realmlp",
+        pytest.param("ftt", marks=_SKIP_REALMLP),
     ])
     def test_search_space_not_empty(self, registry: ModelRegistry, model_name: str):
         space = registry.get_search_space(model_name)
@@ -761,6 +764,256 @@ class TestTabMTrainWithConfig:
 
         oof_list, test_list, labels = train_with_config(
             model_name="tabm",
+            hparams=hparams,
+            feature_cols=["f1", "f2", "f3"],
+            train=train, test=test,
+            target_col="target",
+            cv=cv, registry=registry,
+            task_type="binary_classification",
+            gpu=False, seeds=[42],
+            results_dir=results_dir,
+        )
+        assert len(oof_list) == 1
+        assert len(test_list) == 1
+        assert oof_list[0].shape == (len(train),)
+        assert test_list[0].shape == (len(test),)
+        assert oof_list[0].min() >= 0.0
+        assert oof_list[0].max() <= 1.0
+
+
+# ===========================================================================
+# FT-Transformer — full hyperparameter coverage
+# ===========================================================================
+
+class TestFTTRegistration:
+    """Verify FT-Transformer loads from YAML and registers correctly."""
+
+    @_SKIP_REALMLP
+    def test_ftt_registered(self, registry: ModelRegistry):
+        assert "ftt" in registry.list_models()
+
+    @_SKIP_REALMLP
+    def test_ftt_search_space(self, registry: ModelRegistry):
+        space = registry.get_search_space("ftt")
+        expected = {
+            "module_d_token", "module_d_ffn_factor", "module_n_layers",
+            "module_n_heads", "module_attention_dropout", "module_ffn_dropout",
+            "module_residual_dropout", "lr", "optimizer_weight_decay",
+            "batch_size",
+        }
+        assert set(space.keys()) == expected
+
+    @_SKIP_REALMLP
+    def test_ftt_optuna_config(self, registry: ModelRegistry):
+        cfg = registry.get_optuna_config("ftt")
+        assert cfg["selection_mode"] == "per_fold"
+        assert cfg["fold_timeout"] == 300
+        assert cfg["assembly"]["mode"] == "nsga2"
+        assert cfg["n_top_trials"] == 15
+
+    @_SKIP_REALMLP
+    def test_ftt_feature_requirements(self, registry: ModelRegistry):
+        req = registry.get_feature_requirements("ftt")
+        assert req["needs_scaling"] is False
+        assert req["handles_categorical"] is True
+        assert req["handles_missing"] is False
+
+
+class TestFTTInstantiation:
+    """Test that FT-Transformer can be instantiated with all hyperparameters."""
+
+    _ALL_HPARAMS = {
+        "module_d_token": 64,
+        "module_d_ffn_factor": 2.0,
+        "module_n_layers": 2,
+        "module_n_heads": 4,
+        "module_attention_dropout": 0.1,
+        "module_ffn_dropout": 0.1,
+        "module_residual_dropout": 0.05,
+        "lr": 0.0001,
+        "optimizer_weight_decay": 1e-5,
+        "batch_size": 256,
+    }
+
+    @_SKIP_REALMLP
+    def test_classifier_with_all_hparams(self, registry: ModelRegistry):
+        model = registry.get_model(
+            "ftt", hparams=self._ALL_HPARAMS,
+            task_type="binary_classification",
+        )
+        from pytabkit import FTT_D_Classifier
+        assert isinstance(model, FTT_D_Classifier)
+
+    @_SKIP_REALMLP
+    def test_regressor_with_all_hparams(self, registry: ModelRegistry):
+        model = registry.get_model(
+            "ftt", hparams=self._ALL_HPARAMS,
+            task_type="regression",
+        )
+        from pytabkit import FTT_D_Regressor
+        assert isinstance(model, FTT_D_Regressor)
+
+    @_SKIP_REALMLP
+    def test_8_heads(self, registry: ModelRegistry):
+        hparams = {**self._ALL_HPARAMS, "module_n_heads": 8, "module_d_token": 128}
+        model = registry.get_model(
+            "ftt", hparams=hparams,
+            task_type="binary_classification",
+        )
+        from pytabkit import FTT_D_Classifier
+        assert isinstance(model, FTT_D_Classifier)
+
+
+class TestFTTFitPredict:
+    """Test that FT-Transformer can fit and predict."""
+
+    _FAST_HPARAMS = {
+        "module_d_token": 64,
+        "module_d_ffn_factor": 1.5,
+        "module_n_layers": 1,
+        "module_n_heads": 4,
+        "module_attention_dropout": 0.0,
+        "module_ffn_dropout": 0.0,
+        "module_residual_dropout": 0.0,
+        "lr": 0.001,
+        "optimizer_weight_decay": 0.0,
+        "batch_size": 256,
+    }
+
+    @_SKIP_REALMLP
+    def test_binary_predict_proba(self, registry: ModelRegistry, binary_data):
+        train, _ = binary_data
+        X = train[["f1", "f2", "f3"]].values
+        y = train["target"].values
+
+        model = registry.get_model(
+            "ftt", hparams=self._FAST_HPARAMS,
+            task_type="binary_classification",
+        )
+        model.fit(X, y)
+        proba = model.predict_proba(X)
+
+        assert proba.shape == (len(X), 2)
+        assert proba.min() >= 0.0
+        assert proba.max() <= 1.0
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+
+    @_SKIP_REALMLP
+    def test_regression_predict(self, registry: ModelRegistry, regression_data):
+        train, _ = regression_data
+        X = train[["f1", "f2", "f3"]].values
+        y = train["target"].values
+
+        model = registry.get_model(
+            "ftt", hparams=self._FAST_HPARAMS,
+            task_type="regression",
+        )
+        model.fit(X, y)
+        preds = model.predict(X)
+        assert preds.shape == (len(X),)
+        assert np.isfinite(preds).all()
+
+
+class TestFTTOptunaStudy:
+    """Run a minimal Optuna study for FT-Transformer."""
+
+    @_SKIP_REALMLP
+    def test_optuna_study_completes(self, binary_data, tmp_path):
+        train, _ = binary_data
+
+        ftt_cfg = {
+            "name": "FT-Transformer",
+            "class_path": {
+                "binary_classification": "pytabkit.FTT_D_Classifier",
+                "regression": "pytabkit.FTT_D_Regressor",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": True, "params": {"device": "cuda"},
+                    "fallback": {"device": "cpu"}},
+            "hyperparameters": {
+                "module_d_token": {"type": "int", "low": 64, "high": 64, "step": 8},
+                "module_d_ffn_factor": {"type": "float", "low": 1.5, "high": 2.0},
+                "module_n_layers": {"type": "int", "low": 1, "high": 2},
+                "module_n_heads": {"type": "categorical", "choices": [4]},
+                "module_attention_dropout": {"type": "float", "low": 0.0, "high": 0.1},
+                "module_ffn_dropout": {"type": "float", "low": 0.0, "high": 0.1},
+                "module_residual_dropout": {"type": "float", "low": 0.0, "high": 0.1},
+                "lr": {"type": "float", "low": 0.0005, "high": 0.001, "log": True},
+                "optimizer_weight_decay": {"type": "float", "low": 1e-6, "high": 1e-5, "log": True},
+                "batch_size": {"type": "int", "low": 256, "high": 256},
+            },
+            "fixed_params": {
+                "binary_classification": {
+                    "max_epochs": 5, "es_patience": 2, "n_cv": 1, "n_refit": 0,
+                    "use_checkpoints": False,
+                    "val_metric_name": "cross_entropy", "verbose": 0, "random_state": 42,
+                },
+            },
+            "training": {"needs_eval_set": False, "early_stopping": False,
+                         "eval_metric_param": None, "seed_param": "random_state"},
+            "feature_requirements": {"needs_scaling": False,
+                                     "handles_categorical": True,
+                                     "handles_missing": False},
+            "optuna": {"n_trials": 3, "qmc_warmup_trials": 1,
+                       "timeout": None, "pruner": {"type": "none"},
+                       "n_top_trials": 1, "n_seeds": 1},
+        }
+
+        configs_dir = tmp_path / "models"
+        configs_dir.mkdir()
+        (configs_dir / "ftt.yaml").write_text(
+            yaml.dump(ftt_cfg), encoding="utf-8"
+        )
+
+        registry = ModelRegistry(configs_dir)
+        pipeline = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            cv=CVConfig(n_folds=2, seed=42, stratified=True),
+            models=["ftt"],
+            optuna=OptunaGlobalConfig(global_seed=42),
+            output=OutputConfig(results_dir=str(tmp_path / "results")),
+        )
+
+        study, tracker, _ = run_optuna_study(
+            model_name="ftt",
+            train=train,
+            feature_cols=["f1", "f2", "f3"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline,
+            strategy={},
+            gpu=False,
+        )
+        assert len(study.trials) >= 1
+        assert study.best_value > 0.0
+
+
+class TestFTTTrainWithConfig:
+    """Test train_with_config for FT-Transformer end-to-end."""
+
+    @_SKIP_REALMLP
+    def test_train_produces_oof(self, registry, binary_data, tmp_path):
+        train, test = binary_data
+        cv = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        hparams = {
+            "module_d_token": 64,
+            "module_d_ffn_factor": 1.5,
+            "module_n_layers": 1,
+            "module_n_heads": 4,
+            "module_attention_dropout": 0.0,
+            "module_ffn_dropout": 0.0,
+            "module_residual_dropout": 0.0,
+            "lr": 0.001,
+            "optimizer_weight_decay": 0.0,
+            "batch_size": 256,
+        }
+
+        oof_list, test_list, labels = train_with_config(
+            model_name="ftt",
             hparams=hparams,
             feature_cols=["f1", "f2", "f3"],
             train=train, test=test,

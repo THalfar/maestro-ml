@@ -10,12 +10,16 @@ import pytest
 
 from src.eda.profiler import (
     _add_skewness_and_outliers,
+    _classify_data_personality,
     _compute_cardinality_profile,
     _compute_categorical_target_rates,
     _compute_correlations,
     _compute_cramers_v,
     _compute_distribution_shift,
+    _compute_ghost_features,
+    _compute_interaction_orchestra,
     _compute_iv_woe,
+    _compute_multi_baseline,
     _compute_mutual_information,
     _compute_psi_numeric,
     _compute_prediction_diversity_probe,
@@ -32,6 +36,7 @@ from src.eda.profiler import (
     _find_feature_clusters,
     _generate_recommendations,
     _identify_weak_features,
+    _prepare_eda_features,
     _screen_interactions,
     format_eda_for_llm,
     run_eda,
@@ -106,6 +111,7 @@ class TestRunEda:
             "duplicates", "unseen_categories", "monotonicity",
             "cardinality_profiles", "te_preview", "quick_model",
             "prediction_diversity",
+            "multi_baseline", "interaction_orchestra", "ghost_features",
         }
         assert set(report.keys()) == expected_keys
 
@@ -194,6 +200,28 @@ class TestRunEda:
         train_path, test_path = binary_dataset
         _, train_df, _ = run_eda(train_path, test_path, "target", target_mapping=None)
         assert set(train_df["target"].unique()) == {0, 1}
+
+    def test_string_target_auto_mapping(self, tmp_path: Path):
+        """Binary string targets should be auto-mapped to 0/1 without target_mapping."""
+        rng = np.random.default_rng(99)
+        n = 50
+        train = pd.DataFrame({
+            "feat": rng.normal(0, 1, n),
+            "target": rng.choice(["No", "Yes"], n),
+        })
+        test = pd.DataFrame({"feat": rng.normal(0, 1, 20)})
+        train.to_csv(tmp_path / "train.csv", index=False)
+        test.to_csv(tmp_path / "test.csv", index=False)
+
+        report, train_df, _ = run_eda(
+            tmp_path / "train.csv",
+            tmp_path / "test.csv",
+            "target",
+            task_type="binary_classification",
+        )
+        # Auto-mapped: "No"→0, "Yes"→1 (alphabetical)
+        assert set(train_df["target"].unique()) == {0, 1}
+        assert report["target_analysis"]["n_unique"] == 2
 
     def test_regression_target(self, tmp_path: Path):
         """Regression targets (continuous float) should produce valid reports."""
@@ -2171,8 +2199,9 @@ class TestNewEDASections:
         train_path, test_path = binary_dataset
         report, _, _ = run_eda(train_path, test_path, "target", id_col="id")
         text = format_eda_for_llm(report)
-        assert "QUICK MODEL BASELINE" in text
+        assert "MULTI-MODEL BASELINE" in text
         assert "PREDICTION DIVERSITY PROBE" in text
+        assert "INTERACTION ORCHESTRA" in text
         # Fold context
         assert "fold CV" in text
 
@@ -2197,3 +2226,312 @@ class TestNewEDASections:
         text = format_eda_for_llm(report)
         assert "DUPLICATE ANALYSIS" in text
         assert "Conflicting rows" in text
+
+
+# ---------------------------------------------------------------------------
+# Tests for _prepare_eda_features
+# ---------------------------------------------------------------------------
+
+class TestPrepareEdaFeatures:
+    """Tests for the shared data preparation helper."""
+
+    def test_label_encodes_categoricals(self):
+        df = pd.DataFrame({"num": [1.0, 2.0, 3.0], "cat": ["a", "b", "a"]})
+        target = pd.Series([0, 1, 0])
+        X, y, cols, is_clf = _prepare_eda_features(df, target, "binary_classification")
+        assert X.shape == (3, 2)
+        assert cols == ["num", "cat"]
+        # Cat should be encoded as 0, 1, 0
+        assert X[0, 1] == X[2, 1]
+        assert X[0, 1] != X[1, 1]
+
+    def test_fills_nan_with_median(self):
+        df = pd.DataFrame({"a": [1.0, np.nan, 3.0, 5.0]})
+        target = pd.Series([0, 1, 0, 1])
+        X, y, cols, _ = _prepare_eda_features(df, target, "binary_classification")
+        # Median of [1, 3, 5] = 3.0
+        assert X[1, 0] == 3.0
+
+    def test_subsamples_large_data(self):
+        n = 200
+        df = pd.DataFrame({"a": np.arange(n, dtype=float)})
+        target = pd.Series(np.array([0, 1] * (n // 2)))
+        X, y, _, _ = _prepare_eda_features(df, target, "binary_classification", max_samples=50)
+        assert len(y) == 50
+        assert X.shape[0] == 50
+
+    def test_empty_dataframe(self):
+        df = pd.DataFrame()
+        target = pd.Series(dtype=float)
+        X, y, cols, is_clf = _prepare_eda_features(df, target, "binary_classification")
+        assert len(y) == 0
+        assert len(cols) == 0
+
+    def test_classification_detection(self):
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        target = pd.Series([0, 1, 0])
+        _, _, _, is_clf = _prepare_eda_features(df, target, "binary_classification")
+        assert is_clf is True
+
+    def test_regression_detection(self):
+        df = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+        target = pd.Series([0.1, 0.5, 0.9])
+        _, _, _, is_clf = _prepare_eda_features(df, target, "regression")
+        assert is_clf is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for _classify_data_personality
+# ---------------------------------------------------------------------------
+
+class TestClassifyDataPersonality:
+    """Tests for data personality classification logic."""
+
+    def test_tree_dominant(self):
+        scores = {"random_forest": 0.82, "lightgbm": 0.85, "catboost": 0.84, "ridge": 0.75}
+        personality, detail = _classify_data_personality(scores, "AUC")
+        assert personality == "tree_dominant"
+
+    def test_nn_goldmine(self):
+        scores = {"random_forest": 0.80, "lightgbm": 0.82, "catboost": 0.81,
+                  "ridge": 0.75, "realmlp": 0.83, "tabm": 0.84}
+        personality, detail = _classify_data_personality(scores, "AUC")
+        assert personality == "nn_goldmine"
+
+    def test_linear_friendly(self):
+        scores = {"random_forest": 0.82, "lightgbm": 0.83, "catboost": 0.82, "ridge": 0.83}
+        personality, detail = _classify_data_personality(scores, "AUC")
+        assert personality == "linear_friendly"
+
+    def test_all_similar(self):
+        scores = {"random_forest": 0.82, "lightgbm": 0.823, "catboost": 0.821, "ridge": 0.819}
+        personality, detail = _classify_data_personality(scores, "AUC")
+        assert personality == "all_similar"
+
+    def test_regression_rmse(self):
+        # Lower is better for RMSE
+        scores = {"random_forest": 0.5, "lightgbm": 0.3, "catboost": 0.35, "ridge": 0.8}
+        personality, detail = _classify_data_personality(scores, "RMSE")
+        assert personality == "tree_dominant"
+
+    def test_no_trees_returns_unknown(self):
+        scores = {"ridge": 0.82}
+        personality, _ = _classify_data_personality(scores, "AUC")
+        assert personality == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _compute_multi_baseline
+# ---------------------------------------------------------------------------
+
+class TestMultiBaseline:
+    """Tests for the multi-model baseline probe."""
+
+    @pytest.fixture
+    def binary_data(self):
+        rng = np.random.default_rng(42)
+        n = 50
+        x1 = rng.standard_normal(n)
+        x2 = rng.standard_normal(n)
+        y = (x1 + x2 > 0).astype(int)
+        df = pd.DataFrame({"x1": x1, "x2": x2})
+        return df, pd.Series(y, name="target")
+
+    def test_classification_all_keys_present(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        assert "scores" in result
+        assert "stds" in result
+        assert "best_model" in result
+        assert "best_score" in result
+        assert "metric" in result
+        assert "feature_importances" in result
+        assert "personality" in result
+        assert "cross_model_correlations" in result
+        assert "training_times_sec" in result
+
+    def test_scores_reasonable(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        for model_name, score in result["scores"].items():
+            assert 0.0 <= score <= 1.0, f"{model_name} score {score} out of range"
+
+    def test_has_multiple_models(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        # Should have at least RF + Ridge (always available)
+        assert len(result["scores"]) >= 2
+
+    def test_feature_importances_nonempty(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        imp = result["feature_importances"]
+        assert len(imp) > 0
+        assert "x1" in imp or "x2" in imp
+
+    def test_linear_gap_computed(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        if "ridge" in result["scores"] and len(result["scores"]) > 1:
+            assert result["linear_gap"] is not None
+
+    def test_cross_model_correlations_valid(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        for na, nb, corr in result["cross_model_correlations"]:
+            assert -1.0 <= corr <= 1.0
+
+    def test_training_times_positive(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        for model_name, t in result["training_times_sec"].items():
+            assert t >= 0, f"{model_name} time {t} is negative"
+
+    def test_personality_is_valid(self, binary_data):
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        valid_personalities = {"nn_goldmine", "tree_dominant", "linear_friendly", "all_similar", "mixed", "unknown"}
+        assert result["personality"] in valid_personalities
+
+    def test_regression(self):
+        rng = np.random.default_rng(42)
+        n = 50
+        x1 = rng.standard_normal(n)
+        y = x1 * 2 + rng.standard_normal(n) * 0.1
+        df = pd.DataFrame({"x1": x1})
+        result = _compute_multi_baseline(df, pd.Series(y), "regression")
+        assert result["metric"] == "RMSE"
+        assert result["best_score"] is not None
+
+    def test_empty_dataframe(self):
+        df = pd.DataFrame()
+        target = pd.Series(dtype=float)
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        assert result["scores"] == {}
+        assert result["personality"] == "unknown"
+
+    def test_backward_compat_quick_model(self, binary_dataset):
+        """run_eda should still populate quick_model for backward compat."""
+        train_path, test_path = binary_dataset
+        report, _, _ = run_eda(train_path, test_path, "target")
+        qm = report["quick_model"]
+        assert "feature_importances" in qm
+        assert "baseline_score" in qm
+        assert "baseline_metric" in qm
+
+    def test_all_importances_collected(self, binary_data):
+        """all_importances should contain entries for models that support it."""
+        df, target = binary_data
+        result = _compute_multi_baseline(df, target, "binary_classification")
+        all_imp = result.get("all_importances", {})
+        # At least RF should have importances
+        assert "random_forest" in all_imp
+
+
+# ---------------------------------------------------------------------------
+# Tests for _compute_interaction_orchestra
+# ---------------------------------------------------------------------------
+
+class TestInteractionOrchestra:
+    """Tests for the LightGBM interaction extraction."""
+
+    def test_returns_top_interactions(self):
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.standard_normal(n)
+        x2 = rng.standard_normal(n)
+        x3 = rng.standard_normal(n)
+        y = ((x1 * x2) > 0).astype(int)
+        df = pd.DataFrame({"x1": x1, "x2": x2, "x3": x3})
+        result = _compute_interaction_orchestra(df, pd.Series(y), "binary_classification")
+        assert "top_interactions" in result
+        assert "method" in result
+
+    def test_interaction_strength_sorted(self):
+        rng = np.random.default_rng(42)
+        n = 100
+        x1 = rng.standard_normal(n)
+        x2 = rng.standard_normal(n)
+        y = ((x1 + x2) > 0).astype(int)
+        df = pd.DataFrame({"x1": x1, "x2": x2})
+        result = _compute_interaction_orchestra(df, pd.Series(y), "binary_classification")
+        interactions = result["top_interactions"]
+        if len(interactions) > 1:
+            strengths = [i["interaction_strength"] for i in interactions]
+            assert strengths == sorted(strengths, reverse=True)
+
+    def test_empty_data_graceful(self):
+        df = pd.DataFrame()
+        target = pd.Series(dtype=float)
+        result = _compute_interaction_orchestra(df, target, "binary_classification")
+        assert result["top_interactions"] == []
+
+    def test_with_prefit_models(self):
+        """If lgbm_models are passed, should reuse them."""
+        rng = np.random.default_rng(42)
+        n = 50
+        x1 = rng.standard_normal(n)
+        x2 = rng.standard_normal(n)
+        y = ((x1 + x2) > 0).astype(int)
+        df = pd.DataFrame({"x1": x1, "x2": x2})
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            pytest.skip("LightGBM not installed")
+        model = lgb.LGBMClassifier(n_estimators=50, verbosity=-1, random_state=42)
+        model.fit(np.column_stack([x1, x2]), y)
+        result = _compute_interaction_orchestra(
+            df, pd.Series(y), "binary_classification", lgbm_models=[model]
+        )
+        assert result["method"] == "lgbm_split_gain_pairs"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _compute_ghost_features
+# ---------------------------------------------------------------------------
+
+class TestGhostFeatures:
+    """Tests for cross-model ghost feature detection."""
+
+    def test_detects_ghost_feature(self):
+        """A feature important in one model but not others should be flagged."""
+        importances = {
+            "random_forest": {"a": 0.5, "b": 0.3, "c": 0.1, "d": 0.05, "e": 0.05},
+            "lightgbm": {"a": 0.05, "b": 0.4, "c": 0.3, "d": 0.15, "e": 0.1},
+            "catboost": {"a": 0.03, "b": 0.35, "c": 0.32, "d": 0.2, "e": 0.1},
+            "ridge": {"a": 0.02, "b": 0.3, "c": 0.35, "d": 0.2, "e": 0.13},
+        }
+        result = _compute_ghost_features(importances)
+        ghosts = result["ghost_features"]
+        ghost_names = [g["feature"] for g in ghosts]
+        # 'a' is top in RF but bottom in others
+        assert "a" in ghost_names
+
+    def test_no_ghosts_clean_data(self):
+        """If all models agree, no ghosts should be detected."""
+        importances = {
+            "random_forest": {"a": 0.4, "b": 0.35, "c": 0.25},
+            "lightgbm": {"a": 0.38, "b": 0.37, "c": 0.25},
+        }
+        result = _compute_ghost_features(importances)
+        assert len(result["ghost_features"]) == 0
+
+    def test_rank_correlations_valid(self):
+        importances = {
+            "random_forest": {"a": 0.5, "b": 0.3, "c": 0.2},
+            "lightgbm": {"a": 0.4, "b": 0.35, "c": 0.25},
+        }
+        result = _compute_ghost_features(importances)
+        for key, corr in result["rank_correlations"].items():
+            assert -1.0 <= corr <= 1.0
+
+    def test_single_model_graceful(self):
+        """With only one model, no comparisons possible."""
+        importances = {"random_forest": {"a": 0.5, "b": 0.3}}
+        result = _compute_ghost_features(importances)
+        assert result["ghost_features"] == []
+        assert result["rank_correlations"] == {}
+
+    def test_empty_importances(self):
+        result = _compute_ghost_features({})
+        assert result["ghost_features"] == []

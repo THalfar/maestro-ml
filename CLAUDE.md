@@ -55,8 +55,8 @@ Implement in this order (each module depends on the ones above it):
   ```
 - **XGBoost:** v2.0+ uses `device="cuda"`, not the deprecated `tree_method="gpu_hist"`.
 - **LightGBM:** Default pip/conda installs are CPU-only. GPU requires special build.
-- **Neural net QMC warmup**: TabM/RealMLP trials take ~8-10 min each on large datasets (595k rows). Keep `qmc_warmup_trials` low (≤10) to leave budget for TPE exploration. 30 QMC trials can consume the entire timeout.
-- **Neural net fold_timeout**: Per-fold training on large datasets needs generous timeouts. 120s is too aggressive for 595k rows — use 300s+ to avoid excessive trial pruning.
+- **Neural net QMC warmup**: TabM/RealMLP/FTT trials take ~8-10 min each on large datasets (595k rows). Keep `qmc_warmup_trials` low (≤10) to leave budget for TPE exploration. 30 QMC trials can consume the entire timeout.
+- **Neural net fold_timeout**: Per-fold training on large datasets needs generous timeouts. 120s is too aggressive for 595k rows — use 300s+ to avoid excessive trial pruning. FTT needs even more (300s default) due to O(n^2) attention.
 
 ## Model-Specific Quirks
 
@@ -67,6 +67,7 @@ Implement in this order (each module depends on the ones above it):
 - **RealMLP**: Uses rectangular architecture (`hidden_sizes: "rectangular"` in fixed_params) with `n_hidden_layers` and `hidden_width` as Optuna search params. Uses **per-fold selection** (`selection_mode: per_fold`) — see "Per-Fold Selection" section below.
 - **RealMLP fixed_params**: Task-type-keyed (`binary_classification` / `regression`), like Ridge. `n_ens` (pytabkit internal ensemble count) is in the Optuna search space, not fixed.
 - **Ridge/Elastic Net YAML**: `fixed_params` is task-type-keyed (`binary_classification` / `regression`) because Ridge wraps different sklearn classes per task.
+- **FT-Transformer**: Transformer for tabular data via pytabkit (`FTT_D_Classifier`/`FTT_D_Regressor`). O(n^2) self-attention makes it significantly slower than RealMLP/TabM — use `fold_timeout: 300` (vs 180/120). Lower `batch_size` range (256-2048) and lower `lr` range (1e-5 to 1e-3) than MLPs. `module_d_token` must be divisible by `module_n_heads` — use `step: 8` with `choices: [4, 8]`. Very different inductive bias from MLPs → strong diversity boost. Supports `fold_coverage` mode for large/low-signal datasets (recommended over `per_fold` due to slow training). **FTT uses skorch backend** (requires `skorch` pip package). `val_metric_name` supports only `cross_entropy` or `class_error` for classification (NOT `1-auc_ovr`). Regression has no `val_metric_name` (uses MSE internally). Always set `use_checkpoints: false` to avoid `rtdl_checkpoints/` dir in project root.
 - **AdaBoost/GaussianNB/SVM/KNN**: No early stopping, no GPU — simple sklearn models added for ensemble diversity.
 
 ## Monotone Constraints
@@ -114,6 +115,7 @@ Empirically, per-fold stitching of different trials can create calibration error
   - **Round 2** (mean-best): adds top `n_mean_best` trials by mean CV score, skipping already selected ones.
 - **No retraining, no rank-norm needed**: Each composite is one trial's complete OOF — no scale mismatch.
 - **Diversity pruning does NOT activate** with fold_coverage (requires `per_fold_tracker` which is None). All trials run full n_folds.
+- **Disable Optuna pruner with fold_coverage**: MedianPruner prunes after 1 fold by default. Pruned trials are never committed to `TrialOOFStore` → few complete OOF arrays. Set `pruner: {type: none}` in strategy YAML for fold_coverage models.
 - **Config** (`optuna.assembly` in strategy YAML):
   ```yaml
   optuna:
@@ -161,7 +163,7 @@ During Optuna trials, redundant trials (highly correlated predictions with exist
 
 ## Ensemble & Diversity
 
-- **SOTA models only**: Only include strong models in the ensemble. Weak models (gaussian_nb, svm, knn, adaboost) dilute ensemble quality — their noisy predictions can hurt the meta-learner and final blend even with NSGA-II selection. Prefer: catboost, xgboost, lightgbm, realmlp, random_forest, extra_trees. NSGA-II handles diversity within strong models.
+- **SOTA models only**: Only include strong models in the ensemble. Weak models (gaussian_nb, svm, knn, adaboost) dilute ensemble quality — their noisy predictions can hurt the meta-learner and final blend even with NSGA-II selection. Prefer: catboost, xgboost, lightgbm, realmlp, tabm, ftt, random_forest, extra_trees. NSGA-II handles diversity within strong models.
 - **NSGA-II → meta-model chain** (in `run.py`): NSGA-II selects diverse models, then trains meta-models on selected OOFs. Compares linear blend vs each meta-model on OOF score — picks the winner automatically.
 - **NSGA-II knee-point selection** (default): `run_nsga2_ensemble()` uses `use_knee=True` by default. pymoo's `HighTradeoffPoints` finds the optimal tradeoff point on the Pareto front between metric score and diversity — no need to manually tune `diversity_weight`. The `diversity_weight` parameter serves as fallback when knee-point detection fails (< 3 Pareto solutions) or for explicit linear weighting.
 - **`diversity_weight`** can be a single float or a list of floats. A single float uses knee-point selection (default, recommended). A list of floats creates multiple submissions by re-selecting from the same Pareto front with linear weighting — useful for exploring different metric/diversity tradeoffs without re-running NSGA-II.
@@ -187,7 +189,7 @@ During Optuna trials, redundant trials (highly correlated predictions with exist
 
 ## NaN Imputation
 
-- Models with `handles_missing: false` (RealMLP, TabM, Ridge, KNN, etc.) get automatic median imputation in `run_optuna_study()` and `train_with_config()`.
+- Models with `handles_missing: false` (RealMLP, TabM, FTT, Ridge, KNN, etc.) get automatic median imputation in `run_optuna_study()` and `train_with_config()`.
 - Fitted on train, applied to both train and test via `sklearn.impute.SimpleImputer`.
 - Models with `handles_missing: true` (CatBoost, XGBoost, LightGBM) handle NaN natively — no imputation applied.
 
@@ -232,7 +234,15 @@ preprocessing:
 - **Monotonicity detection** (`monotonicity`): Bins numeric features and computes Spearman rho on binned target rates. Features with |rho| > 0.7 flagged as monotonic — candidates for `monotone_constraints` in gradient boosting.
 - **Cardinality profiles** (`cardinality_profiles`): Top-K share, Shannon entropy, normalized entropy per categorical. Classifies distribution shape as "uniform", "moderate", or "long_tail". Long-tail categoricals need frequency encoding or rare-category binning.
 - **Target encoding preview** (`te_preview`): OOF target encoding simulation (5-fold, alpha=10). Reports Pearson correlation and AUC of encoded column with target — concrete numbers for whether TE is worthwhile.
-- **Quick model baseline** (`quick_model`): 3-fold CV RandomForest (n_estimators=100, max_depth=8) with label-encoded categoricals. Returns baseline AUC/RMSE (performance floor without feature engineering) and feature importances (sees non-linear effects and interactions unlike univariate metrics). Subsamples to 50k rows for speed. Fully deterministic (seeded).
+- **Multi-model baseline** (`multi_baseline`): Trains up to 6 models (RandomForest, LightGBM, CatBoost, Ridge + optional RealMLP, TabM) with default hyperparameters on 3-fold CV. CPU models use 50k subsample, NNs use 20k. Produces:
+  - Per-model scores, stds, and training times
+  - **Data personality** classification: `nn_goldmine` (NNs lead trees), `tree_dominant` (trees lead), `linear_friendly` (Ridge competitive), `all_similar`, `mixed`
+  - **Linear gap**: best tree score minus Ridge — large gap means non-linear patterns
+  - **Cross-model diversity**: pairwise OOF correlations between all baseline models
+  - Backward-compatible `quick_model` alias still populated from RF results
+  - `all_importances` dict with per-model feature importances for ghost detector
+- **Interaction orchestra** (`interaction_orchestra`): Extracts top-15 feature interaction pairs from LightGBM tree structure. Walks `booster_.dump_model()` JSON, records parent→child split feature pairs weighted by split gain. Normalized to [0, 1]. Reuses LightGBM model from multi_baseline (no retraining). Guides LLM in choosing explicit `interactions` in strategy YAML.
+- **Ghost feature detector** (`ghost_features`): Compares feature importance rankings across all baseline models (RF MDI, LightGBM gain, CatBoost importance, Ridge |coef|). Flags features that are top-10% in one model but bottom-50% in another as "ghost features" with severity levels. Also reports pairwise Spearman rank correlations between model importances. Helps detect MDI bias, data artifacts, or potential leakage.
 - **Prediction diversity probe** (`prediction_diversity`): Trains 3 RF models with different seeds and measures signal-noise ratio (SNR = within_seed_std / across_seed_std). Within-seed std = how much predictions vary across samples (signal). Across-seed std = how much seeds change predictions (noise). Classification by SNR: `very_low` (<3), `low` (3-8), `moderate` (8-15), `high` (>15). **Note**: Pearson correlation alone is misleading for RF — noise features inflate seed-to-seed variation. SNR is robust because noise inflates both stds proportionally. Also reports Pearson correlations and Fisher z CI for reference. Subsamples to 50k. Guides LLM in setting tiered tracker/diversity pruning parameters.
 - **Fold context**: Dataset header shows per-fold train/val sizes for 5-fold and 10-fold CV to help calibrate min_leaf parameters.
 
@@ -299,6 +309,7 @@ Custom TPE gamma function is the **project default** for all models. Controls th
 
 ## Pipeline YAML Key Features
 
+- **`run_name`**: Unique identifier for the run (e.g. `"ps-s6e3-r1"`). Used for Optuna study names (`{run_name}__{model}`), SQLite DB filenames, and log file names. Increment per round: `r1`, `r2`, `r3`.
 - **`extra_data`**: List of extra datasets to concat with train (see "Extra Data" section).
 - **`target_mapping`**: Converts string labels to numeric (`{Yes: 1, No: 0}`).
 - **`log_transform_target`**: Applies `log1p()` to regression targets (for RMSLE optimization).
@@ -309,6 +320,28 @@ Custom TPE gamma function is the **project default** for all models. Controls th
 - **`assembly`**: Per-model in model YAML. Dict with `mode` (`rank`/`nsga2`), `n_composites`, `n_generations`, `pop_size`, `diversity_metric`, `diversity_weight`. Controls how per-fold composites are built.
 - **`meta_cv_folds`**: Number of CV folds for meta-model training. Defaults to `2 × pipeline n_folds` if not set. Set explicitly for large datasets (e.g., 15 folds for 595k samples).
 - **Model execution order**: Strategy YAML `models` dict overrides pipeline YAML `models` list. Python dict preserves insertion order — the first key in strategy YAML runs first. To control execution order, reorder the strategy YAML `models` dict.
+
+## Optuna Persistence & Logging
+
+### SQLite Storage (per model)
+- Set `optuna.storage_dir` in pipeline YAML to persist studies to SQLite.
+- One DB per model: `{storage_dir}/{run_name}__{model_name}.db`
+- Substudy gets its own DB: `{storage_dir}/{run_name}__{model_name}__sub.db`
+- `load_if_exists=True` — interrupted runs resume automatically from existing DB.
+- Study name format: `{run_name}__{model_name}` (e.g. `ps-s6e3-r1__realmlp`)
+- Cross-round trial transfer: load old study with `optuna.load_study(storage=...)`, copy completed trials to new study with `study.add_trial()` — TPE inherits full history with narrowed search space.
+
+```yaml
+run_name: "ps-s6e3-r1"
+optuna:
+  storage_dir: "competitions/ps-s6e3/results/optuna"
+```
+
+### File Logging
+- `setup_logging(verbose, log_file)` adds a `FileHandler` in addition to console output.
+- Log file path: `{results_dir}/logs/{run_name}.log` — created automatically by `run.py`.
+- All console output is mirrored to the log file for post-run analysis.
+- Log file persists between rounds (new run_name → new log file).
 
 ## CV and OOF Predictions
 
@@ -321,14 +354,14 @@ Custom TPE gamma function is the **project default** for all models. Controls th
 ## Configuration Files
 
 - `configs/schemas/` — YAML schema documentation (pipeline, model, EDA report)
-- `configs/models/` — One YAML per model type (12 models: catboost, xgboost, lightgbm, realmlp, ridge, elastic_net, knn, random_forest, extra_trees, adaboost, gaussian_nb, svm)
+- `configs/models/` — One YAML per model type (14 models: catboost, xgboost, lightgbm, realmlp, tabm, ftt, ridge, elastic_net, knn, random_forest, extra_trees, adaboost, gaussian_nb, svm)
 - `configs/templates/` — Ready-to-use pipeline configurations (binary_classification, regression)
 - `competitions/` — Per-competition pipeline configs + strategy YAML (house_prices, ps-s6e2, ps-s6e3)
 
 ## Dependencies
 
 Core: catboost, xgboost, lightgbm, scikit-learn, optuna, pandas, numpy
-Neural nets: pytabkit (RealMLP), torch
+Neural nets: pytabkit (RealMLP, TabM, FT-Transformer), torch
 Multi-objective: pymoo (NSGA-II)
 LLM: anthropic, openai, python-dotenv
 Config: pyyaml
@@ -357,7 +390,7 @@ conda run -n maestro pytest tests/ -v
 ## Testing
 
 - Run tests: `conda run -n maestro pytest tests/ -v`
-- Expected: **723 passed, 22 skipped, ~30s**
+- Expected: **860 passed, 35 skipped, ~90s**
 - `test_gpu.py` tests GPU availability — do not modify
 - Each module has a corresponding test file (see `tests/CLAUDE.md` for patterns)
 - `tests/conftest.py` handles Windows-specific torch/OpenMP DLL workarounds
@@ -382,7 +415,7 @@ conda run -n maestro python run.py --config pipeline.yaml --strategy manual
 ## File Structure Quick Reference
 ```
 src/utils/io.py          — load_yaml, load_pipeline_config, load_model_config, save_*, parse_timeout
-src/eda/profiler.py      — run_eda, format_eda_for_llm
+src/eda/profiler.py      — run_eda, format_eda_for_llm, multi-baseline probe, interaction orchestra, ghost detector
 src/features/engineer.py — build_features, target encoding, interactions, ratios
 src/models/registry.py   — ModelRegistry class (register, get_model, get_search_space)
 src/models/trainer.py    — PerFoldTracker, run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists

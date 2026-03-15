@@ -1,31 +1,34 @@
 # =============================================================================
 # Kaggle Playground Series S6E3 — Customer Churn Prediction
 # =============================================================================
-# Binary classification: predict Churn (Yes/No → 1/0)
+# Binary classification: predict Churn (0/1)
 # Metric: AUC-ROC
-# Features: gender, SeniorCitizen, Partner, Dependents, tenure, PhoneService,
-#   MultipleLines, InternetService, OnlineSecurity, OnlineBackup,
-#   DeviceProtection, TechSupport, StreamingTV, StreamingMovies,
-#   Contract, PaperlessBilling, PaymentMethod, MonthlyCharges, TotalCharges
-# ~594k train rows, ~594k test rows
+# Data: ~594k train, ~254k test, 19 features
+# Signal: strong (tenure corr=-0.42, MonthlyCharges corr=+0.27)
+# Class balance: 22.5% positive — well balanced
+# Features: tenure, MonthlyCharges, TotalCharges (continuous)
+#           + 6 binary + 10 low-cardinality categoricals
+#
+# 16h budget allocation:
+# - RealMLP 5h30m: 1h substudy (full data, 2-fold QMC) + 4h30m main TPE (fold_coverage)
+# - TabM    5h30m: 1h substudy (full data, 2-fold QMC) + 4h30m main TPE (fold_coverage)
+# - FTT     3h:    30m substudy (10%, 2-fold QMC) + 2.5h main TPE (fold_coverage, fold_timeout=600s)
+# - CatBoost 40m: GPU, symmetric trees
+# - XGBoost  40m: GPU, level-wise
+# - LightGBM 40m: CPU, leaf-wise
 # =============================================================================
 
+run_name: "ps-s6e3-r1"                         # study names: ps-s6e3-r1__realmlp etc.
+
 data:
-  train_path: "data/ps-s6e3/train.csv"
-  test_path: "data/ps-s6e3/test.csv"
-  extra_data:
-    - path: "data/ps-s6e3/original/WA_Fn-UseC_-Telco-Customer-Churn.csv"
-      drop_columns: [customerID]
-      sample_weight: 10.0
+  train_path: "competitions/ps-s6e3/train.csv"
+  test_path: "competitions/ps-s6e3/test.csv"
   target_column: "Churn"
   id_column: "id"
   task_type: "binary_classification"
-  target_mapping:
-    "Yes": 1
-    "No": 0
 
 cv:
-  n_folds: 5
+  n_folds: 10
   seed: 42
   stratified: true
 
@@ -33,7 +36,7 @@ strategy:
   mode: "manual"
   api:
     provider: "anthropic"
-    model: "claude-sonnet-4-5-20250514"
+    model: "claude-sonnet-4-6"
     env_key: "ANTHROPIC_API_KEY"
     max_tokens: 4096
   manual:
@@ -41,35 +44,44 @@ strategy:
     strategy_input_path: "competitions/ps-s6e3/strategy_output.yaml"
 
 models:
+  - realmlp
+  - tabm
+  - ftt
   - catboost
   - xgboost
   - lightgbm
-  - realmlp
-  - tabm
 
-features: {}
+features:
+  interactions: []
+  ratios: []
+  target_encoding:
+    columns: []
+    pairs: []
+    alpha: 15
+  custom: []
 
 ensemble:
   strategy: "nsga2"
-  meta_models:
-    - xgboost                                # Non-linear meta-learner (trees capture model interactions)
-    - logreg                                 # Linear meta-learner (LogisticRegression with logit features)
-  meta_trials:
-    xgboost: 100                              # More params → more trials
-    logreg: 500                              # Fast, can afford more
-  nsga2_trials: 3000
+  nsga2_trials: 10000
   diversity_weight: 0.3
-  diversity_metric: "ambiguity"              # Weighted prediction variance — directly measures ensemble benefit
+  diversity_metric: "spearman_neff"      # AUC-based metric → Spearman neff
+  meta_models: ["logreg", "xgboost"]
+  meta_cv_folds: 15
+  meta_trials:
+    logreg: 50                           # Reduced vs Porto — avoid meta overfit
+    xgboost: 50                          # Reduced vs Porto — avoid meta overfit
 
 optuna:
   global_seed: 42
   global_timeout: null
+  storage_dir: "competitions/ps-s6e3/results/optuna"   # SQLite per model
   model_timeouts:
-    catboost: "2h"
-    xgboost: "1h30m"
-    lightgbm: "1h30m"
-    realmlp: "2h30m"
-    tabm: "2h"
+    realmlp: "5h30m"                     # 1h substudy + ~4h30m main TPE
+    tabm: "5h30m"                        # 1h substudy + ~4h30m main TPE
+    ftt: "3h"                            # 30m substudy + ~2.5h main TPE, fold_coverage
+    catboost: "40m"                      # GPU, fast convergence
+    xgboost: "40m"                       # GPU, fast convergence
+    lightgbm: "40m"                      # GPU (if gpu build), leaf-wise fast
 
 runtime:
   gpu_check: true

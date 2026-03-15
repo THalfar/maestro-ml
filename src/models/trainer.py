@@ -1096,6 +1096,8 @@ def _run_substudy(
     scaler_choices: list[str] | None,
     global_seed: int,
     monotone_constraints: list[int] | None = None,
+    run_name: str = "run",
+    storage_dir: str | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run a substudy on a stratified data subset to find good starting configs.
 
@@ -1208,9 +1210,21 @@ def _run_substudy(
         substudy_pruner_cfg["type"] = "none"
     pruner = _build_pruner(substudy_pruner_cfg)
 
-    # Study direction
+    # Study direction + persistent storage (substudy gets own __sub DB)
     direction = "minimize" if task_type == "regression" else "maximize"
-    study = optuna.create_study(direction=direction, pruner=pruner)
+    sub_study_name = f"{run_name}__{model_name}__sub"
+    sub_storage: str | None = None
+    if storage_dir:
+        Path(storage_dir).mkdir(parents=True, exist_ok=True)
+        sub_db_path = Path(storage_dir) / f"{sub_study_name}.db"
+        sub_storage = f"sqlite:///{sub_db_path}"
+    study = optuna.create_study(
+        study_name=sub_study_name,
+        storage=sub_storage,
+        direction=direction,
+        pruner=pruner,
+        load_if_exists=True,
+    )
 
     # Pure QMC — no TPE phase
     start_time = time.time()
@@ -1552,6 +1566,8 @@ def run_optuna_study(
             scaler_choices=scaler_choices,
             global_seed=pipeline_config.optuna.global_seed,
             monotone_constraints=monotone_constraints_list,
+            run_name=pipeline_config.run_name,
+            storage_dir=pipeline_config.optuna.storage_dir,
         )
 
         # Scaler lock: replace scaler_choices with single winner
@@ -1606,10 +1622,24 @@ def run_optuna_study(
     pruner_cfg = optuna_cfg.get("pruner", {}) or {}
     pruner = _build_pruner(pruner_cfg)
 
-    # Study direction
+    # Study direction + persistent storage (optional SQLite per model)
     direction = "minimize" if task_type == "regression" else "maximize"
-
-    study = optuna.create_study(direction=direction, pruner=pruner)
+    run_name = pipeline_config.run_name
+    storage_dir = pipeline_config.optuna.storage_dir
+    study_name = f"{run_name}__{model_name}"
+    storage: str | None = None
+    if storage_dir:
+        Path(storage_dir).mkdir(parents=True, exist_ok=True)
+        db_path = Path(storage_dir) / f"{study_name}.db"
+        storage = f"sqlite:///{db_path}"
+        logger.info(f"[{model_name}] Optuna storage: {db_path}")
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction=direction,
+        pruner=pruner,
+        load_if_exists=True,
+    )
 
     # Enqueue pre-specified trials (e.g., known good configs from previous runs
     # or LLM-suggested starting points). These run first, before QMC/TPE.
@@ -1673,6 +1703,10 @@ def run_optuna_study(
     if n_failed > 0:
         summary += f", {n_failed} failed"
     logger.info(summary)
+
+    # Attach in-memory OOF store to the study for downstream access
+    # (e.g., global-mode retrain can skip re-fitting if OOF is cached).
+    study._oof_store = objective.oof_store  # type: ignore[attr-defined]
 
     return study, tracker, trial_oof_store
 
@@ -1937,9 +1971,11 @@ def _create_objective(
               - Check if trial should be pruned:
                 if trial.should_prune(): raise TrialPruned.
            e. Compute overall CV metric from OOF predictions.
-           f. Store OOF predictions via trial.set_user_attr('oof_preds', oof)
-              only if this trial ranks in the top n_top_trials among all
-              completed trials so far (bounds memory usage).
+           f. Store OOF predictions in an in-memory dict (``_oof_store``)
+              keyed by trial number, only if this trial ranks in the top
+              n_top_trials (bounds memory). Attached to the returned
+              objective as ``objective.oof_store`` and to the study as
+              ``study._oof_store`` after optimization.
            g. Return the overall CV metric.
         2. Return the objective function.
     """
@@ -1986,6 +2022,11 @@ def _create_objective(
     dp_warmup = diversity_pruning.get("warmup_entries", 5) if dp_enabled else 5
     dp_n_consecutive = diversity_pruning.get("n_consecutive", 2) if dp_enabled else 2
     dp_score_tolerance = diversity_pruning.get("score_tolerance", 0.001) if dp_enabled else 0.001
+
+    # In-memory OOF storage — avoids Optuna's JSON serialization (ndarray
+    # is not JSON-serializable with SQLite backend).  Top-N bounding is
+    # applied inside the objective so memory stays bounded.
+    _oof_store: dict[int, np.ndarray] = {}
 
     def objective(trial: optuna.Trial) -> float:
         # Scaler selection (Optuna parameter when model needs scaling)
@@ -2276,21 +2317,21 @@ def _create_objective(
                 raise optuna.exceptions.TrialPruned()
 
         overall_metric = _compute_cv_metric(y, oof, task_type)
+
         # Store OOF only for top-N trials to bound memory usage.
-        # At the time of completion, the current trial is RUNNING, so
-        # study.trials only returns previously completed trials — making
-        # this an accurate, race-free rank check.
+        # Uses an in-memory dict (not Optuna user_attrs) to avoid JSON
+        # serialization issues with SQLite storage backend.
         maximize = task_type != "regression"
         prior_values = [
             t.value for t in trial.study.trials
             if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
         ]
         if len(prior_values) < n_top_trials:
-            trial.set_user_attr("oof_preds", oof)
+            _oof_store[trial.number] = oof.copy()
         else:
             cutoff = sorted(prior_values, reverse=maximize)[n_top_trials - 1]
             if (maximize and overall_metric >= cutoff) or (not maximize and overall_metric <= cutoff):
-                trial.set_user_attr("oof_preds", oof)
+                _oof_store[trial.number] = oof.copy()
 
         # Fold-coverage: commit completed trial (must come after all folds finish)
         if trial_oof_store is not None:
@@ -2298,6 +2339,7 @@ def _create_objective(
 
         return overall_metric
 
+    objective.oof_store = _oof_store  # type: ignore[attr-defined]
     return objective
 
 

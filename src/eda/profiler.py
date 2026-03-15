@@ -12,7 +12,10 @@ estimation (seeded). Fully deterministic given the same seed.
 from __future__ import annotations
 
 import itertools
+import logging
+import time
 from collections import deque
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -223,14 +226,14 @@ def _compute_iv_woe(
     for col in feature_df.columns:
         series = feature_df[col]
         col_info = columns_analysis.get(col, {})
-        is_numeric = col_info.get("stats") is not None
+        is_numeric = col_info.get("stats") is not None and pd.api.types.is_numeric_dtype(series)
 
         # Bin the feature
         if is_numeric:
             try:
                 binned = pd.qcut(series.fillna(series.median()), q=n_bins, duplicates="drop")
-            except ValueError:
-                # All same value or very low variance
+            except (ValueError, TypeError):
+                # All same value, very low variance, or non-numeric dtype
                 continue
         else:
             binned = series.fillna("__MISSING__")
@@ -649,13 +652,16 @@ def _screen_interactions(
     ind_corrs: dict[str, float] = {}
     col_arrays: dict[str, np.ndarray] = {}
     for col in candidates:
+        if not pd.api.types.is_numeric_dtype(feature_df[col]):
+            continue
         arr = feature_df[col].fillna(feature_df[col].median()).values.astype(float)
         col_arrays[col] = arr
         corr_mat = np.corrcoef(arr, target_arr)
         ind_corrs[col] = abs(float(corr_mat[0, 1])) if not np.isnan(corr_mat[0, 1]) else 0.0
 
     results = []
-    for a, b in itertools.combinations(candidates, 2):
+    numeric_candidates = list(col_arrays.keys())
+    for a, b in itertools.combinations(numeric_candidates, 2):
         product = col_arrays[a] * col_arrays[b]
         corr_mat = np.corrcoef(product, target_arr)
         interaction_corr = abs(float(corr_mat[0, 1])) if not np.isnan(corr_mat[0, 1]) else 0.0
@@ -991,12 +997,14 @@ def _detect_monotonicity(
             continue
 
         series = feature_df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            continue
         try:
             binned = pd.qcut(
                 series.fillna(series.median()), q=n_bins,
                 duplicates="drop", labels=False,
             )
-        except ValueError:
+        except (ValueError, TypeError):
             continue
 
         if binned.nunique() < 3:
@@ -1175,6 +1183,63 @@ def _compute_target_encoding_preview(
     return dict(sorted(result.items(), key=lambda x: abs(x[1]["encoded_corr"]), reverse=True))
 
 
+def _prepare_eda_features(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    task_type: str,
+    max_samples: int = 50000,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray, list[str], bool]:
+    """Shared data prep for EDA baseline functions.
+
+    Label-encodes categoricals, fills NaN with median, subsamples large
+    datasets, and auto-detects classification vs regression.
+
+    Args:
+        feature_df: Feature columns (raw).
+        target_series: Target series.
+        task_type: ``'binary_classification'`` or ``'regression'``.
+        max_samples: Subsample to this many rows for speed.
+        seed: Random seed for deterministic subsampling.
+
+    Returns:
+        Tuple of ``(X, y, column_names, is_classification)``.
+        Returns ``(empty_array, empty_array, [], False)`` if input is empty.
+    """
+    if feature_df.empty or len(target_series) == 0:
+        return np.empty((0, 0)), np.array([]), [], False
+
+    y = target_series.values.astype(float)
+    cols = list(feature_df.columns)
+
+    # Label-encode categoricals, fill NaN with median
+    arrays: list[np.ndarray] = []
+    for col in cols:
+        series = feature_df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            codes, _ = pd.factorize(series, sort=False)
+            arrays.append(codes.astype(float))
+        else:
+            arrays.append(series.fillna(series.median()).values.astype(float))
+
+    X = np.column_stack(arrays) if arrays else np.empty((len(feature_df), 0))
+    X = np.nan_to_num(X, nan=0.0)
+
+    # Subsample for speed on large datasets
+    rng = np.random.default_rng(seed)
+    if len(X) > max_samples:
+        idx = rng.choice(len(X), max_samples, replace=False)
+        idx.sort()
+        X = X[idx]
+        y = y[idx]
+
+    # Auto-detect: classification if task_type says so AND target has few unique values
+    n_unique = len(np.unique(y[~np.isnan(y)]))
+    is_classification = task_type != "regression" and n_unique <= 30
+
+    return X, y, cols, is_classification
+
+
 def _compute_quick_importance_and_baseline(
     feature_df: pd.DataFrame,
     target_series: pd.Series,
@@ -1203,37 +1268,11 @@ def _compute_quick_importance_and_baseline(
         - baseline_score: float (AUC for classification, RMSE for regression)
         - baseline_metric: str describing the metric used
     """
-    if feature_df.empty or len(target_series) == 0:
+    X, y, cols, is_classification = _prepare_eda_features(
+        feature_df, target_series, task_type, max_samples=max_samples
+    )
+    if len(y) == 0:
         return {"feature_importances": {}, "baseline_score": None, "baseline_metric": "N/A"}
-
-    y = target_series.values.astype(float)
-    cols = list(feature_df.columns)
-
-    # Prepare X: label-encode categoricals, fill NaN
-    arrays: list[np.ndarray] = []
-    for col in cols:
-        series = feature_df[col]
-        if not pd.api.types.is_numeric_dtype(series):
-            codes, _ = pd.factorize(series, sort=False)
-            arrays.append(codes.astype(float))
-        else:
-            arrays.append(series.fillna(series.median()).values.astype(float))
-
-    X = np.column_stack(arrays) if arrays else np.empty((len(feature_df), 0))
-    X = np.nan_to_num(X, nan=0.0)
-
-    # Subsample for speed on large datasets
-    rng = np.random.default_rng(42)
-    if len(X) > max_samples:
-        idx = rng.choice(len(X), max_samples, replace=False)
-        idx.sort()
-        X = X[idx]
-        y = y[idx]
-
-    # Auto-detect: if task_type says classification but target is actually
-    # continuous (many unique values), fall back to regression.
-    n_unique = len(np.unique(y[~np.isnan(y)]))
-    is_classification = task_type != "regression" and n_unique <= 30
 
     if is_classification:
         model_cls = RandomForestClassifier
@@ -1341,40 +1380,13 @@ def _compute_prediction_diversity_probe(
         - ``fisher_z_ci``: 95% CI for mean correlation via Fisher z-transform
         - ``n_samples_used``: how many samples were used (after subsampling)
     """
-    # DISPUTE: Extracting a shared _prepare_X_y() helper modifies two call sites
-    # and risks subtle interface mismatches (subsample logic, column handling).
-    # CLAUDE.md: "skip if risky" for PERF. The duplication is 10 lines — below
-    # the abstraction threshold. Leave as-is.
-    if feature_df.empty or len(target_series) == 0:
+    X, y, _cols, is_classification = _prepare_eda_features(
+        feature_df, target_series, task_type, max_samples=max_samples
+    )
+    if len(y) == 0:
         return {}
 
-    y = target_series.values.astype(float)
-    cols = list(feature_df.columns)
-
-    # Prepare X: label-encode categoricals, fill NaN
-    arrays: list[np.ndarray] = []
-    for col in cols:
-        series = feature_df[col]
-        if not pd.api.types.is_numeric_dtype(series):
-            codes, _ = pd.factorize(series, sort=False)
-            arrays.append(codes.astype(float))
-        else:
-            arrays.append(series.fillna(series.median()).values.astype(float))
-
-    X = np.column_stack(arrays) if arrays else np.empty((len(feature_df), 0))
-    X = np.nan_to_num(X, nan=0.0)
-
-    # Subsample for speed
-    rng = np.random.default_rng(42)
-    if len(X) > max_samples:
-        idx = rng.choice(len(X), max_samples, replace=False)
-        idx.sort()
-        X = X[idx]
-        y = y[idx]
-
     n = len(y)
-    n_unique = len(np.unique(y[~np.isnan(y)]))
-    is_classification = task_type != "regression" and n_unique <= 30
 
     # Collect OOF predictions per seed
     oof_per_seed: list[np.ndarray] = []
@@ -1457,6 +1469,801 @@ def _compute_prediction_diversity_probe(
     }
 
 
+def _run_single_baseline(
+    name: str,
+    model: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    is_classification: bool,
+    n_folds: int,
+    scaler: Any | None = None,
+) -> dict[str, Any]:
+    """Run CV for one baseline model. Returns OOF predictions, score, std, time.
+
+    Args:
+        name: Model name for logging.
+        model: Unfitted sklearn-compatible estimator (will be cloned per fold).
+        X: Feature matrix.
+        y: Target array.
+        is_classification: Whether to use predict_proba.
+        n_folds: Number of CV folds.
+        scaler: If not None, applied per fold (fit on train, transform train+val).
+
+    Returns:
+        Dict with ``oof``, ``score``, ``fold_scores``, ``std``, ``time_sec``,
+        ``feature_importances`` (if available), ``metric``.
+    """
+    from sklearn.base import clone
+
+    if is_classification:
+        cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        split_target = y
+    else:
+        cv = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+        split_target = None
+
+    oof = np.zeros(len(y))
+    importances = np.zeros(X.shape[1]) if X.shape[1] > 0 else np.array([])
+    has_importances = False
+    fold_scores: list[float] = []
+
+    t0 = time.perf_counter()
+    for train_idx, val_idx in cv.split(X, split_target):
+        X_tr, X_val = X[train_idx], X[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+
+        if scaler is not None:
+            from sklearn.base import clone as clone_scaler
+
+            sc = clone_scaler(scaler)
+            X_tr = sc.fit_transform(X_tr)
+            X_val = sc.transform(X_val)
+
+        m = clone(model)
+        m.fit(X_tr, y_tr)
+
+        if is_classification:
+            preds = m.predict_proba(X_val)[:, 1]
+        else:
+            preds = m.predict(X_val)
+        oof[val_idx] = preds
+
+        # Per-fold score
+        if is_classification:
+            try:
+                fold_scores.append(float(roc_auc_score(y_val, preds)))
+            except ValueError:
+                fold_scores.append(0.5)
+        else:
+            fold_scores.append(float(np.sqrt(np.mean((y_val - preds) ** 2))))
+
+        if hasattr(m, "feature_importances_"):
+            importances += m.feature_importances_ / n_folds
+            has_importances = True
+
+    elapsed = time.perf_counter() - t0
+
+    # Overall OOF score
+    if is_classification:
+        try:
+            score = float(roc_auc_score(y, oof))
+        except ValueError:
+            score = 0.5
+        metric = "AUC"
+    else:
+        score = float(np.sqrt(np.mean((y - oof) ** 2)))
+        metric = "RMSE"
+
+    result: dict[str, Any] = {
+        "oof": oof,
+        "score": round(score, 6),
+        "fold_scores": [round(s, 6) for s in fold_scores],
+        "std": round(float(np.std(fold_scores)), 6),
+        "time_sec": round(elapsed, 2),
+        "metric": metric,
+    }
+    if has_importances:
+        result["feature_importances"] = importances
+    return result
+
+
+def _classify_data_personality(
+    scores: dict[str, float],
+    metric: str,
+) -> tuple[str, str]:
+    """Classify data personality from multi-baseline scores.
+
+    Args:
+        scores: ``{model_name: score}`` dict.
+        metric: ``"AUC"`` (higher-is-better) or ``"RMSE"`` (lower-is-better).
+
+    Returns:
+        Tuple of ``(personality, detail_string)``.
+        Personality is one of: ``nn_goldmine``, ``tree_dominant``,
+        ``linear_friendly``, ``all_similar``, ``mixed``.
+    """
+    tree_models = {"random_forest", "lightgbm", "catboost"}
+    nn_models = {"realmlp", "tabm"}
+    linear_models = {"ridge"}
+
+    tree_scores = [scores[k] for k in tree_models if k in scores]
+    nn_scores = [scores[k] for k in nn_models if k in scores]
+    linear_score = next((scores[k] for k in linear_models if k in scores), None)
+
+    if not tree_scores:
+        return "unknown", "No tree models available."
+
+    higher_is_better = metric != "RMSE"
+
+    best_tree = max(tree_scores) if higher_is_better else min(tree_scores)
+    best_nn = (max(nn_scores) if higher_is_better else min(nn_scores)) if nn_scores else None
+
+    # For comparisons: always work in "higher is better" space
+    def gap(a: float, b: float) -> float:
+        return (a - b) if higher_is_better else (b - a)
+
+    parts: list[str] = []
+    personality = "mixed"
+
+    nn_gap = gap(best_nn, best_tree) if best_nn is not None else None
+    linear_gap = gap(best_tree, linear_score) if linear_score is not None else None
+
+    # Check all similar first (takes priority over linear_friendly)
+    all_scores_list = list(scores.values())
+    spread = max(all_scores_list) - min(all_scores_list)
+
+    if nn_gap is not None and nn_gap > 0.005:
+        personality = "nn_goldmine"
+        parts.append(f"Neural nets lead trees by {abs(nn_gap):.4f}.")
+    elif linear_gap is not None and linear_gap > 0.02 and (
+        nn_gap is None or nn_gap < -0.005
+    ):
+        personality = "tree_dominant"
+        parts.append("Tree boosters dominate.")
+    elif spread < 0.005:
+        personality = "all_similar"
+        parts.append("All models perform similarly.")
+    elif linear_gap is not None and linear_gap < 0.005:
+        personality = "linear_friendly"
+        parts.append("Linear model is competitive with trees.")
+
+    if linear_gap is not None:
+        parts.append(f"Linear gap: {linear_gap:.4f}.")
+    if nn_gap is not None:
+        parts.append(f"NN gap vs trees: {nn_gap:+.4f}.")
+    elif nn_scores == []:
+        parts.append("NNs not tested (pytabkit not available or no GPU).")
+
+    return personality, " ".join(parts)
+
+
+def _compute_multi_baseline(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    task_type: str,
+    n_folds: int = 3,
+    max_samples: int = 50000,
+    nn_max_samples: int = 20000,
+    nn_timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Train multiple baseline models and classify data personality.
+
+    Trains up to 6 models (RF, LightGBM, CatBoost, Ridge + RealMLP, TabM)
+    with default hyperparameters on a 3-fold CV. Returns per-model scores,
+    cross-model diversity, and a data personality classification.
+
+    CPU models (RF, LightGBM, CatBoost, Ridge) always run on the full
+    subsample. Neural nets (RealMLP, TabM) run on a smaller subsample
+    with a per-model timeout, and only when pytabkit + torch are available.
+
+    Args:
+        feature_df: Raw feature columns.
+        target_series: Target series.
+        task_type: ``'binary_classification'`` or ``'regression'``.
+        n_folds: Number of CV folds (default 3).
+        max_samples: Subsample for CPU models.
+        nn_max_samples: Smaller subsample for neural nets.
+        nn_timeout: Max seconds per NN model (skip if exceeded).
+
+    Returns:
+        Dict with ``scores``, ``stds``, ``best_model``, ``best_score``,
+        ``metric``, ``feature_importances``, ``linear_gap``,
+        ``cross_model_correlations``, ``training_times_sec``, ``personality``,
+        ``personality_detail``, ``n_samples_used``, ``nn_samples_used``,
+        ``all_importances`` (per-model importances for ghost detector),
+        ``lgbm_models`` (fitted LightGBM models for interaction orchestra).
+    """
+    logger = logging.getLogger(__name__)
+
+    X, y, cols, is_classification = _prepare_eda_features(
+        feature_df, target_series, task_type, max_samples=max_samples
+    )
+    if len(y) == 0:
+        return {
+            "scores": {}, "stds": {}, "best_model": None, "best_score": None,
+            "metric": "N/A", "feature_importances": {},
+            "linear_gap": None, "cross_model_correlations": [],
+            "training_times_sec": {}, "personality": "unknown",
+            "personality_detail": "No data.", "n_samples_used": 0,
+            "nn_samples_used": 0, "all_importances": {}, "lgbm_models": [],
+        }
+
+    # ─── Define CPU baseline models ───────────────────────────────────────
+    cpu_baselines: list[tuple[str, Any, Any]] = []  # (name, model, scaler|None)
+
+    # 1. RandomForest
+    if is_classification:
+        cpu_baselines.append((
+            "random_forest",
+            RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1),
+            None,
+        ))
+    else:
+        cpu_baselines.append((
+            "random_forest",
+            RandomForestRegressor(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1),
+            None,
+        ))
+
+    # 2. LightGBM
+    try:
+        import lightgbm as lgb
+
+        if is_classification:
+            cpu_baselines.append((
+                "lightgbm",
+                lgb.LGBMClassifier(n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1),
+                None,
+            ))
+        else:
+            cpu_baselines.append((
+                "lightgbm",
+                lgb.LGBMRegressor(n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1),
+                None,
+            ))
+    except ImportError:
+        logger.warning("LightGBM not installed — skipping baseline.")
+
+    # 3. CatBoost
+    try:
+        from catboost import CatBoostClassifier, CatBoostRegressor
+
+        if is_classification:
+            cpu_baselines.append((
+                "catboost",
+                CatBoostClassifier(
+                    iterations=200, verbose=0, random_seed=42,
+                    allow_writing_files=False,
+                ),
+                None,
+            ))
+        else:
+            cpu_baselines.append((
+                "catboost",
+                CatBoostRegressor(
+                    iterations=200, verbose=0, random_seed=42,
+                    allow_writing_files=False,
+                ),
+                None,
+            ))
+    except ImportError:
+        logger.warning("CatBoost not installed — skipping baseline.")
+
+    # 4. Ridge / LogisticRegression (with scaling)
+    from sklearn.preprocessing import StandardScaler
+
+    if is_classification:
+        from sklearn.linear_model import LogisticRegression
+
+        cpu_baselines.append((
+            "ridge",
+            LogisticRegression(max_iter=10000, solver="lbfgs", random_state=42),
+            StandardScaler(),
+        ))
+    else:
+        from sklearn.linear_model import Ridge
+
+        cpu_baselines.append((
+            "ridge",
+            Ridge(fit_intercept=True, random_state=42),
+            StandardScaler(),
+        ))
+
+    # ─── Run CPU baselines ────────────────────────────────────────────────
+    results: dict[str, dict[str, Any]] = {}
+    lgbm_models: list[Any] = []
+
+    for name, model, scaler in cpu_baselines:
+        try:
+            res = _run_single_baseline(
+                name, model, X, y, is_classification, n_folds, scaler=scaler
+            )
+            results[name] = res
+            logger.info(
+                "Baseline %s: %s=%.4f (±%.4f) in %.1fs",
+                name, res["metric"], res["score"], res["std"], res["time_sec"],
+            )
+        except Exception as exc:
+            logger.warning("Baseline %s failed: %s", name, exc)
+
+    # Collect LightGBM fitted models for interaction orchestra (refit one for tree dump)
+    if "lightgbm" in results:
+        try:
+            import lightgbm as lgb
+
+            # Fit a single LightGBM on full data for tree structure extraction
+            if is_classification:
+                lgbm_full = lgb.LGBMClassifier(
+                    n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1
+                )
+            else:
+                lgbm_full = lgb.LGBMRegressor(
+                    n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1
+                )
+            lgbm_full.fit(X, y)
+            lgbm_models.append(lgbm_full)
+        except Exception:
+            pass  # interaction orchestra will skip
+
+    # ─── Run NN baselines (optional) ──────────────────────────────────────
+    nn_samples_used = 0
+    try:
+        import pytabkit  # noqa: F401
+        import torch  # noqa: F401
+
+        has_gpu = torch.cuda.is_available()
+        device = "cuda" if has_gpu else "cpu"
+
+        # Prepare smaller subsample for NNs
+        X_nn, y_nn, cols_nn, _ = _prepare_eda_features(
+            feature_df, target_series, task_type,
+            max_samples=nn_max_samples, seed=42,
+        )
+        nn_samples_used = len(y_nn)
+
+        nn_baselines: list[tuple[str, Any]] = []
+
+        # RealMLP
+        try:
+            if is_classification:
+                nn_baselines.append((
+                    "realmlp",
+                    pytabkit.RealMLP_TD_Classifier(
+                        hidden_sizes="rectangular", n_hidden_layers=3, hidden_width=128,
+                        n_epochs=50, n_cv=1, n_refit=0, use_early_stopping=True,
+                        verbosity=0, random_state=42, n_ens=1, device=device,
+                    ),
+                ))
+            else:
+                nn_baselines.append((
+                    "realmlp",
+                    pytabkit.RealMLP_TD_Regressor(
+                        hidden_sizes="rectangular", n_hidden_layers=3, hidden_width=128,
+                        n_epochs=50, n_cv=1, n_refit=0, use_early_stopping=True,
+                        verbosity=0, random_state=42, n_ens=1, device=device,
+                    ),
+                ))
+        except Exception as exc:
+            logger.warning("RealMLP init failed: %s", exc)
+
+        # TabM
+        try:
+            if is_classification:
+                nn_baselines.append((
+                    "tabm",
+                    pytabkit.TabM_D_Classifier(
+                        arch_type="tabm", tabm_k=8, n_blocks=2, d_block=128,
+                        dropout=0.1, num_emb_type="pwl", d_embedding=16,
+                        num_emb_n_bins=32, lr=0.001, weight_decay=0.001,
+                        batch_size=2048, n_epochs=100, patience=16,
+                        n_cv=1, n_refit=0, tfms=["quantile_tabr"],
+                        val_metric_name="1-auc_ovr", verbosity=0,
+                        random_state=42, device=device,
+                    ),
+                ))
+            else:
+                nn_baselines.append((
+                    "tabm",
+                    pytabkit.TabM_D_Regressor(
+                        arch_type="tabm", tabm_k=8, n_blocks=2, d_block=128,
+                        dropout=0.1, num_emb_type="pwl", d_embedding=16,
+                        num_emb_n_bins=32, lr=0.001, weight_decay=0.001,
+                        batch_size=2048, n_epochs=100, patience=16,
+                        n_cv=1, n_refit=0, tfms=["quantile_tabr"],
+                        val_metric_name="rmse", verbosity=0,
+                        random_state=42, device=device,
+                    ),
+                ))
+        except Exception as exc:
+            logger.warning("TabM init failed: %s", exc)
+
+        for name, model in nn_baselines:
+            try:
+                t0 = time.perf_counter()
+                res = _run_single_baseline(
+                    name, model, X_nn, y_nn, is_classification, n_folds
+                )
+                elapsed = time.perf_counter() - t0
+                if elapsed > nn_timeout:
+                    logger.warning("NN baseline %s took %.0fs (timeout=%.0fs) — included but slow.", name, elapsed, nn_timeout)
+                results[name] = res
+                logger.info(
+                    "Baseline %s: %s=%.4f (±%.4f) in %.1fs [%s, %d samples]",
+                    name, res["metric"], res["score"], res["std"],
+                    res["time_sec"], device, nn_samples_used,
+                )
+            except Exception as exc:
+                logger.warning("NN baseline %s failed: %s", name, exc)
+
+    except (ImportError, OSError):
+        logger.info("pytabkit/torch not available — skipping NN baselines.")
+
+    if not results:
+        return {
+            "scores": {}, "stds": {}, "best_model": None, "best_score": None,
+            "metric": "N/A", "feature_importances": {},
+            "linear_gap": None, "cross_model_correlations": [],
+            "training_times_sec": {}, "personality": "unknown",
+            "personality_detail": "All baselines failed.", "n_samples_used": len(y),
+            "nn_samples_used": nn_samples_used, "all_importances": {},
+            "lgbm_models": [],
+        }
+
+    # ─── Aggregate results ────────────────────────────────────────────────
+    scores = {k: v["score"] for k, v in results.items()}
+    stds = {k: v["std"] for k, v in results.items()}
+    times = {k: v["time_sec"] for k, v in results.items()}
+    metric = next(iter(results.values()))["metric"]
+
+    # Best model
+    if metric == "RMSE":
+        best_model = min(scores, key=scores.get)  # type: ignore[arg-type]
+    else:
+        best_model = max(scores, key=scores.get)  # type: ignore[arg-type]
+    best_score = scores[best_model]
+
+    # RF feature importances
+    rf_importances: dict[str, float] = {}
+    if "random_forest" in results and "feature_importances" in results["random_forest"]:
+        imp_arr = results["random_forest"]["feature_importances"]
+        rf_importances = {col: round(float(imp), 6) for col, imp in zip(cols, imp_arr)}
+        rf_importances = dict(sorted(rf_importances.items(), key=lambda x: x[1], reverse=True))
+
+    # All importances (for ghost detector)
+    all_importances: dict[str, dict[str, float]] = {}
+    if rf_importances:
+        all_importances["random_forest"] = rf_importances
+
+    # LightGBM importances (gain-based)
+    if "lightgbm" in results and lgbm_models:
+        try:
+            lgbm_imp = lgbm_models[0].feature_importances_
+            lgbm_imp_dict = {col: round(float(v), 6) for col, v in zip(cols, lgbm_imp)}
+            all_importances["lightgbm"] = lgbm_imp_dict
+        except Exception:
+            pass
+
+    # CatBoost importances
+    if "catboost" in results:
+        try:
+            # Fit a quick CatBoost on full data for importances
+            from catboost import CatBoostClassifier, CatBoostRegressor
+
+            if is_classification:
+                cb_full = CatBoostClassifier(
+                    iterations=200, verbose=0, random_seed=42,
+                    allow_writing_files=False,
+                )
+            else:
+                cb_full = CatBoostRegressor(
+                    iterations=200, verbose=0, random_seed=42,
+                    allow_writing_files=False,
+                )
+            cb_full.fit(X, y)
+            cb_imp = cb_full.get_feature_importance()
+            cb_imp_dict = {col: round(float(v), 6) for col, v in zip(cols, cb_imp)}
+            all_importances["catboost"] = cb_imp_dict
+        except Exception:
+            pass
+
+    # Ridge coefficients as importances
+    if "ridge" in results:
+        try:
+            from sklearn.preprocessing import StandardScaler
+
+            sc = StandardScaler()
+            X_scaled = sc.fit_transform(X)
+            if is_classification:
+                from sklearn.linear_model import LogisticRegression
+
+                ridge_full = LogisticRegression(max_iter=10000, solver="lbfgs", random_state=42)
+            else:
+                from sklearn.linear_model import Ridge as RidgeModel
+
+                ridge_full = RidgeModel(fit_intercept=True, random_state=42)
+            ridge_full.fit(X_scaled, y)
+            coefs = np.abs(ridge_full.coef_.ravel())
+            ridge_imp_dict = {col: round(float(v), 6) for col, v in zip(cols, coefs)}
+            all_importances["ridge"] = ridge_imp_dict
+        except Exception:
+            pass
+
+    # Linear gap
+    tree_models = {"random_forest", "lightgbm", "catboost"}
+    tree_scores = [scores[k] for k in tree_models if k in scores]
+    ridge_score = scores.get("ridge")
+    if tree_scores and ridge_score is not None:
+        if metric == "RMSE":
+            linear_gap = round(ridge_score - min(tree_scores), 6)  # positive = trees better
+        else:
+            linear_gap = round(max(tree_scores) - ridge_score, 6)  # positive = trees better
+    else:
+        linear_gap = None
+
+    # Cross-model OOF correlations (CPU models only — same sample size)
+    cpu_oof = {k: v["oof"] for k, v in results.items() if k in tree_models | {"ridge"}}
+    cross_corr: list[tuple[str, str, float]] = []
+    for (na, oa), (nb, ob) in combinations(cpu_oof.items(), 2):
+        corr = float(np.corrcoef(oa, ob)[0, 1])
+        if np.isnan(corr):
+            corr = 1.0
+        cross_corr.append((na, nb, round(corr, 6)))
+
+    # Data personality
+    personality, personality_detail = _classify_data_personality(scores, metric)
+
+    return {
+        "scores": scores,
+        "stds": stds,
+        "best_model": best_model,
+        "best_score": best_score,
+        "metric": metric,
+        "feature_importances": rf_importances,
+        "linear_gap": linear_gap,
+        "cross_model_correlations": cross_corr,
+        "training_times_sec": times,
+        "personality": personality,
+        "personality_detail": personality_detail,
+        "n_samples_used": len(y),
+        "nn_samples_used": nn_samples_used,
+        "all_importances": all_importances,
+        "lgbm_models": lgbm_models,
+    }
+
+
+def _extract_lgbm_interaction_pairs(
+    lgbm_model: Any,
+    cols: list[str],
+    top_n: int = 15,
+) -> list[dict[str, Any]]:
+    """Extract feature interaction pairs from LightGBM tree structure.
+
+    Walks the tree JSON and records parent→child split feature pairs
+    weighted by the parent node's split gain.
+
+    Args:
+        lgbm_model: Fitted LightGBM model with ``booster_`` attribute.
+        cols: Feature column names.
+        top_n: Number of top interactions to return.
+
+    Returns:
+        List of dicts with ``feature_a``, ``feature_b``, ``interaction_strength``.
+    """
+    from collections import Counter
+
+    try:
+        dump = lgbm_model.booster_.dump_model()
+    except Exception:
+        return []
+
+    feature_names = dump.get("feature_names", [str(i) for i in range(len(cols))])
+    # Map internal names (Column_0, ...) back to user names
+    name_map = {}
+    for i, fn in enumerate(feature_names):
+        if i < len(cols):
+            name_map[fn] = cols[i]
+        else:
+            name_map[fn] = fn
+
+    pair_gains: Counter[tuple[str, str], float] = Counter()
+
+    def _walk_tree(node: dict) -> str | None:
+        """Walk tree recursively, return split feature name of this node."""
+        split_feature = node.get("split_feature")
+        if split_feature is None:
+            return None  # leaf node
+
+        gain = node.get("split_gain", 0.0)
+        parent_name = name_map.get(split_feature, split_feature)
+
+        # Visit children
+        for child_key in ("left_child", "right_child"):
+            child = node.get(child_key)
+            if child and child.get("split_feature") is not None:
+                child_name = name_map.get(child["split_feature"], child["split_feature"])
+                if parent_name != child_name:
+                    pair = tuple(sorted([parent_name, child_name]))
+                    pair_gains[pair] += gain
+                _walk_tree(child)
+
+        return parent_name
+
+    for tree_info in dump.get("tree_info", []):
+        tree = tree_info.get("tree_structure")
+        if tree:
+            _walk_tree(tree)
+
+    # Sort by cumulative gain
+    top_pairs = pair_gains.most_common(top_n)
+    total_gain = sum(pair_gains.values()) or 1.0
+
+    return [
+        {
+            "feature_a": pair[0],
+            "feature_b": pair[1],
+            "interaction_strength": round(gain / total_gain, 6),
+        }
+        for pair, gain in top_pairs
+    ]
+
+
+def _compute_interaction_orchestra(
+    feature_df: pd.DataFrame,
+    target_series: pd.Series,
+    task_type: str,
+    lgbm_models: list[Any] | None = None,
+    n_folds: int = 3,
+    max_samples: int = 50000,
+    top_n: int = 15,
+) -> dict[str, Any]:
+    """Extract top feature interaction pairs from LightGBM tree structure.
+
+    Uses consecutive parent-child split pairs weighted by split gain
+    to identify features that the model frequently uses together.
+
+    Args:
+        feature_df: Raw feature columns.
+        target_series: Target series.
+        task_type: ``'binary_classification'`` or ``'regression'``.
+        lgbm_models: Pre-fitted LightGBM models from multi_baseline.
+            If provided, skips re-training.
+        n_folds: Number of CV folds (only used if lgbm_models is None).
+        max_samples: Subsample size (only used if lgbm_models is None).
+        top_n: Number of top interactions to return.
+
+    Returns:
+        Dict with ``top_interactions`` (list of interaction dicts) and
+        ``method`` describing the extraction approach.
+    """
+    logger = logging.getLogger(__name__)
+    cols = list(feature_df.columns)
+
+    # Use pre-fitted model if available
+    if lgbm_models:
+        interactions = _extract_lgbm_interaction_pairs(lgbm_models[0], cols, top_n)
+        return {"top_interactions": interactions, "method": "lgbm_split_gain_pairs"}
+
+    # Otherwise, train a quick LightGBM
+    try:
+        import lightgbm as lgb
+    except ImportError:
+        logger.info("LightGBM not available — skipping interaction orchestra.")
+        return {"top_interactions": [], "method": "skipped_no_lgbm"}
+
+    X, y, cols, is_classification = _prepare_eda_features(
+        feature_df, target_series, task_type, max_samples=max_samples
+    )
+    if len(y) == 0:
+        return {"top_interactions": [], "method": "skipped_empty_data"}
+
+    try:
+        if is_classification:
+            model = lgb.LGBMClassifier(n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1)
+        else:
+            model = lgb.LGBMRegressor(n_estimators=200, verbosity=-1, random_state=42, n_jobs=-1)
+        model.fit(X, y)
+        interactions = _extract_lgbm_interaction_pairs(model, cols, top_n)
+        return {"top_interactions": interactions, "method": "lgbm_split_gain_pairs"}
+    except Exception as exc:
+        logger.warning("Interaction orchestra failed: %s", exc)
+        return {"top_interactions": [], "method": "failed"}
+
+
+def _compute_ghost_features(
+    all_importances: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    """Detect ghost features by comparing importance rankings across models.
+
+    A ghost feature is important for one model family but irrelevant for
+    others — potentially indicating leakage, MDI bias, or data artifacts.
+
+    Args:
+        all_importances: ``{model_name: {feature: importance}}`` dict.
+            At least 2 models needed for meaningful comparison.
+
+    Returns:
+        Dict with ``ghost_features`` (list of ghost dicts with feature,
+        severity, ranks, explanation) and ``rank_correlations`` (pairwise
+        Spearman rank correlations between model importances).
+    """
+    if len(all_importances) < 2:
+        return {"ghost_features": [], "rank_correlations": {}}
+
+    # Get union of all features
+    all_features = sorted(
+        set().union(*(imp.keys() for imp in all_importances.values()))
+    )
+    n_features = len(all_features)
+    if n_features == 0:
+        return {"ghost_features": [], "rank_correlations": {}}
+
+    # Build rank arrays per model (rank 1 = most important)
+    model_ranks: dict[str, dict[str, int]] = {}
+    model_arrays: dict[str, np.ndarray] = {}
+
+    for model_name, imp_dict in all_importances.items():
+        # Get importance values (0 for missing features)
+        values = np.array([imp_dict.get(f, 0.0) for f in all_features])
+        # Rank: higher importance → lower rank number (1 = best)
+        from scipy.stats import rankdata
+
+        ranks = n_features + 1 - rankdata(values, method="average")
+        model_ranks[model_name] = {f: int(r) for f, r in zip(all_features, ranks)}
+        model_arrays[model_name] = values
+
+    # Detect ghost features
+    ghost_features: list[dict[str, Any]] = []
+    rank_gap_threshold_high = n_features * 0.7
+    rank_gap_threshold_medium = n_features * 0.5
+
+    for feature in all_features:
+        ranks_for_feature = {m: model_ranks[m][feature] for m in model_ranks}
+        min_rank = min(ranks_for_feature.values())
+        max_rank = max(ranks_for_feature.values())
+        gap = max_rank - min_rank
+
+        # Must be important in at least one model (top 10%)
+        if min_rank > max(n_features * 0.1, 1):
+            continue
+
+        if gap >= rank_gap_threshold_medium:
+            best_model = min(ranks_for_feature, key=ranks_for_feature.get)  # type: ignore[arg-type]
+            worst_model = max(ranks_for_feature, key=ranks_for_feature.get)  # type: ignore[arg-type]
+            severity = "high" if gap >= rank_gap_threshold_high else "medium"
+            ghost_features.append({
+                "feature": feature,
+                "severity": severity,
+                "ranks": ranks_for_feature,
+                "explanation": (
+                    f"Rank {min_rank} in {best_model} but rank {max_rank} in "
+                    f"{worst_model} (gap={int(gap)}). "
+                    f"Possible {'MDI bias' if best_model == 'random_forest' else 'model-specific artifact'}."
+                ),
+            })
+
+    # Sort by severity (high first), then by min rank
+    ghost_features.sort(key=lambda x: (0 if x["severity"] == "high" else 1, min(x["ranks"].values())))
+
+    # Pairwise Spearman rank correlations
+    from scipy.stats import spearmanr
+
+    rank_correlations: dict[str, float] = {}
+    model_names = list(all_importances.keys())
+    for i, ma in enumerate(model_names):
+        for mb in model_names[i + 1:]:
+            arr_a = model_arrays[ma]
+            arr_b = model_arrays[mb]
+            corr, _ = spearmanr(arr_a, arr_b)
+            if np.isnan(corr):
+                corr = 0.0
+            rank_correlations[f"{ma}_vs_{mb}"] = round(float(corr), 4)
+
+    return {
+        "ghost_features": ghost_features,
+        "rank_correlations": rank_correlations,
+    }
+
+
 def run_eda(
     train_path: str | Path,
     test_path: str | Path,
@@ -1525,6 +2332,20 @@ def run_eda(
     # Apply target mapping (e.g., {"Presence": 1, "Absence": 0})
     if target_mapping and target_col in train.columns:
         train[target_col] = train[target_col].map(target_mapping)
+
+    # Auto-detect binary string targets (e.g., "Yes"/"No") and map to 0/1
+    if (
+        target_col in train.columns
+        and not pd.api.types.is_numeric_dtype(train[target_col])
+        and task_type == "binary_classification"
+    ):
+        unique_vals = sorted(train[target_col].dropna().unique().tolist())
+        if len(unique_vals) == 2:
+            auto_map = {unique_vals[0]: 0, unique_vals[1]: 1}
+            train[target_col] = train[target_col].map(auto_map).astype(int)
+            logging.getLogger(__name__).info(
+                "Auto-mapped string target %s: %s", target_col, auto_map,
+            )
 
     # Dataset info
     train_mem = train.memory_usage(deep=True).sum() / 1024 / 1024
@@ -1654,9 +2475,25 @@ def run_eda(
         feature_df, target_series, columns_analysis
     )
 
-    # Quick model baseline and feature importances
-    quick_model = _compute_quick_importance_and_baseline(
-        feature_df, target_series, task_type
+    # Multi-model baseline (replaces single RF quick_model)
+    multi_baseline = _compute_multi_baseline(feature_df, target_series, task_type)
+
+    # Backward-compat alias for quick_model
+    quick_model = {
+        "feature_importances": multi_baseline.get("feature_importances", {}),
+        "baseline_score": multi_baseline.get("best_score"),
+        "baseline_metric": multi_baseline.get("metric", "N/A"),
+    }
+
+    # Interaction orchestra (LightGBM split-gain pairs)
+    interaction_orchestra = _compute_interaction_orchestra(
+        feature_df, target_series, task_type,
+        lgbm_models=multi_baseline.get("lgbm_models"),
+    )
+
+    # Ghost feature detector (cross-model importance comparison)
+    ghost_features = _compute_ghost_features(
+        multi_baseline.get("all_importances", {}),
     )
 
     # Prediction diversity probe (multi-seed RF correlation)
@@ -1681,6 +2518,9 @@ def run_eda(
         te_preview=te_preview,
         quick_model=quick_model,
         prediction_diversity=prediction_diversity,
+        multi_baseline=multi_baseline,
+        interaction_orchestra=interaction_orchestra,
+        ghost_features=ghost_features,
     )
 
     # Preprocessing summary: aggregate scaling/transform signals for LLM
@@ -1710,6 +2550,12 @@ def run_eda(
         "te_preview": te_preview,
         "quick_model": quick_model,
         "prediction_diversity": prediction_diversity,
+        "multi_baseline": {
+            k: v for k, v in multi_baseline.items()
+            if k not in ("lgbm_models", "all_importances")
+        },
+        "interaction_orchestra": interaction_orchestra,
+        "ghost_features": ghost_features,
     }
     return report, train, test
 
@@ -1801,6 +2647,9 @@ def _generate_recommendations(
     te_preview: dict[str, dict] | None = None,
     quick_model: dict[str, Any] | None = None,
     prediction_diversity: dict[str, Any] | None = None,
+    multi_baseline: dict[str, Any] | None = None,
+    interaction_orchestra: dict[str, Any] | None = None,
+    ghost_features: dict[str, Any] | None = None,
 ) -> list[str]:
     """Generate LLM-readable recommendation strings from EDA results."""
     recs = []
@@ -2053,6 +2902,51 @@ def _generate_recommendations(
             f"Columns with missing values: {missing_desc}. "
             "Tree-based models handle these natively; linear/KNN models need imputation."
         )
+
+    # ─── Multi-baseline personality ──────────────────────────────────
+    if multi_baseline and multi_baseline.get("personality"):
+        p = multi_baseline["personality"]
+        detail = multi_baseline.get("personality_detail", "")
+        lg = multi_baseline.get("linear_gap")
+
+        recs.append(f"DATA PERSONALITY: {p.upper()}. {detail}")
+
+        if lg is not None and lg > 0.05:
+            recs.append(
+                f"Linear gap = {lg:.4f} — significant non-linear patterns. "
+                "Use interaction features, target encoding, and tree models."
+            )
+        elif lg is not None and lg < 0.005:
+            recs.append(
+                f"Linear gap = {lg:.4f} — linear model is competitive. "
+                "Data may be linearly separable; simpler models may suffice."
+            )
+
+    # ─── Interaction orchestra ──────────────────────────────────
+    if interaction_orchestra:
+        top_int = interaction_orchestra.get("top_interactions", [])
+        if top_int:
+            top5 = top_int[:5]
+            desc = ", ".join(
+                f"{i['feature_a']}*{i['feature_b']}({i['interaction_strength']:.3f})"
+                for i in top5
+            )
+            recs.append(
+                f"Top LightGBM interaction pairs: {desc}. "
+                "Prioritize these for explicit interaction features."
+            )
+
+    # ─── Ghost feature warnings ──────────────────────────────────
+    if ghost_features:
+        ghosts = ghost_features.get("ghost_features", [])
+        high_ghosts = [g for g in ghosts if g["severity"] == "high"]
+        if high_ghosts:
+            names = ", ".join(g["feature"] for g in high_ghosts[:5])
+            recs.append(
+                f"GHOST FEATURES (high severity): {names}. "
+                "Important in one model but irrelevant in others. "
+                "Investigate for leakage, MDI bias, or data artifacts."
+            )
 
     return recs
 
@@ -2774,21 +3668,119 @@ def format_eda_for_llm(eda_report: dict) -> str:
             )
         lines.append("")
 
-    # Quick model baseline and feature importances
-    qm = eda_report.get("quick_model", {})
-    if qm and qm.get("baseline_score") is not None:
+    # Multi-model baseline (personality fingerprint)
+    mb = eda_report.get("multi_baseline", {})
+    if mb and mb.get("scores"):
         lines.append("─" * 50)
-        lines.append("QUICK MODEL BASELINE (RandomForest, 3-fold CV, no feature engineering)")
+        lines.append("MULTI-MODEL BASELINE (3-fold CV, no feature engineering)")
         lines.append("─" * 50)
-        lines.append(f"  Baseline {qm['baseline_metric']}: {qm['baseline_score']:.4f}")
+        personality = mb.get("personality", "unknown").upper()
+        lines.append(f"  Data Personality: {personality}")
+        if mb.get("personality_detail"):
+            lines.append(f"  {mb['personality_detail']}")
         lines.append("")
-        imp = qm.get("feature_importances", {})
+
+        metric = mb.get("metric", "Score")
+        lines.append(f"  {'Model':<20} {metric:<10} {'Std':<10} {'Time'}")
+        lines.append(f"  {'─'*20} {'─'*10} {'─'*10} {'─'*10}")
+        scores = mb.get("scores", {})
+        stds = mb.get("stds", {})
+        times = mb.get("training_times_sec", {})
+        nn_models = {"realmlp", "tabm"}
+        nn_samples = mb.get("nn_samples_used", 0)
+        for model_name in scores:
+            score_val = scores[model_name]
+            std_val = stds.get(model_name, 0)
+            time_val = times.get(model_name, 0)
+            suffix = ""
+            if model_name in nn_models and nn_samples > 0:
+                suffix = f"  ({nn_samples:,} subsample)"
+            lines.append(
+                f"  {model_name:<20} {score_val:<10.4f} {std_val:<10.4f} {time_val:.1f}s{suffix}"
+            )
+        lines.append("")
+
+        if mb.get("best_model"):
+            lines.append(f"  Best: {mb['best_model']} ({metric}={mb['best_score']:.4f})")
+        if mb.get("linear_gap") is not None:
+            lg = mb["linear_gap"]
+            desc = "trees significantly better" if lg > 0.02 else (
+                "trees slightly better" if lg > 0.005 else "linear competitive"
+            )
+            lines.append(f"  Linear gap: {lg:.4f} ({desc})")
+        lines.append("")
+
+        cross_corr = mb.get("cross_model_correlations", [])
+        if cross_corr:
+            lines.append("  Cross-model diversity:")
+            for na, nb, corr in cross_corr:
+                lines.append(f"    {na} vs {nb}: {corr:.4f}")
+            lines.append("")
+
+        imp = mb.get("feature_importances", {})
         if imp:
-            lines.append("  Feature importances (top 15):")
+            lines.append("  Feature importances (RF, top 15):")
             for col, importance in list(imp.items())[:15]:
                 bar = "█" * int(importance * 200)
                 lines.append(f"    {col:<35} {importance:.4f}  {bar}")
             lines.append("")
+    else:
+        # Backward compat: show quick_model if multi_baseline not available
+        qm = eda_report.get("quick_model", {})
+        if qm and qm.get("baseline_score") is not None:
+            lines.append("─" * 50)
+            lines.append("QUICK MODEL BASELINE (RandomForest, 3-fold CV, no feature engineering)")
+            lines.append("─" * 50)
+            lines.append(f"  Baseline {qm['baseline_metric']}: {qm['baseline_score']:.4f}")
+            lines.append("")
+            imp = qm.get("feature_importances", {})
+            if imp:
+                lines.append("  Feature importances (top 15):")
+                for col, importance in list(imp.items())[:15]:
+                    bar = "█" * int(importance * 200)
+                    lines.append(f"    {col:<35} {importance:.4f}  {bar}")
+                lines.append("")
+
+    # Interaction orchestra (LightGBM split-gain pairs)
+    io_data = eda_report.get("interaction_orchestra", {})
+    if io_data and io_data.get("top_interactions"):
+        lines.append("─" * 50)
+        lines.append("INTERACTION ORCHESTRA (LightGBM split-gain pairs)")
+        lines.append("─" * 50)
+        lines.append("  Top interaction candidates:")
+        for i, pair in enumerate(io_data["top_interactions"][:15], 1):
+            lines.append(
+                f"    {i:>2}. {pair['feature_a']} * {pair['feature_b']}"
+                f"   strength={pair['interaction_strength']:.4f}"
+            )
+        lines.append(f"  Method: {io_data.get('method', 'N/A')}")
+        lines.append("")
+
+    # Ghost feature detector (cross-model importance comparison)
+    gf_data = eda_report.get("ghost_features", {})
+    if gf_data:
+        ghosts = gf_data.get("ghost_features", [])
+        rank_corrs = gf_data.get("rank_correlations", {})
+        if ghosts or rank_corrs:
+            lines.append("─" * 50)
+            lines.append("GHOST FEATURE DETECTOR (cross-model importance comparison)")
+            lines.append("─" * 50)
+            if ghosts:
+                for g in ghosts[:10]:
+                    ranks_str = ", ".join(f"{m}={r}" for m, r in g["ranks"].items())
+                    lines.append(
+                        f"  ⚠ {g['feature']} [{g['severity'].upper()}]: {ranks_str}"
+                    )
+                    lines.append(f"    {g['explanation']}")
+                lines.append("")
+            else:
+                lines.append("  No ghost features detected — model importances are consistent.")
+                lines.append("")
+            if rank_corrs:
+                lines.append("  Model importance rank correlations (Spearman):")
+                corr_parts = [f"{k}: {v:.3f}" for k, v in rank_corrs.items()]
+                lines.append(f"    {' | '.join(corr_parts)}")
+                lines.append("")
 
     # Prediction diversity probe (multi-seed RF signal-noise analysis)
     pd_probe = eda_report.get("prediction_diversity", {})

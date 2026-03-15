@@ -81,6 +81,7 @@ class OptunaGlobalConfig:
     global_seed: int = 42
     global_timeout: Optional[int] = None
     model_timeouts: dict[str, int] = field(default_factory=dict)
+    storage_dir: Optional[str] = None  # If set, persist studies to SQLite per model
 
 
 @dataclass
@@ -122,6 +123,7 @@ class PipelineConfig:
         output: Output paths for submissions and results.
     """
 
+    run_name: str = "run"  # Used for study names, log files — e.g. "ps-s6e3-r1"
     train_path: str = ""
     test_path: str = ""
     extra_data: list[dict[str, Any]] = field(default_factory=list)
@@ -352,6 +354,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         global_seed=optuna_raw.get("global_seed", 42),
         global_timeout=parse_timeout(optuna_raw.get("global_timeout", None)),
         model_timeouts=model_timeouts,
+        storage_dir=optuna_raw.get("storage_dir", None),
     )
 
     runtime = RuntimeConfig(
@@ -389,6 +392,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         extra_data_raw = []
 
     return PipelineConfig(
+        run_name=raw.get("run_name", "run"),
         train_path=data.get("train_path", ""),
         test_path=data.get("test_path", ""),
         extra_data=extra_data_raw,
@@ -541,11 +545,13 @@ def save_eda_report(report: dict, path: str | Path) -> None:
 # Logging
 # ---------------------------------------------------------------------------
 
-def setup_logging(verbose: int = 1) -> logging.Logger:
+def setup_logging(verbose: int = 1, log_file: str | None = None) -> logging.Logger:
     """Configure and return the maestro-ml logger.
 
     Args:
         verbose: Logging level. 0=WARNING, 1=INFO, 2=DEBUG.
+        log_file: Optional path to write logs to file (in addition to console).
+                  Parent directory must exist.
 
     Returns:
         Configured Logger instance named 'maestro'.
@@ -554,9 +560,9 @@ def setup_logging(verbose: int = 1) -> logging.Logger:
         1. Map verbose int to logging level (0->WARNING, 1->INFO, 2->DEBUG).
         2. Create or get the 'maestro' logger.
         3. Set the logging level.
-        4. Add a StreamHandler with a formatted output
-           (timestamp, level, message).
-        5. Return the logger.
+        4. Add a StreamHandler with a formatted output (timestamp, level, message).
+        5. If log_file is provided, add a FileHandler with the same format.
+        6. Return the logger.
     """
     level_map = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
     level = level_map.get(verbose, logging.INFO)
@@ -564,17 +570,27 @@ def setup_logging(verbose: int = 1) -> logging.Logger:
     logger = logging.getLogger("maestro")
     logger.setLevel(level)
 
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setLevel(level)
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
     else:
         for h in logger.handlers:
             h.setLevel(level)
+
+    # Add file handler if requested and not already added
+    if log_file is not None:
+        already_has_file = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+        if not already_has_file:
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setLevel(level)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     return logger

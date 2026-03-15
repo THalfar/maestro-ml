@@ -34,9 +34,9 @@ Maestro orchestrates an ensemble of ML models like a conductor leads an orchestr
 - **LLM-guided search** — An LLM analyzes your data profile and narrows the hyperparameter search space before Optuna begins. Informed exploration instead of blind grid search.
 - **Diversity-aware ensembles** — NSGA-II optimizes both accuracy AND model diversity simultaneously, with three configurable diversity metrics: Pearson/Spearman eigenvalue-based effective ensemble size, and ambiguity decomposition. Prevents the common failure mode where ensembles collapse into near-identical models. NSGA-II selected models are then meta-stacked (LogisticRegression or XGBoost, configurable) with Optuna-optimized hyperparameters and compared against the linear blend — the best wins automatically.
 - **Extra data support** — Concat original (non-synthetic) datasets with configurable sample weights. Kaggle Playground Series competitions use synthetic data — weighting the original dataset higher (e.g., 10×) gives models cleaner training signal.
-- **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
+- **Automatic NaN imputation** — Models that don't handle missing values (RealMLP, TabM, FTT, Ridge, etc.) get automatic median imputation fitted on train. Models that handle NaN natively (CatBoost, XGBoost, LightGBM) are left untouched.
 - **LLM-driven preprocessing** — EDA detects scaling signals (skewness, outliers, sentinels, scale range ratios) and the LLM selects appropriate scalers per model. Optuna optimizes scaler choice (StandardScaler, RobustScaler, QuantileTransformer, or none) as a hyperparameter — per fold, fit on train only. Only applied to models that benefit from scaling (Ridge, KNN, SVM, etc.); tree models are left untouched.
-- **Per-fold and fold-coverage selection for neural nets** — RealMLP and TabM offer two retraining-free selection modes. `per_fold`: each fold's model predicts test immediately; a bounded per-fold leaderboard tracks top-N predictions (including pruned trials); after Optuna, composites assembled via rank or NSGA-II with greedy diversity-aware selection. `fold_coverage`: stores complete OOF per trial (no cross-fold mixing), then selects via round-robin fold-best + top mean — avoids calibration errors from mixing trials trained with different scalers or architectures on low-signal data. Both modes support per-fold **rank normalisation** before stitching. Supports **tiered tracker** and **diversity pruning** (per_fold only) for low-signal datasets.
+- **Per-fold and fold-coverage selection for neural nets** — RealMLP, TabM, and FT-Transformer offer two retraining-free selection modes. `per_fold`: each fold's model predicts test immediately; a bounded per-fold leaderboard tracks top-N predictions (including pruned trials); after Optuna, composites assembled via rank or NSGA-II with greedy diversity-aware selection. `fold_coverage`: stores complete OOF per trial (no cross-fold mixing), then selects via round-robin fold-best + top mean — avoids calibration errors from mixing trials trained with different scalers or architectures on low-signal data. Both modes support per-fold **rank normalisation** before stitching. Supports **tiered tracker** and **diversity pruning** (per_fold only) for low-signal datasets.
 - **Substudy warm-start for neural nets** — Runs a fast QMC-only Optuna study on a data subset with fewer CV folds. Two-tier enqueue: `top_n` best configs are always included unconditionally, while the remaining slots use rank-weighted importance sampling (including some bad ones so TPE learns where NOT to search). Also resolves the scaler lock problem: tests all scaler choices cheaply and locks the main study to the best one. ~10× speedup per trial means a 15-minute substudy covers as much hyperparameter space as 2.5 hours of full-data search.
 - **Custom TPE gamma** — Project-wide default TPE configuration with dynamic gamma function (`gamma_ratio=0.15`, `gamma_min=5`). 15% of completed trials are classified as "good", scaling with history size. Per-model overridable via YAML.
 - **YAML-driven** — Every decision is configured in YAML. Hyperparameter ranges, feature engineering plans, model selection, ensemble strategy — all version-controllable and reproducible.
@@ -58,7 +58,7 @@ pip install -r requirements.txt
 | Category | Packages |
 |----------|----------|
 | ML | catboost, xgboost, lightgbm, scikit-learn |
-| Neural Nets | pytabkit (RealMLP, TabM), torch |
+| Neural Nets | pytabkit (RealMLP, TabM, FT-Transformer), torch |
 | Optimization | optuna |
 | Data | pandas, numpy, scipy |
 | LLM | anthropic, openai, python-dotenv |
@@ -185,7 +185,9 @@ Analyzes raw CSVs and produces a structured JSON report:
 - **Monotonicity detection** — features with monotonic target relationships (candidates for `monotone_constraints`)
 - **Categorical cardinality profiles** — entropy and concentration (uniform vs long-tail distribution shape)
 - **Target encoding preview** — OOF-simulated TE correlation and AUC per categorical (concrete go/no-go numbers)
-- **Quick model baseline** — 3-fold RandomForest gives baseline AUC/RMSE and feature importances (sees non-linear effects)
+- **Multi-model baseline** — Trains up to 6 models (RF, LightGBM, CatBoost, Ridge + optional RealMLP, TabM) with defaults on 3-fold CV. Classifies data personality (`nn_goldmine`, `tree_dominant`, `linear_friendly`, `all_similar`, `mixed`), computes linear gap, and cross-model OOF correlations
+- **Interaction orchestra** — Extracts top-15 feature interaction pairs from LightGBM tree structure (parent→child split gain pairs). Guides explicit interaction feature engineering
+- **Ghost feature detector** — Compares importance rankings across model families (RF MDI, LightGBM gain, CatBoost, Ridge coef). Flags features important in one model but irrelevant in others — potential MDI bias, data artifacts, or leakage
 - **Prediction diversity probe** — 3 RF models with different seeds measure signal-noise ratio (SNR): how much predictions vary across samples (signal) vs across seeds (noise). Low SNR (<8) indicates low-signal data where models converge — guides tiered tracker and diversity pruning configuration for neural nets. Uses SNR instead of Pearson correlation (which is misleading for RF on data with noise features)
 - **Fold context** — per-fold train/val sizes for 5-fold and 10-fold CV
 - Concrete LLM-readable recommendations
@@ -246,6 +248,7 @@ The LLM's job is to *narrow* the search space, not to do ML.
 | LightGBM | Special build | callbacks | CPU-only by default |
 | RealMLP | CUDA | patience | PyTorch neural net via pytabkit, rectangular architecture with searchable depth/width, per-fold selection (no retraining), NSGA-II fold-level assembly, tiered tracker + diversity pruning |
 | TabM | CUDA | patience | Parameter-efficient ensemble NN via pytabkit, per-fold selection, tiered tracker + diversity pruning |
+| FT-Transformer | CUDA | es_patience | Transformer for tabular data via pytabkit, O(n^2) attention learns cross-feature dependencies, very different inductive bias → strong diversity boost, per-fold or fold-coverage selection |
 | Ridge / LogReg | CPU | — | Fast linear baseline |
 | Elastic Net | CPU | — | L1+L2 linear regression |
 | KNN | CPU | — | Instance-based, adds diversity |
@@ -269,12 +272,13 @@ maestro-ml/
 │   ├── check_realmlp_gpu.py
 │   └── check_realmlp_params.py
 ├── configs/
-│   ├── models/               # Per-model YAML configs (13 models)
+│   ├── models/               # Per-model YAML configs (14 models)
 │   │   ├── catboost.yaml
 │   │   ├── xgboost.yaml
 │   │   ├── lightgbm.yaml
 │   │   ├── realmlp.yaml
 │   │   ├── tabm.yaml
+│   │   ├── ftt.yaml
 │   │   ├── ridge.yaml
 │   │   ├── elastic_net.yaml
 │   │   ├── knn.yaml
@@ -312,7 +316,7 @@ maestro-ml/
 │   └── porto-seguro-safe-driver-prediction/  # Porto Seguro (low-signal binary)
 │       ├── pipeline.yaml
 │       └── strategy_output.yaml
-├── tests/                    # 775 tests
+├── tests/                    # 859 tests
 ├── requirements.txt
 ├── LICENSE                   # MIT License
 └── CLAUDE.md                 # AI-assisted development instructions
@@ -327,7 +331,7 @@ pytest tests/ -v
 ```
 
 ```
-775 passed, 22 skipped in ~55s
+859 passed, 35 skipped in ~89s
 ```
 
 Tests cover all modules: YAML loading, EDA profiling (including duplicate detection, unseen categories, monotonicity, cardinality profiles, target encoding preview, quick model baseline, prediction diversity probe), feature engineering (including OOF leakage checks), model registry, Optuna training (including sample weights, NaN imputation, substudy warm-start, custom TPE gamma), per-fold selection (PerFoldTracker with vanilla and tiered modes, NSGA-II fold-level assembly, greedy Pareto selection with all 3 diversity metrics, diversity pruning), ensemble blending (meta-model C optimization, XGBoost meta-learner), NSGA-II→meta-model stacking chain, extra data concatenation, LLM strategy parsing, and end-to-end pipeline integration (including extra data scenario).
@@ -340,15 +344,16 @@ Tests cover all modules: YAML loading, EDA profiling (including duplicate detect
 
 | Section | Key Fields | Description |
 |---------|-----------|-------------|
+| `run_name` | string (top-level) | Unique run identifier (e.g. `"ps-s6e3-r1"`). Used for Optuna study names, SQLite DB filenames, and log file. Increment per round: `r1`, `r2`, `r3` |
 | `data` | `train_path`, `test_path`, `target_column`, `id_column`, `task_type`, `target_mapping`, `extra_data` | Dataset paths and metadata. `target_mapping` converts string targets to numeric. `extra_data` concats original datasets with configurable `sample_weight` |
 | `cv` | `n_folds`, `seed`, `stratified` | Cross-validation settings |
 | `strategy` | `mode` (`api`/`manual`), `api.provider`, `api.model` | LLM strategy mode |
 | `models` | List of model names | Which models to train |
 | `features` | `interactions`, `ratios`, `target_encoding`, `custom` | Feature engineering (populated by LLM) |
 | `ensemble` | `strategy`, `meta_models` (`[logreg, xgboost]`), `meta_trials` (int or dict), `diversity_weight`, `diversity_metric` | Ensemble selection. `meta_models` configures which meta-learners to try; `meta_trials` sets Optuna budget per meta-model |
-| `optuna` | `global_seed`, `global_timeout` | Global Optuna settings |
+| `optuna` | `global_seed`, `global_timeout`, `storage_dir`, `model_timeouts` | Global Optuna settings. `storage_dir`: path to persist SQLite DBs per model — enables resume and cross-round trial transfer |
 | `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
-| `output` | `submission_path`, `results_dir`, `save_oof` | Output paths |
+| `output` | `submission_path`, `results_dir`, `save_oof` | Output paths. Logs written to `{results_dir}/logs/{run_name}.log` automatically |
 
 ### Model YAML
 
@@ -419,7 +424,7 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 - [x] Custom TPE gamma function (dynamic 15% good-trial ratio, per-model overridable)
 - [x] Fold-coverage selection mode (complete OOF per trial, round-robin + top-mean assembly, no retraining)
 - [x] Per-fold rank normalisation (removes scale mismatch from mixed-scaler trials)
-- [x] 775 tests with full coverage
+- [x] 859 tests with full coverage
 - [ ] Kaggle Playground Series validation runs
 - [ ] Multi-competition benchmarking
 - [x] Feature importance analysis (quick model baseline in EDA)
@@ -430,7 +435,7 @@ python run.py --config competitions/ps-s6e2/pipeline.yaml
 ## Built With
 
 - **[CatBoost](https://catboost.ai/)** / **[XGBoost](https://xgboost.readthedocs.io/)** / **[LightGBM](https://lightgbm.readthedocs.io/)** — Gradient boosting
-- **[pytabkit](https://github.com/dholzmueller/pytabkit)** — RealMLP and TabM neural networks for tabular data
+- **[pytabkit](https://github.com/dholzmueller/pytabkit)** — RealMLP, TabM, and FT-Transformer neural networks for tabular data
 - **[scikit-learn](https://scikit-learn.org/)** — Linear models, KNN, Random Forest, Extra Trees
 - **[Optuna](https://optuna.org/)** — Bayesian hyperparameter optimization with QMC
 - **[pymoo](https://pymoo.org/)** — Multi-objective optimization (NSGA-II for ensemble diversity and fold-level assembly)

@@ -4,6 +4,7 @@ xgboost>=2.0
 lightgbm>=4.0
 scikit-learn>=1.3
 pytabkit>=1.7
+skorch>=1.0                                # Required by FT-Transformer (pytabkit skorch backend)
 
 # Optimization
 optuna>=3.4

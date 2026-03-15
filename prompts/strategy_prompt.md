@@ -114,6 +114,27 @@ You can enqueue specific hyperparameter configurations to be evaluated **before*
 
 Place `enqueue_trials` under `overrides.<model>.optuna.enqueue_trials` as a list of param dicts. You don't need to specify every parameter — unspecified ones are sampled normally.
 
+### Interpreting the multi-model baseline
+
+The EDA report includes a **MULTI-MODEL BASELINE** section with default-hyperparameter scores from multiple model families. Use this to guide your strategy:
+
+- **Data Personality** tells you the overall character:
+  - `NN_GOLDMINE` — Neural nets outperform trees. Allocate more time budget to RealMLP/TabM. Consider substudy for warm-start.
+  - `TREE_DOMINANT` — Gradient boosting wins. Focus on CatBoost/XGBoost/LightGBM with diverse hyperparameter ranges.
+  - `LINEAR_FRIENDLY` — Ridge/LogReg is competitive. Data may be linearly separable — simpler models may suffice, but add interactions for non-linear models.
+  - `ALL_SIMILAR` — All models perform similarly. Diversity is key — include varied model families.
+  - `MIXED` — No clear winner. Include a broad mix of models.
+
+- **Linear gap**: If large (>0.02), significant non-linear patterns exist — prioritize interaction features, target encoding, and tree models. If small (<0.005), linear model is competitive — simpler features may suffice.
+
+- **Cross-model diversity**: If all baseline correlations >0.99, models converge to similar predictions — diversity management is critical (tiered tracker, diversity pruning).
+
+- **Interaction Orchestra**: The top LightGBM split-gain pairs reveal which feature pairs the model uses together. Prioritize these for explicit `interactions` in your feature engineering.
+
+- **Ghost Features**: Features flagged as ghosts are important in one model family but irrelevant in others. Investigate before including — they may indicate MDI bias (Random Forest), data artifacts, or leakage.
+
+- **Training times**: Use baseline times to estimate Optuna budgets. If LightGBM takes 2s per baseline trial, a 200-trial Optuna study will take ~400s.
+
 ### Feature engineering notes
 
 - **Interactions** (`col_a * col_b`): Best between a strong numeric feature and a binary/ordinal feature.

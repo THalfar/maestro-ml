@@ -1,0 +1,186 @@
+# =============================================================================
+# FT-Transformer (Feature Tokenizer + Transformer) Configuration — maestro-ml
+# =============================================================================
+# Transformer architecture for tabular data via pytabkit. Each feature is
+# tokenized into an embedding, then processed by standard Transformer blocks
+# with multi-head self-attention. Very different inductive bias from MLPs
+# (RealMLP) and parameter-efficient ensembles (TabM) → strong diversity
+# boost for NSGA-II ensemble selection.
+#
+# O(n^2) self-attention makes FTT slower per trial than RealMLP/TabM —
+# fold_timeout is set higher accordingly. Best suited for datasets where
+# feature interactions matter (attention learns cross-feature dependencies).
+#
+# Uses per-fold selection (selection_mode: per_fold) — same as RealMLP/TabM.
+# =============================================================================
+
+name: FT-Transformer
+class_path:
+  binary_classification: pytabkit.FTT_D_Classifier
+  regression: pytabkit.FTT_D_Regressor
+task_types:
+  - binary_classification
+  - regression
+
+gpu:
+  supported: true
+  params:
+    device: cuda
+  fallback:
+    device: cpu
+  install_notes: >
+    Requires PyTorch with CUDA support. pytabkit auto-detects GPU.
+    Install: pip install pytabkit torch --index-url https://download.pytorch.org/whl/cu121
+
+# ---------------------------------------------------------------------------
+# Hyperparameters — Optuna search space
+# ---------------------------------------------------------------------------
+# Based on FT-Transformer paper (Gorishniy et al., 2021) and pytabkit's
+# FTTransformerConstructorMixin defaults. module_d_token step=8 ensures
+# divisibility by n_heads choices [4, 8].
+# ---------------------------------------------------------------------------
+hyperparameters:
+  # --- Architecture ---
+  module_d_token:
+    type: int
+    low: 64
+    high: 256
+    step: 8                                    # divisible by n_heads (4 or 8)
+  module_d_ffn_factor:
+    type: float
+    low: 1.0
+    high: 4.0
+  module_n_layers:
+    type: int
+    low: 1
+    high: 6
+  module_n_heads:
+    type: categorical
+    choices: [4, 8]
+
+  # --- Dropout ---
+  module_attention_dropout:
+    type: float
+    low: 0.0
+    high: 0.5
+  module_ffn_dropout:
+    type: float
+    low: 0.0
+    high: 0.5
+  module_residual_dropout:
+    type: float
+    low: 0.0
+    high: 0.3
+
+  # --- Learning rate & regularization ---
+  lr:
+    type: float
+    low: 0.00001
+    high: 0.001
+    log: true
+  optimizer_weight_decay:
+    type: float
+    low: 0.000001
+    high: 0.01
+    log: true
+  batch_size:
+    type: int
+    low: 256
+    high: 2048
+    log: true
+
+# ---------------------------------------------------------------------------
+# Fixed params — task-type keyed
+# ---------------------------------------------------------------------------
+# max_epochs capped at 200 — es_patience triggers early stopping well before.
+# Same pytabkit API as RealMLP/TabM: n_cv=1, n_refit=0, internal val split.
+# ---------------------------------------------------------------------------
+fixed_params:
+  binary_classification:
+    max_epochs: 200
+    es_patience: 16
+    n_cv: 1
+    n_refit: 0
+    use_checkpoints: false                         # avoid rtdl_checkpoints/ dir in project root
+    val_metric_name: cross_entropy                 # FTT skorch backend supports: cross_entropy | class_error
+    verbose: 0
+    random_state: 42
+  regression:
+    max_epochs: 200
+    es_patience: 16
+    n_cv: 1
+    n_refit: 0
+    use_checkpoints: false                         # avoid rtdl_checkpoints/ dir in project root
+    verbose: 0
+    random_state: 42
+
+training:
+  early_stopping: false                        # FTT handles early stopping internally (es_patience)
+  early_stopping_param: null
+  early_stopping_rounds: null
+  uses_callbacks_for_early_stopping: false
+  seed_param: random_state
+  eval_metric_param: null
+  needs_eval_set: false
+  supports_sample_weight: false
+
+feature_requirements:
+  needs_scaling: false                         # pytabkit preprocesses internally
+  handles_categorical: true                    # auto-detects from DataFrame dtype
+  handles_missing: false
+
+optuna:
+  n_trials: 500                                # fewer than RealMLP/TabM — each trial slower (O(n^2) attention)
+  qmc_warmup_trials: 10
+  timeout: null
+  pruner:
+    type: median                               # median | percentile | hyperband | none
+    n_warmup_steps: 1                          # steps before pruning (fold index)
+    n_startup_trials: 10                       # trials that always complete in full
+  n_top_trials: 15
+  n_seeds: 1
+  selection_mode: per_fold                     # per-fold best selection (no retraining)
+  fold_timeout: 300                            # O(n^2) attention — needs more time than RealMLP (180) / TabM (120)
+  assembly:
+    mode: nsga2                                # "rank" (deterministic) | "nsga2" (diversity-optimized)
+    n_composites: 10                           # how many composites from Pareto front
+    n_generations: 100                         # NSGA-II generations
+    pop_size: 150                              # NSGA-II population size
+    diversity_metric: spearman_neff            # rank-based diversity — suits AUC metric
+    diversity_weight: 0.3                      # fallback if knee-point detection fails
+  # --- fold_coverage mode (recommended for large/low-signal datasets) ---
+  # FTT is slow (O(n^2) attention) — fold_coverage avoids calibration errors
+  # from per-fold stitching and stores complete OOFs per trial.
+  # Override via strategy YAML:
+  #   overrides:
+  #     ftt:
+  #       optuna:
+  #         selection_mode: fold_coverage
+  #         pruner: {type: none}              # pruned trials → no complete OOF
+  #         assembly:
+  #           n_fold_best: 10
+  #           n_mean_best: 5
+  # --- Optional features (disabled by default, enable via strategy YAML) ---
+  # See realmlp.yaml for detailed comments on tracker, diversity_pruning, substudy, tpe.
+  # tracker:
+  #   diversity_mode: tiered
+  #   tier1_size: 5
+  #   tier2_corr_threshold: 0.99
+  # diversity_pruning:
+  #   corr_threshold: 0.995
+  #   warmup_entries: 5
+  #   n_consecutive: 2
+  #   score_tolerance: 0.001
+  # substudy:
+  #   enabled: true
+  #   sample_fraction: 0.10
+  #   n_folds: 3
+  #   timeout: "15m"
+  #   n_trials: 100
+  #   n_enqueue: 20
+  #   temperature: 0.3
+  #   lock_scaler: true
+  # tpe:
+  #   gamma_ratio: 0.15
+  #   gamma_min: 5
+  #   n_startup_trials: 0

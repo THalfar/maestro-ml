@@ -575,3 +575,186 @@ class TestPickBestStrategy:
         assert name == "only"
         np.testing.assert_array_equal(result_preds, test_preds)
         assert score > 0.5  # decent predictions should beat random
+
+
+# ---------------------------------------------------------------------------
+# Meta-model selection logic — comprehensive tests
+# ---------------------------------------------------------------------------
+
+class TestMetaModelSelectionLogic:
+    """Test that pick_best_strategy correctly compares all ensemble strategies:
+    linear blend, rank average, logistic regression meta, XGBoost meta."""
+
+    @pytest.fixture
+    def ensemble_data(self):
+        """Generate OOF/test data for 3 diverse models."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.choice([0, 1], n)
+        # Model A: strong signal
+        oof_a = y * 0.8 + rng.normal(0, 0.15, n)
+        oof_a = np.clip(oof_a, 0.01, 0.99)
+        # Model B: moderate, different signal
+        oof_b = y * 0.6 + rng.normal(0, 0.2, n)
+        oof_b = np.clip(oof_b, 0.01, 0.99)
+        # Model C: weaker
+        oof_c = y * 0.4 + rng.normal(0, 0.25, n)
+        oof_c = np.clip(oof_c, 0.01, 0.99)
+
+        n_test = 50
+        test_a = rng.random(n_test)
+        test_b = rng.random(n_test)
+        test_c = rng.random(n_test)
+
+        return [oof_a, oof_b, oof_c], [test_a, test_b, test_c], y
+
+    def test_meta_logreg_vs_blend(self, ensemble_data):
+        """pick_best_strategy should correctly compare logreg meta vs blend."""
+        oof_list, test_list, y = ensemble_data
+
+        # Build candidates
+        weights = optimize_blend_weights(oof_list, y, n_trials=20, seed=42)
+        blend_oof = np.average(oof_list, axis=0, weights=weights)
+        blend_test = np.average(test_list, axis=0, weights=weights)
+
+        meta_oof, meta_test = train_meta_model(
+            oof_list, test_list, y, n_folds=3, seed=42,
+        )
+
+        candidates = {
+            "blend": (blend_oof, blend_test),
+            "logreg": (meta_oof, meta_test),
+        }
+        result_preds, name, score = pick_best_strategy(candidates, y)
+
+        # Winner should exist and have valid output
+        assert name in ("blend", "logreg")
+        assert result_preds.shape == (50,)
+        assert score > 0.5  # should beat random
+
+    def test_meta_xgb_vs_blend_vs_logreg(self, ensemble_data):
+        """Full comparison: blend vs logreg vs xgb meta."""
+        oof_list, test_list, y = ensemble_data
+
+        # Blend
+        weights = optimize_blend_weights(oof_list, y, n_trials=20, seed=42)
+        blend_oof = np.average(oof_list, axis=0, weights=weights)
+        blend_test = np.average(test_list, axis=0, weights=weights)
+
+        # Rank average
+        rank_oof = rank_average(oof_list)
+        rank_test = rank_average(test_list)
+
+        # Logreg meta
+        meta_oof, meta_test = train_meta_model(
+            oof_list, test_list, y, n_folds=3, seed=42,
+        )
+
+        # XGBoost meta
+        xgb_oof, xgb_test = train_meta_model_xgb(
+            oof_list, test_list, y, n_folds=3, seed=42,
+            xgb_params={"n_estimators": 20, "max_depth": 2, "learning_rate": 0.1},
+        )
+
+        candidates = {
+            "blend": (blend_oof, blend_test),
+            "rank": (rank_oof, rank_test),
+            "logreg": (meta_oof, meta_test),
+            "xgb": (xgb_oof, xgb_test),
+        }
+        result_preds, name, score = pick_best_strategy(candidates, y)
+
+        assert name in candidates
+        assert result_preds.shape == (50,)
+        assert score > 0.5
+
+    def test_meta_model_beats_random_baseline(self, ensemble_data):
+        """Meta-model should outperform a random baseline strategy."""
+        from sklearn.metrics import roc_auc_score
+        oof_list, test_list, y = ensemble_data
+
+        meta_oof, meta_test = train_meta_model(
+            oof_list, test_list, y, n_folds=3, seed=42,
+        )
+
+        rng = np.random.default_rng(0)
+        random_oof = rng.random(len(y))
+        random_test = rng.random(len(test_list[0]))
+
+        candidates = {
+            "meta": (meta_oof, meta_test),
+            "random": (random_oof, random_test),
+        }
+        _, name, _ = pick_best_strategy(candidates, y)
+        assert name == "meta"
+
+    def test_pick_best_strategy_with_optimized_C(self, ensemble_data):
+        """Optimized C meta-model should be a valid candidate."""
+        oof_list, test_list, y = ensemble_data
+
+        meta_oof, meta_test, best_C = optimize_meta_C(
+            oof_list, test_list, y,
+            n_folds=3, seed=42, n_trials=5,
+        )
+
+        weights = optimize_blend_weights(oof_list, y, n_trials=20, seed=42)
+        blend_oof = np.average(oof_list, axis=0, weights=weights)
+        blend_test = np.average(test_list, axis=0, weights=weights)
+
+        candidates = {
+            "blend": (blend_oof, blend_test),
+            "logreg_optimized_C": (meta_oof, meta_test),
+        }
+        result_preds, name, score = pick_best_strategy(candidates, y)
+        assert name in candidates
+        assert score > 0.5
+
+    def test_pick_best_strategy_regression(self):
+        """pick_best_strategy should work for regression tasks."""
+        rng = np.random.default_rng(42)
+        n = 200
+        y = rng.normal(0, 1, n)
+        oof1 = y + rng.normal(0, 0.3, n)
+        oof2 = y + rng.normal(0, 0.5, n)
+        test1 = rng.normal(0, 1, 50)
+        test2 = rng.normal(0, 1, 50)
+
+        # Blend
+        weights = optimize_blend_weights(
+            [oof1, oof2], y, n_trials=10, metric="neg_rmse", seed=42,
+        )
+        blend_oof = oof1 * weights[0] + oof2 * weights[1]
+        blend_test = test1 * weights[0] + test2 * weights[1]
+
+        # Meta
+        meta_oof, meta_test = train_meta_model(
+            [oof1, oof2], [test1, test2], y,
+            n_folds=3, seed=42, task_type="regression",
+        )
+
+        candidates = {
+            "blend": (blend_oof, blend_test),
+            "meta": (meta_oof, meta_test),
+        }
+        result_preds, name, score = pick_best_strategy(
+            candidates, y, metric="neg_rmse",
+        )
+        assert name in candidates
+        assert result_preds.shape == (50,)
+        # neg_rmse: closer to 0 = better
+        assert score <= 0.0
+
+    def test_pick_best_strategy_score_is_on_oof(self, ensemble_data):
+        """Returned score should be computed on OOF preds, not test preds."""
+        from sklearn.metrics import roc_auc_score
+        oof_list, test_list, y = ensemble_data
+
+        perfect_oof = y.astype(float)
+        random_test = np.random.default_rng(0).random(50)
+
+        candidates = {
+            "perfect_oof": (perfect_oof, random_test),
+        }
+        _, name, score = pick_best_strategy(candidates, y)
+        assert name == "perfect_oof"
+        assert score == 1.0  # perfect OOF AUC

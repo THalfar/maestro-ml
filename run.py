@@ -299,9 +299,13 @@ def main(pipeline_yaml_path: str | Path) -> None:
     step_times: dict[str, float] = {}
 
     pipeline_config = load_pipeline_config(pipeline_yaml_path)
-    logger = setup_logging(pipeline_config.runtime.verbose)
+    log_dir = Path(pipeline_config.output.results_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = str(log_dir / f"{pipeline_config.run_name}.log")
+    logger = setup_logging(pipeline_config.runtime.verbose, log_file=log_file)
 
     logger.info(f"Pipeline config loaded: {pipeline_yaml_path}")
+    logger.info(f"Run name: {pipeline_config.run_name} | Log: {log_file}")
     logger.info(
         f"Task: {pipeline_config.task_type} | "
         f"Models: {pipeline_config.models} | "
@@ -384,6 +388,22 @@ def main(pipeline_yaml_path: str | Path) -> None:
             f"EDA complete: train={dataset_info.get('train_shape')}, "
             f"test={dataset_info.get('test_shape')}"
         )
+
+    # Auto-map binary string targets (e.g., "Yes"/"No" → 0/1) when no
+    # target_mapping is configured.  EDA already does this internally, but
+    # the skip-EDA path and any future code paths also need it.
+    target_col = pipeline_config.target_column
+    if (
+        not pipeline_config.target_mapping
+        and target_col in train.columns
+        and not pd.api.types.is_numeric_dtype(train[target_col])
+        and pipeline_config.task_type == "binary_classification"
+    ):
+        unique_vals = sorted(train[target_col].dropna().unique().tolist())
+        if len(unique_vals) == 2:
+            auto_map = {unique_vals[0]: 0, unique_vals[1]: 1}
+            train[target_col] = train[target_col].map(auto_map).astype(int)
+            logger.info(f"Auto-mapped string target '{target_col}': {auto_map}")
 
     # Apply log1p to target (e.g. for RMSLE competitions like House Prices)
     if pipeline_config.log_transform_target:

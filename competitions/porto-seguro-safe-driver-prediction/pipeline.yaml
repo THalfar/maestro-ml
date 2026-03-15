@@ -27,6 +27,8 @@
 # - LightGBM 1h20m: CPU/GPU, leaf-wise growth — fast per trial
 # =============================================================================
 
+run_name: "porto-r2"                            # increment per round: r1, r2, r3...
+
 data:
   train_path: "competitions/porto-seguro-safe-driver-prediction/train.csv"
   test_path: "competitions/porto-seguro-safe-driver-prediction/test.csv"
@@ -81,6 +83,7 @@ ensemble:
 optuna:
   global_seed: 42
   global_timeout: null
+  storage_dir: "competitions/porto-seguro-safe-driver-prediction/results/optuna"
   model_timeouts:
     realmlp: "5h"              # 1h substudy + ~4h main TPE (fold_coverage, 10-fold)
     tabm: "5h"                 # 1h substudy + ~4h main TPE (fold_coverage, 10-fold)
