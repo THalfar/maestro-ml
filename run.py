@@ -18,6 +18,7 @@ import argparse
 import os
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Fix OpenMP DLL conflict (libomp vs libiomp5md) on Windows
@@ -257,7 +258,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
 
         4. Layer 2 — Strategy:
            a. Call generate_strategy(eda_report, pipeline_config).
-           b. Save the strategy to results_dir/strategy.yaml.
+           b. In manual mode, strategy is read from strategy_input_path (not saved again).
            c. Log the strategy summary (selected features, models).
            d. Merge strategy features into pipeline_config.features
               (strategy overrides template defaults).
@@ -301,7 +302,8 @@ def main(pipeline_yaml_path: str | Path) -> None:
     pipeline_config = load_pipeline_config(pipeline_yaml_path)
     log_dir = Path(pipeline_config.output.results_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = str(log_dir / f"{pipeline_config.run_name}.log")
+    _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = str(log_dir / f"{pipeline_config.run_name}_{_ts}.log")
     logger = setup_logging(pipeline_config.runtime.verbose, log_file=log_file)
 
     logger.info(f"Pipeline config loaded: {pipeline_yaml_path}")
@@ -340,23 +342,20 @@ def main(pipeline_yaml_path: str | Path) -> None:
     step_times["gpu_check"] = time.time() - gpu_start
 
     # -------------------------------------------------------------------------
-    # Step 3 & 4: EDA + Strategy (skip EDA if strategy already exists)
+    # Step 3 & 4: EDA + Strategy (skip EDA if eda_report already exists)
     # -------------------------------------------------------------------------
-    # When strategy_input_path already exists (previous run), skip EDA entirely
-    # — it's expensive and the strategy is already generated.
+    # Skip EDA when eda_report.json already exists — preserve the original report.
+    # Never overwrite an existing EDA with an empty placeholder.
     eda_start = time.time()
     strategy_mode = pipeline_config.strategy.mode
     manual_cfg = pipeline_config.strategy.manual or {}
     strategy_input_path = manual_cfg.get("strategy_input_path")
-    skip_eda = (
-        strategy_mode == "manual"
-        and strategy_input_path
-        and Path(strategy_input_path).exists()
-    )
+    eda_report_path = results_dir / "eda_report.json"
+    skip_eda = eda_report_path.exists()
 
     if skip_eda:
         logger.info(
-            f"Strategy file exists: {strategy_input_path} — skipping EDA"
+            f"EDA report exists: {eda_report_path} — skipping EDA"
         )
         # Load data directly (same as run_eda but without analysis)
         train = pd.read_csv(pipeline_config.train_path)
@@ -435,11 +434,9 @@ def main(pipeline_yaml_path: str | Path) -> None:
     logger.info("Layer 2: Generating strategy...")
     strategy = generate_strategy(eda_report, pipeline_config)
 
-    # Save strategy
-    strategy_path = results_dir / "strategy.yaml"
-    with open(strategy_path, "w", encoding="utf-8") as f:
-        yaml.dump(strategy, f, default_flow_style=False, allow_unicode=True)
-    logger.info(f"Strategy saved: {strategy_path}")
+    # Log where the strategy lives (manual mode: already at strategy_input_path)
+    if strategy_input_path:
+        logger.info(f"Strategy loaded from manual mode.")
 
     # Log summary
     strategy_features = strategy.get("features", {}) or {}

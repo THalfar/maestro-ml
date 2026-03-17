@@ -530,6 +530,23 @@ def run_manual_mode(
     from src.utils.io import load_yaml
 
     strategy_path = Path(strategy_path)
+
+    # Agent mode: strategy already written — load and go, no prompting needed.
+    if strategy_path.exists():
+        logger.info(f"Strategy file exists: {strategy_path} — loading directly.")
+        strategy = load_yaml(strategy_path)
+        configs_dir = Path("configs/models")
+        available_models = (
+            [p.stem for p in sorted(configs_dir.glob("*.yaml"))]
+            if configs_dir.exists()
+            else []
+        )
+        try:
+            _validate_strategy(strategy, available_models=available_models)
+        except ValueError as exc:
+            logger.warning(f"Strategy validation warning: {exc}")
+        return strategy
+
     formatted_eda = format_eda_for_llm(eda_report)
 
     print(formatted_eda)

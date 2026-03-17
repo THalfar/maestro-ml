@@ -82,6 +82,7 @@ class OptunaGlobalConfig:
     global_timeout: Optional[int] = None
     model_timeouts: dict[str, int] = field(default_factory=dict)
     storage_dir: Optional[str] = None  # If set, persist studies to SQLite per model
+    persist_trackers: bool = False  # If True, save/load PerFoldTracker & TrialOOFStore to disk
 
 
 @dataclass
@@ -355,6 +356,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         global_timeout=parse_timeout(optuna_raw.get("global_timeout", None)),
         model_timeouts=model_timeouts,
         storage_dir=optuna_raw.get("storage_dir", None),
+        persist_trackers=bool(optuna_raw.get("persist_trackers", False)),
     )
 
     runtime = RuntimeConfig(
@@ -562,6 +564,8 @@ def setup_logging(verbose: int = 1, log_file: str | None = None) -> logging.Logg
         3. Set the logging level.
         4. Add a StreamHandler with a formatted output (timestamp, level, message).
         5. If log_file is provided, add a FileHandler with the same format.
+           Also attach the same FileHandler to the 'optuna' logger so that
+           Optuna trial results (including hyperparameters) are written to file.
         6. Return the logger.
     """
     level_map = {0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}
@@ -592,5 +596,9 @@ def setup_logging(verbose: int = 1, log_file: str | None = None) -> logging.Logg
             file_handler.setLevel(level)
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
+
+            # Also route Optuna's internal logger to the file so trial params appear in the log
+            optuna_logger = logging.getLogger("optuna")
+            optuna_logger.addHandler(file_handler)
 
     return logger

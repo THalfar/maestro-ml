@@ -21,7 +21,8 @@
       "Bash(for f:*)",
       "Bash(do echo:*)",
       "Read(//c/Projektit/maestro-ml/**)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(find /c/Projektit/maestro-ml/competitions/ps-s6e3 -type f -name *.txt -o -name *.json -o -name *.pkl)"
     ]
   }
 }

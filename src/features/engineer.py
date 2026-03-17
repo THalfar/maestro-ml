@@ -164,6 +164,12 @@ def _add_interactions(
         if col_b not in df.columns:
             logger.warning(f"Interaction: column '{col_b}' not found, skipping.")
             continue
+        if not pd.api.types.is_numeric_dtype(df[col_a]) or not pd.api.types.is_numeric_dtype(df[col_b]):
+            logger.warning(
+                f"Interaction: skipping '{col_a}' × '{col_b}' — non-numeric columns. "
+                "Use target_encoding.pairs for categorical interactions."
+            )
+            continue
         df[f"{col_a}__x__{col_b}"] = df[col_a] * df[col_b]
     return df
 

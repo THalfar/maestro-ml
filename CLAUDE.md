@@ -54,9 +54,9 @@ Implement in this order (each module depends on the ones above it):
   CatBoostClassifier(..., train_dir=str(results_dir / "catboost_info"))
   ```
 - **XGBoost:** v2.0+ uses `device="cuda"`, not the deprecated `tree_method="gpu_hist"`.
-- **LightGBM:** Default pip/conda installs are CPU-only. GPU requires special build.
+- **LightGBM:** GPU requires a special build (conda-forge GPU variant or source with `-DUSE_GPU=1`). Config supports GPU with CPU fallback (`gpu_check` detects automatically). GPU LightGBM is installed in this environment (`device: gpu`).
 - **Neural net QMC warmup**: TabM/RealMLP/FTT trials take ~8-10 min each on large datasets (595k rows). Keep `qmc_warmup_trials` low (≤10) to leave budget for TPE exploration. 30 QMC trials can consume the entire timeout.
-- **Neural net fold_timeout**: Per-fold training on large datasets needs generous timeouts. 120s is too aggressive for 595k rows — use 300s+ to avoid excessive trial pruning. FTT needs even more (300s default) due to O(n^2) attention.
+- **Neural net fold_timeout**: Per-fold training on large datasets needs generous timeouts. 120s is too aggressive for 595k rows — use 300s+ to avoid excessive trial pruning. FTT needs even more due to O(n^2) attention: use 600s+ on 595k rows (300s causes nearly all trials to prune on fold 1).
 
 ## Model-Specific Quirks
 
@@ -335,6 +335,23 @@ Custom TPE gamma function is the **project default** for all models. Controls th
 run_name: "ps-s6e3-r1"
 optuna:
   storage_dir: "competitions/ps-s6e3/results/optuna"
+```
+
+### Tracker Persistence (per_fold & fold_coverage modes)
+- Set `optuna.persist_trackers: true` in pipeline YAML to save OOF predictions to disk.
+- Requires `storage_dir` to be set (files go in the same directory as SQLite DBs).
+- Files: `{storage_dir}/{study_name}__tracker.pkl` (PerFoldTracker) and `{study_name}__oof_store.pkl` (TrialOOFStore).
+- **Loaded automatically** when a file exists — previous run's OOF predictions are merged with new trials.
+- **Saved after every trial** via an Optuna callback — interrupt-safe (lose at most one trial's data).
+- Only finalized (committed, non-pruned) trial data is pickled. In-progress partial data is always in RAM.
+- Off by default (`persist_trackers: false`) — backward-compatible.
+- Typical sizes: ~60 MB (PerFoldTracker, 595k rows) and ~240 MB (TrialOOFStore, 100 trials, 595k rows).
+
+```yaml
+run_name: "ps-s6e3-r2"
+optuna:
+  storage_dir: "competitions/ps-s6e3/results/optuna"
+  persist_trackers: true   # Save OOF predictions between interrupted runs
 ```
 
 ### File Logging

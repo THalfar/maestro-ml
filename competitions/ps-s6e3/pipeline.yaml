@@ -9,16 +9,22 @@
 # Features: tenure, MonthlyCharges, TotalCharges (continuous)
 #           + 6 binary + 10 low-cardinality categoricals
 #
-# 16h budget allocation:
-# - RealMLP 5h30m: 1h substudy (full data, 2-fold QMC) + 4h30m main TPE (fold_coverage)
-# - TabM    5h30m: 1h substudy (full data, 2-fold QMC) + 4h30m main TPE (fold_coverage)
-# - FTT     3h:    30m substudy (10%, 2-fold QMC) + 2.5h main TPE (fold_coverage, fold_timeout=600s)
-# - CatBoost 40m: GPU, symmetric trees
-# - XGBoost  40m: GPU, level-wise
-# - LightGBM 40m: CPU, leaf-wise
+# Round 2 — 15h budget (FTT removed: too slow, ~45min/trial on full data)
+# R1 results: RealMLP 0.9153, TabM 0.9145, FTT 0.9138 (only 3 trials)
+# R1 issues: TabM fold_timeout=120s too tight (47% pruned), CatBoost crashed
+#
+# 15h budget allocation (sequential):
+# - RealMLP  2h:  substudy 1h (full data, 2-fold, QMC) → main 2h pure TPE
+# - TabM     3h:  substudy 1h (full data, 2-fold, QMC) → main 3h pure TPE
+# - CatBoost 3h:  GPU, QMC=15
+# - XGBoost  3h:  GPU, QMC=15
+# - LightGBM 3h:  GPU, QMC=15
+# Substudies run first (sequential), not counted in model_timeouts below.
+# Total worst-case: (1+2) + (1+3) + 3+3+3 = 16h. In practice GBMs finish
+# before their timeout due to early stopping → expect ~14-15h.
 # =============================================================================
 
-run_name: "ps-s6e3-r1"                         # study names: ps-s6e3-r1__realmlp etc.
+run_name: "ps-s6e3-r2"                         # study names: ps-s6e3-r2__realmlp etc.
 
 data:
   train_path: "competitions/ps-s6e3/train.csv"
@@ -46,7 +52,6 @@ strategy:
 models:
   - realmlp
   - tabm
-  - ftt
   - catboost
   - xgboost
   - lightgbm
@@ -75,13 +80,13 @@ optuna:
   global_seed: 42
   global_timeout: null
   storage_dir: "competitions/ps-s6e3/results/optuna"   # SQLite per model
+  persist_trackers: true                               # save OOF predictions → interrupt-safe
   model_timeouts:
-    realmlp: "5h30m"                     # 1h substudy + ~4h30m main TPE
-    tabm: "5h30m"                        # 1h substudy + ~4h30m main TPE
-    ftt: "3h"                            # 30m substudy + ~2.5h main TPE, fold_coverage
-    catboost: "40m"                      # GPU, fast convergence
-    xgboost: "40m"                       # GPU, fast convergence
-    lightgbm: "40m"                      # GPU (if gpu build), leaf-wise fast
+    realmlp: "2h"                        # main study after substudy; substudy has own 1h timeout
+    tabm: "3h"                           # main study after substudy; substudy has own 1h timeout
+    catboost: "3h"                       # GPU, full exploration (crashed in R1)
+    xgboost: "3h"                        # GPU, full exploration
+    lightgbm: "3h"                       # GPU, full exploration
 
 runtime:
   gpu_check: true

@@ -41,8 +41,9 @@ hyperparameters:
     type: categorical
     choices: [tabm, tabm-mini]
   tabm_k:
-    type: categorical
-    choices: [8, 16]
+    type: int
+    low: 2
+    high: 16
   n_blocks:
     type: int
     low: 1

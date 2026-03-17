@@ -66,6 +66,23 @@ def _suppress_catboost_gpu_warnings():
         sys.stderr = old_stderr
 
 
+@contextlib.contextmanager
+def _redirect_stdout_to_log(model_name: str):
+    """Redirect stdout to logger.debug() — hides skorch epoch tables from console but keeps them in log file."""
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+        captured = buf.getvalue()
+        if captured.strip():
+            _log = logging.getLogger(__name__)
+            for line in captured.splitlines():
+                _log.debug("[%s stdout] %s", model_name, line)
+
+
 def _free_gpu_memory() -> None:
     """Release GPU memory between model training runs."""
     import gc
@@ -996,6 +1013,33 @@ class PerFoldTracker:
             f"{len(all_trial_nums)}"
         )
 
+    # ------------------------------------------------------------------
+    def save(self, path: str | Path) -> None:
+        """Pickle the tracker to disk for resume between interrupted runs."""
+        import pickle
+        data = {
+            "fold_data": self.fold_data,
+            "n_top": self.n_top,
+            "n_folds": self.n_folds,
+            "maximize": self.maximize,
+            "diversity_mode": self.diversity_mode,
+            "tier1_size": self.tier1_size,
+            "tier2_corr_threshold": self.tier2_corr_threshold,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "PerFoldTracker":
+        """Load a previously saved tracker from disk."""
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        obj = cls.__new__(cls)
+        for k, v in data.items():
+            setattr(obj, k, v)
+        return obj
+
 
 def _compute_cv_metric(y_true: np.ndarray, y_pred: np.ndarray, task_type: str) -> float:
     """Compute the cross-validation metric for a given task type."""
@@ -1347,7 +1391,7 @@ def run_optuna_study(
     gpu: bool = False,
     timeout_override: int | None = None,
     test: pd.DataFrame | None = None,
-) -> tuple[optuna.Study, PerFoldTracker | None]:
+) -> tuple[optuna.Study, PerFoldTracker | None, TrialOOFStore | None]:
     """Run a complete Optuna study for a single model.
 
     Creates an Optuna study with the model's configured pruner, runs
@@ -1359,6 +1403,12 @@ def run_optuna_study(
     During each trial's fold training the model also predicts on test
     data and the tracker records per-fold results (including from
     pruned trials).
+
+    When ``pipeline_config.optuna.persist_trackers`` is True and
+    ``storage_dir`` is set, the tracker/oof_store is loaded from disk
+    at startup (if a file exists) and saved after every trial via an
+    Optuna callback. File names: ``{storage_dir}/{study_name}__tracker.pkl``
+    and ``{storage_dir}/{study_name}__oof_store.pkl``.
 
     Args:
         model_name: Name of the model (must be registered in registry).
@@ -1373,8 +1423,10 @@ def run_optuna_study(
         test: Test DataFrame (required for ``selection_mode: per_fold``).
 
     Returns:
-        Tuple of (study, tracker).  ``tracker`` is None when the model
-        uses global selection mode.
+        3-tuple of (study, tracker, trial_oof_store).  ``tracker`` is None
+        when the model uses global or fold_coverage selection mode.
+        ``trial_oof_store`` is None when the model uses global or per_fold
+        selection mode.
 
     Steps:
         1. Get the model's Optuna config from registry.get_optuna_config.
@@ -1641,6 +1693,37 @@ def run_optuna_study(
         load_if_exists=True,
     )
 
+    # Tracker/OOF-store persistence: load from disk if available
+    persist = pipeline_config.optuna.persist_trackers and bool(storage_dir)
+    tracker_pkl: Path | None = None
+    oof_store_pkl: Path | None = None
+    if persist:
+        tracker_pkl = Path(storage_dir) / f"{study_name}__tracker.pkl"
+        oof_store_pkl = Path(storage_dir) / f"{study_name}__oof_store.pkl"
+        if tracker is not None and tracker_pkl.exists():
+            try:
+                tracker = PerFoldTracker.load(tracker_pkl)
+                n_entries = sum(len(v) for v in tracker.fold_data.values())
+                logger.info(
+                    f"[{model_name}] Loaded PerFoldTracker from {tracker_pkl} "
+                    f"({n_entries} fold entries)"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{model_name}] Failed to load tracker from {tracker_pkl}: {exc}"
+                )
+        if trial_oof_store is not None and oof_store_pkl.exists():
+            try:
+                trial_oof_store = TrialOOFStore.load(oof_store_pkl)
+                logger.info(
+                    f"[{model_name}] Loaded TrialOOFStore from {oof_store_pkl} "
+                    f"({len(trial_oof_store._oof)} committed trials)"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{model_name}] Failed to load oof_store from {oof_store_pkl}: {exc}"
+                )
+
     # Enqueue pre-specified trials (e.g., known good configs from previous runs
     # or LLM-suggested starting points). These run first, before QMC/TPE.
     enqueue_trials = optuna_cfg.get("enqueue_trials", []) or []
@@ -1661,6 +1744,24 @@ def run_optuna_study(
     effective_qmc = 0 if substudy_ran else optuna_cfg["qmc_warmup_trials"]
     tpe_cfg = optuna_cfg.get("tpe", {}) or {}
 
+    # Build persist callback if tracker persistence is enabled
+    persist_callbacks: list = []
+    if persist:
+        _t = tracker
+        _os = trial_oof_store
+        _tp = tracker_pkl
+        _op = oof_store_pkl
+
+        def _persist_callback(
+            _study: optuna.Study, _trial: optuna.trial.FrozenTrial
+        ) -> None:
+            if _t is not None and _tp is not None:
+                _t.save(_tp)
+            if _os is not None and _op is not None:
+                _os.save(_op)
+
+        persist_callbacks = [_persist_callback]
+
     _run_two_phase_study(
         study=study,
         objective=objective,
@@ -1669,6 +1770,7 @@ def run_optuna_study(
         timeout=effective_timeout,
         global_seed=pipeline_config.optuna.global_seed,
         tpe_cfg=tpe_cfg,
+        extra_callbacks=persist_callbacks or None,
     )
 
     try:
@@ -1875,6 +1977,44 @@ class TrialOOFStore:
                 logger.info(
                     f"  Fold {fold_idx}: best trial #{trial_num} score={score:.6f}"
                 )
+
+    # ------------------------------------------------------------------
+    def save(self, path: str | Path) -> None:
+        """Pickle the finalized store to disk for resume between interrupted runs.
+
+        Only committed (non-pruned) trial data is saved; in-progress
+        partial data from the current run is always in RAM anyway.
+        """
+        import pickle
+        data = {
+            "n_samples": self.n_samples,
+            "n_test": self.n_test,
+            "n_folds": self.n_folds,
+            "maximize": self.maximize,
+            "_oof": self._oof,
+            "_test": self._test,
+            "_fold_scores": self._fold_scores,
+            "_mean_scores": self._mean_scores,
+            "_fold_best": self._fold_best,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "TrialOOFStore":
+        """Load a previously saved store from disk."""
+        import pickle
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        obj = cls.__new__(cls)
+        # Restore finalized fields
+        for k, v in data.items():
+            setattr(obj, k, v)
+        # Initialize empty partial dicts (in-progress state is not persisted)
+        obj._partial_oof = {}
+        obj._partial_test = {}
+        obj._partial_fold_scores = {}
+        return obj
 
 
 def _create_objective(
@@ -2175,10 +2315,12 @@ def _create_objective(
 
             fold_start = time.monotonic()
 
-            # Suppress CatBoost C++ GPU memory warnings on stderr
-            _fit_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+            # Suppress CatBoost C++ GPU memory warnings on stderr;
+            # redirect FTT/skorch stdout epoch tables to log file (not console)
+            _stderr_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+            _stdout_ctx = _redirect_stdout_to_log(model_name) if model_name == "ftt" else contextlib.nullcontext()
 
-            with _fit_ctx:
+            with _stderr_ctx, _stdout_ctx:
                 if needs_eval_set:
                     fit_params: dict[str, Any] = {
                         "eval_set": [(X_val, y_val)],
@@ -2364,6 +2506,7 @@ def _run_two_phase_study(
     timeout: int | None = None,
     global_seed: int = 42,
     tpe_cfg: dict[str, Any] | None = None,
+    extra_callbacks: list | None = None,
 ) -> None:
     """Run a two-phase Optuna study: QMC warmup then TPE.
 
@@ -2389,6 +2532,9 @@ def _run_two_phase_study(
             - ``gamma_min`` (int): Minimum good trials floor (default 5).
             - ``n_startup_trials`` (int): TPE startup random trials
               (default 0 since QMC/substudy already explored).
+        extra_callbacks: Optional list of additional Optuna callbacks to
+            run after each trial (e.g. a persist callback that saves the
+            tracker/oof_store to disk for interrupt recovery).
 
     Steps:
         1. Use n_qmc = qmc_warmup_trials directly (0 = skip QMC).
@@ -2405,6 +2551,8 @@ def _run_two_phase_study(
     else:
         n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
         n_tpe = n_trials - n_qmc
+
+    callbacks = [_duration_callback] + (extra_callbacks or [])
 
     start_time = time.time()
 
@@ -2428,7 +2576,7 @@ def _run_two_phase_study(
                 n_trials=n_qmc,
                 timeout=timeout,
                 show_progress_bar=False,
-                callbacks=[_duration_callback],
+                callbacks=callbacks,
             )
             qmc_elapsed = time.time() - start_time
             logger.info(
@@ -2471,7 +2619,7 @@ def _run_two_phase_study(
                 n_trials=n_tpe,
                 timeout=remaining_timeout,
                 show_progress_bar=False,
-                callbacks=[_duration_callback],
+                callbacks=callbacks,
             )
             total_elapsed = time.time() - start_time
             logger.info(
@@ -2640,10 +2788,12 @@ def train_with_config(
                 task_type=task_type, gpu=gpu, results_dir=results_dir
             )
 
-            # Suppress CatBoost C++ GPU memory warnings on stderr
-            _fit_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+            # Suppress CatBoost C++ GPU memory warnings on stderr;
+            # redirect FTT/skorch stdout epoch tables to log file (not console)
+            _stderr_ctx = _suppress_catboost_gpu_warnings() if (model_name == "catboost" and gpu) else contextlib.nullcontext()
+            _stdout_ctx = _redirect_stdout_to_log(model_name) if model_name == "ftt" else contextlib.nullcontext()
 
-            with _fit_ctx:
+            with _stderr_ctx, _stdout_ctx:
                 if needs_eval_set:
                     fit_params: dict[str, Any] = {
                         "eval_set": [(X_fold_val, y_fold_val)],

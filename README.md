@@ -351,7 +351,7 @@ Tests cover all modules: YAML loading, EDA profiling (including duplicate detect
 | `models` | List of model names | Which models to train |
 | `features` | `interactions`, `ratios`, `target_encoding`, `custom` | Feature engineering (populated by LLM) |
 | `ensemble` | `strategy`, `meta_models` (`[logreg, xgboost]`), `meta_trials` (int or dict), `diversity_weight`, `diversity_metric` | Ensemble selection. `meta_models` configures which meta-learners to try; `meta_trials` sets Optuna budget per meta-model |
-| `optuna` | `global_seed`, `global_timeout`, `storage_dir`, `model_timeouts` | Global Optuna settings. `storage_dir`: path to persist SQLite DBs per model — enables resume and cross-round trial transfer |
+| `optuna` | `global_seed`, `global_timeout`, `storage_dir`, `model_timeouts`, `persist_trackers` | Global Optuna settings. `storage_dir`: path to persist SQLite DBs per model — enables resume and cross-round trial transfer. `persist_trackers: true`: also saves `PerFoldTracker`/`TrialOOFStore` OOF predictions to disk (same dir) — allows safe interruption for per_fold and fold_coverage models |
 | `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
 | `output` | `submission_path`, `results_dir`, `save_oof` | Output paths. Logs written to `{results_dir}/logs/{run_name}.log` automatically |
 

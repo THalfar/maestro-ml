@@ -26,6 +26,8 @@ from src.models.trainer import (
     get_top_configs,
     run_optuna_study,
     train_with_config,
+    PerFoldTracker,
+    TrialOOFStore,
 )
 from src.utils.io import PipelineConfig, CVConfig, OptunaGlobalConfig, OutputConfig
 
@@ -5312,3 +5314,150 @@ class TestSubstudyScalerLock:
         )
         # Should have at least top_n params (or as many as completed)
         assert len(enqueue_params) >= 1  # at least some trials completed
+
+
+# ---------------------------------------------------------------------------
+# PerFoldTracker and TrialOOFStore — save/load persistence
+# ---------------------------------------------------------------------------
+
+class TestPerFoldTrackerSaveLoad:
+    """Round-trip save/load tests for PerFoldTracker persistence."""
+
+    def _make_tracker(self) -> PerFoldTracker:
+        rng = np.random.default_rng(0)
+        tracker = PerFoldTracker(n_top=3, n_folds=2, maximize=True)
+        for fold_idx in range(2):
+            for trial_num in range(4):
+                n_val = 10
+                tracker.update(
+                    fold_idx=fold_idx,
+                    score=rng.random(),
+                    val_preds=rng.random(n_val).astype(np.float32),
+                    val_idx=np.arange(n_val),
+                    test_preds=rng.random(5).astype(np.float32),
+                    trial_number=trial_num,
+                    params={"C": trial_num},
+                )
+        return tracker
+
+    def test_save_creates_file(self, tmp_path):
+        tracker = self._make_tracker()
+        pkl = tmp_path / "tracker.pkl"
+        tracker.save(pkl)
+        assert pkl.exists()
+
+    def test_load_restores_attributes(self, tmp_path):
+        tracker = self._make_tracker()
+        pkl = tmp_path / "tracker.pkl"
+        tracker.save(pkl)
+        loaded = PerFoldTracker.load(pkl)
+
+        assert loaded.n_top == tracker.n_top
+        assert loaded.n_folds == tracker.n_folds
+        assert loaded.maximize == tracker.maximize
+        assert loaded.diversity_mode == tracker.diversity_mode
+
+    def test_load_restores_fold_data_shapes(self, tmp_path):
+        tracker = self._make_tracker()
+        pkl = tmp_path / "tracker.pkl"
+        tracker.save(pkl)
+        loaded = PerFoldTracker.load(pkl)
+
+        for fold_idx in range(tracker.n_folds):
+            assert len(loaded.fold_data[fold_idx]) == len(tracker.fold_data[fold_idx])
+            for orig, rest in zip(tracker.fold_data[fold_idx], loaded.fold_data[fold_idx]):
+                np.testing.assert_array_equal(orig.val_preds, rest.val_preds)
+                np.testing.assert_array_equal(orig.test_preds, rest.test_preds)
+                assert orig.trial_number == rest.trial_number
+                assert orig.score == rest.score
+
+    def test_tiered_mode_round_trip(self, tmp_path):
+        tracker = PerFoldTracker(
+            n_top=4, n_folds=1, maximize=True,
+            diversity_mode="tiered", tier1_size=2, tier2_corr_threshold=0.95,
+        )
+        rng = np.random.default_rng(1)
+        for i in range(5):
+            tracker.update(0, rng.random(), rng.random(8).astype(np.float32),
+                           np.arange(8), rng.random(4).astype(np.float32), i, {})
+        pkl = tmp_path / "tiered.pkl"
+        tracker.save(pkl)
+        loaded = PerFoldTracker.load(pkl)
+        assert loaded.diversity_mode == "tiered"
+        assert loaded.tier1_size == 2
+        assert loaded.tier2_corr_threshold == 0.95
+
+
+class TestTrialOOFStoreSaveLoad:
+    """Round-trip save/load tests for TrialOOFStore persistence."""
+
+    def _make_store(self) -> TrialOOFStore:
+        rng = np.random.default_rng(2)
+        store = TrialOOFStore(n_samples=20, n_test=8, n_folds=2, maximize=True)
+        for trial_num in range(3):
+            for fold_idx, val_idx in enumerate([np.arange(10), np.arange(10, 20)]):
+                store.update(
+                    trial_num=trial_num,
+                    fold_idx=fold_idx,
+                    fold_score=rng.random(),
+                    val_preds=rng.random(10).astype(np.float32),
+                    val_idx=val_idx,
+                    test_preds=rng.random(8).astype(np.float32),
+                )
+            store.commit_trial(trial_num)
+        return store
+
+    def test_save_creates_file(self, tmp_path):
+        store = self._make_store()
+        pkl = tmp_path / "oof_store.pkl"
+        store.save(pkl)
+        assert pkl.exists()
+
+    def test_load_restores_committed_trials(self, tmp_path):
+        store = self._make_store()
+        pkl = tmp_path / "oof_store.pkl"
+        store.save(pkl)
+        loaded = TrialOOFStore.load(pkl)
+
+        assert set(loaded._oof.keys()) == set(store._oof.keys())
+        assert loaded.n_samples == store.n_samples
+        assert loaded.n_test == store.n_test
+        assert loaded.n_folds == store.n_folds
+        assert loaded.maximize == store.maximize
+
+    def test_load_restores_oof_arrays(self, tmp_path):
+        store = self._make_store()
+        pkl = tmp_path / "oof_store.pkl"
+        store.save(pkl)
+        loaded = TrialOOFStore.load(pkl)
+
+        for trial_num in store._oof:
+            np.testing.assert_array_equal(loaded._oof[trial_num], store._oof[trial_num])
+            np.testing.assert_array_equal(loaded._test[trial_num], store._test[trial_num])
+            assert loaded._mean_scores[trial_num] == store._mean_scores[trial_num]
+
+    def test_load_clears_partial_state(self, tmp_path):
+        store = self._make_store()
+        # Add a partial (uncommitted) trial
+        store.update(99, 0, 0.5, np.zeros(10), np.arange(10), np.zeros(8))
+        pkl = tmp_path / "oof_store.pkl"
+        store.save(pkl)
+        loaded = TrialOOFStore.load(pkl)
+
+        # Partial trial should not be in loaded store
+        assert 99 not in loaded._oof
+        assert loaded._partial_oof == {}
+        assert loaded._partial_test == {}
+        assert loaded._partial_fold_scores == {}
+
+    def test_select_works_after_load(self, tmp_path):
+        store = self._make_store()
+        pkl = tmp_path / "oof_store.pkl"
+        store.save(pkl)
+        loaded = TrialOOFStore.load(pkl)
+
+        composites = loaded.select(n_fold_best=2, n_mean_best=1)
+        assert len(composites) >= 1
+        for c in composites:
+            assert c["oof_preds"].shape == (20,)
+            assert c["test_preds"].shape == (8,)
