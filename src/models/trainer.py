@@ -3161,6 +3161,19 @@ def run_all_studies(
                     f"[{model_name}] Per-fold assembly ({assembly_mode}): "
                     f"{len(all_oof)} composites (no retraining needed)"
                 )
+                # Log actual assembled OOF AUC (vs optimistic avg_score from tracker)
+                if all_oof and task_type != "regression":
+                    from sklearn.metrics import roc_auc_score
+                    assembled_aucs = [
+                        roc_auc_score(labels, oof) for oof in all_oof
+                    ]
+                    logger.info(
+                        f"[{model_name}] Assembled OOF AUC: "
+                        f"best={max(assembled_aucs):.6f}, "
+                        f"mean={sum(assembled_aucs)/len(assembled_aucs):.6f}, "
+                        f"worst={min(assembled_aucs):.6f} "
+                        f"(tracker avg_score={composites[0]['avg_score']:.6f})"
+                    )
 
             else:
                 # --- Global path: retrain top configs (existing behaviour) ---
