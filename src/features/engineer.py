@@ -208,6 +208,11 @@ def _add_ratios(
         if den not in df.columns:
             logger.warning(f"Ratio: column '{den}' not found, skipping.")
             continue
+        if not pd.api.types.is_numeric_dtype(df[num]) or not pd.api.types.is_numeric_dtype(df[den]):
+            logger.warning(
+                f"Ratio: skipping '{num}' / '{den}' — non-numeric columns."
+            )
+            continue
         df[f"{num}__div__{den}"] = df[num] / (df[den] + 1e-8)
     return df
 
@@ -278,11 +283,15 @@ def _add_target_encoding(
         oof = np.full(len(train_df), np.nan)
         target = train_df[target_col].values
 
-        # Determine split arguments
+        # Determine split arguments — StratifiedKFold and KFold both accept y;
+        # fall back only for custom splitters that don't accept a y argument.
         try:
             splits = list(cv_folds.split(train_df, target))
-        except Exception:
+        except TypeError:
             splits = list(cv_folds.split(train_df))
+
+        def _smooth(count: float, mean: float, gm: float) -> float:
+            return (count * mean + alpha * gm) / (count + alpha)
 
         for train_idx, val_idx in splits:
             # Stats and mean from training fold only — no label leakage into val rows.
@@ -292,9 +301,6 @@ def _add_target_encoding(
                 fold_train.groupby(col_name)[target_col]
                 .agg(["count", "mean"])
             )
-
-            def _smooth(count: float, mean: float, gm: float) -> float:
-                return (count * mean + alpha * gm) / (count + alpha)
 
             # Pre-build smoothed encoding dict for O(1) lookup per value.
             encode_map = {

@@ -79,6 +79,14 @@ class TestAddInteractions:
         assert "num_a__x__num_b" in result.columns
         assert "num_a__x__num_a" in result.columns
 
+    def test_non_numeric_columns_skipped(self, train_df: pd.DataFrame):
+        """Non-numeric column pairs should be skipped with a warning."""
+        result = _add_interactions(train_df, [["cat_x", "num_a"]])
+        assert "cat_x__x__num_a" not in result.columns
+        # Both non-numeric
+        result2 = _add_interactions(train_df, [["cat_x", "cat_y"]])
+        assert "cat_x__x__cat_y" not in result2.columns
+
 
 # ---------------------------------------------------------------------------
 # _add_ratios

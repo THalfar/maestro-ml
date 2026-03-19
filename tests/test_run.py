@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from run import main, _parse_args, _concat_extra_data
+from run import main, _parse_args, _concat_extra_data, _generate_round_report
 
 
 # ---------------------------------------------------------------------------
@@ -1078,3 +1078,170 @@ class TestConcatExtraData:
         result = _concat_extra_data(train, cfg, logging.getLogger("test"))
         assert result["_sample_weight"].tolist() == [1.0, 2.0, 5.0]
         assert result["_is_original"].tolist() == [False, True, True]
+
+
+class TestGenerateRoundReport:
+    """Tests for _generate_round_report() in run.py."""
+
+    def _minimal_config(self) -> "PipelineConfig":
+        """Return a minimal PipelineConfig with no storage_dir (standalone-safe)."""
+        from src.utils.io import PipelineConfig, OutputConfig, OptunaGlobalConfig
+        cfg = PipelineConfig()
+        cfg.run_name = "test-run"
+        cfg.models = ["catboost", "xgboost"]
+        cfg.task_type = "binary_classification"
+        cfg.output = OutputConfig(submission_path="sub.csv", results_dir="results/")
+        cfg.optuna = OptunaGlobalConfig(storage_dir=None)
+        return cfg
+
+    def test_returns_string(self):
+        cfg = self._minimal_config()
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert isinstance(report, str)
+        assert len(report) > 100
+
+    def test_all_section_headers_present(self):
+        cfg = self._minimal_config()
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "1. RUN HISTORY" in report
+        assert "2. SCORE TRAJECTORY" in report
+        assert "3. PRUNING ANALYSIS" in report
+        assert "4. HYPERPARAMETER CONVERGENCE" in report
+        assert "5. FOLD-LEVEL SCORE MATRIX" in report
+        assert "6. ASSEMBLY DIAGNOSTICS" in report
+        assert "7. SUBSTUDY" in report
+        assert "8. CROSS-MODEL DIVERSITY" in report
+        assert "9. ENSEMBLE RESULT" in report
+        assert "10. CONFIG SIMILARITY" in report
+        assert "11. OOF-LB GAP" in report
+
+    def test_run_name_in_header(self):
+        cfg = self._minimal_config()
+        cfg.run_name = "my-run-xyz"
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "my-run-xyz" in report
+
+    def test_ensemble_score_in_report(self):
+        cfg = self._minimal_config()
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=0.91620, chosen_strategy="nsga2+blend",
+        )
+        assert "0.916200" in report
+        assert "nsga2+blend" in report
+
+    def test_lb_score_shown_when_set(self):
+        cfg = self._minimal_config()
+        cfg.output.lb_score = 0.91345
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=0.91620, chosen_strategy="blend",
+        )
+        assert "0.91345" in report
+        assert "Gap" in report
+
+    def test_lb_score_absent_shows_instructions(self):
+        cfg = self._minimal_config()
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "output.lb_score" in report
+
+    def test_writes_file_when_output_path_given(self, tmp_path: Path):
+        cfg = self._minimal_config()
+        out = tmp_path / "report.txt"
+        _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+            output_path=out,
+        )
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_fold_score_matrix_shown_with_model_results(self):
+        cfg = self._minimal_config()
+        model_results = {
+            "catboost": {
+                "oof_preds": [np.zeros(20)], "test_preds": [],
+                "best_fold_scores": [0.91, 0.92, 0.90],
+                "selection_mode": "global", "n_committed": None,
+                "n_composites_raw": None, "hp_importance": {},
+            }
+        }
+        report = _generate_round_report(
+            model_results=model_results, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "0.9100" in report or "0.91" in report
+        assert "catboost" in report
+
+    def test_assembly_diagnostics_fold_coverage(self):
+        cfg = self._minimal_config()
+        model_results = {
+            "tabm": {
+                "oof_preds": [np.zeros(20)] * 3, "test_preds": [],
+                "best_fold_scores": [], "selection_mode": "fold_coverage",
+                "n_committed": 15, "n_composites_raw": None, "hp_importance": {},
+            }
+        }
+        report = _generate_round_report(
+            model_results=model_results, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "fold_coverage" in report
+        assert "committed=15" in report
+        assert "selected=3" in report
+
+    def test_assembly_diagnostics_per_fold_with_dedup(self):
+        cfg = self._minimal_config()
+        model_results = {
+            "realmlp": {
+                "oof_preds": [np.zeros(20)] * 2, "test_preds": [],
+                "best_fold_scores": [], "selection_mode": "per_fold",
+                "n_committed": None, "n_composites_raw": 10, "hp_importance": {},
+            }
+        }
+        report = _generate_round_report(
+            model_results=model_results, pipeline_config=cfg,
+            all_oof=[], model_labels=[], y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "per_fold" in report
+        assert "raw=10" in report
+        assert "dedup=2" in report
+
+    def test_diversity_matrix_with_multiple_models(self):
+        np.random.seed(42)
+        n = 100
+        oof1 = np.random.rand(n)
+        oof2 = np.random.rand(n)
+        cfg = self._minimal_config()
+        report = _generate_round_report(
+            model_results={}, pipeline_config=cfg,
+            all_oof=[oof1, oof2],
+            model_labels=["catboost_0", "xgboost_0"],
+            y_true=None,
+            metric="roc_auc", ensemble_score=None, chosen_strategy=None,
+        )
+        assert "N_eff" in report
+        assert "catboost" in report
+        assert "xgboost" in report

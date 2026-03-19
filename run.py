@@ -228,6 +228,865 @@ def _score_fn(y_true: np.ndarray, y_pred: np.ndarray, metric: str) -> float:
     return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
+def _generate_round_report(
+    model_results: dict,
+    pipeline_config: "PipelineConfig",
+    all_oof: "list[np.ndarray]",
+    model_labels: "list[str]",
+    y_true: "np.ndarray | None",
+    metric: str,
+    ensemble_score: "float | None",
+    chosen_strategy: "str | None",
+    nsga2_info: "dict | None" = None,
+    output_path: "str | Path | None" = None,
+) -> str:
+    """Generate a comprehensive round report from Optuna DBs and model results.
+
+    Covers 11 sections: run history, score trajectory, pruning analysis,
+    HP convergence, fold-level score matrix, assembly diagnostics,
+    substudy→main transfer, cross-model diversity, ensemble result,
+    GBM config similarity, and OOF-LB gap.
+
+    Args:
+        model_results: Dict from run_all_studies() — pass {} for standalone mode.
+        pipeline_config: Loaded pipeline configuration.
+        all_oof: Per-model averaged OOF arrays — pass [] for standalone mode.
+        model_labels: Labels corresponding to all_oof entries.
+        y_true: Ground-truth target array — None in standalone mode.
+        metric: Scoring metric string ("roc_auc" or "neg_rmse").
+        ensemble_score: Final ensemble OOF score — None in standalone mode.
+        chosen_strategy: Ensemble strategy name — None in standalone mode.
+        nsga2_info: Dict from run_nsga2_ensemble() — None when not NSGA-II.
+        output_path: If provided, write the report to this file.
+
+    Returns:
+        Full report as a string.
+    """
+    import optuna as _optuna
+    from math import ceil
+
+    lines: list[str] = []
+    storage_dir = pipeline_config.optuna.storage_dir
+    run_name = pipeline_config.run_name
+    models_order = list(model_results.keys()) if model_results else list(pipeline_config.models)
+    maximize = (metric == "roc_auc")
+
+    def _sep(char: str = "=", width: int = 78) -> str:
+        return char * width
+
+    def _h(title: str) -> str:
+        return f"\n{_sep()}\n{title}\n{_sep('-')}"
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(_sep())
+    lines.append(f"ROUND REPORT — {run_name} — {now_str}")
+    lines.append(_sep())
+
+    # ------------------------------------------------------------------
+    # Load Optuna studies from DB (used by multiple sections)
+    # ------------------------------------------------------------------
+    _studies: dict[str, "_optuna.Study"] = {}
+    _sub_studies: dict[str, "_optuna.Study"] = {}
+    if storage_dir:
+        for mn in models_order:
+            db = Path(storage_dir) / f"{run_name}__{mn}.db"
+            if db.exists():
+                try:
+                    _studies[mn] = _optuna.load_study(
+                        study_name=f"{run_name}__{mn}",
+                        storage=f"sqlite:///{db}",
+                    )
+                except Exception:
+                    pass
+            sub_db = Path(storage_dir) / f"{run_name}__{mn}__sub.db"
+            if sub_db.exists():
+                try:
+                    _sub_studies[mn] = _optuna.load_study(
+                        study_name=f"{run_name}__{mn}__sub",
+                        storage=f"sqlite:///{sub_db}",
+                    )
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Section 1: Run History
+    # ------------------------------------------------------------------
+    lines.append(_h("1. RUN HISTORY"))
+    hdr = f"  {'model':<14} {'best':>8}  {'complete':>8}  {'pruned':>7}  {'failed':>6}  {'sec/trial':>9}  {'elapsed':>10}  sub_trials  sub_best"
+    lines.append(hdr)
+    lines.append("  " + "-" * (len(hdr) - 2))
+    for mn in models_order:
+        study = _studies.get(mn)
+        res = model_results.get(mn, {})
+        if study is None and not res:
+            lines.append(f"  {mn:<14}  (no data)")
+            continue
+        if study is not None:
+            trials = study.trials
+            n_complete = sum(1 for t in trials if t.state == _optuna.trial.TrialState.COMPLETE)
+            n_pruned = sum(1 for t in trials if t.state == _optuna.trial.TrialState.PRUNED)
+            n_failed = len(trials) - n_complete - n_pruned
+            try:
+                best_val = study.best_value
+            except ValueError:
+                best_val = float("nan")
+        else:
+            n_complete = res.get("n_trials", 0)
+            n_pruned = 0
+            n_failed = 0
+            best_val = res.get("top_configs", [{}])[0].get("value", float("nan")) if res.get("top_configs") else float("nan")
+
+        # sec/trial: prefer in-memory result, fall back to DB timestamps
+        avg_t = res.get("avg_trial_time", 0.0)
+        if avg_t == 0.0 and study is not None:
+            completed_trials = [
+                t for t in study.trials
+                if t.state == _optuna.trial.TrialState.COMPLETE
+                and t.datetime_start is not None
+                and t.datetime_complete is not None
+            ]
+            if completed_trials:
+                durations = [
+                    (t.datetime_complete - t.datetime_start).total_seconds()
+                    for t in completed_trials
+                ]
+                avg_t = sum(durations) / len(durations)
+
+        # elapsed: prefer in-memory result, fall back to DB first/last timestamp
+        elapsed = res.get("optuna_elapsed", 0.0)
+        if elapsed == 0.0 and study is not None:
+            timed = [
+                t for t in study.trials
+                if t.datetime_start is not None and t.datetime_complete is not None
+            ]
+            if timed:
+                wall_start = min(t.datetime_start for t in timed)
+                wall_end = max(t.datetime_complete for t in timed)
+                elapsed = (wall_end - wall_start).total_seconds()
+        elapsed_str = _fmt_time(elapsed) if elapsed > 0 else "n/a"
+
+        sub_study = _sub_studies.get(mn)
+        sub_n = len(sub_study.trials) if sub_study else 0
+        sub_str = str(sub_n) if sub_n > 0 else "-"
+
+        # sub_best: best value from sub study
+        sub_best_str = "-"
+        if sub_study:
+            try:
+                sub_best_str = f"{sub_study.best_value:.6f}"
+            except ValueError:
+                pass
+
+        lines.append(
+            f"  {mn:<14} {best_val:>8.6f}  {n_complete:>8}  {n_pruned:>7}  {n_failed:>6}"
+            f"  {avg_t:>8.1f}s  {elapsed_str:>10}  {sub_str:>10}  {sub_best_str}"
+        )
+
+    # ------------------------------------------------------------------
+    # Section 2: Score Trajectory
+    # ------------------------------------------------------------------
+    # _synth_models accumulates per-model data for Section 12 strategy synthesis
+    _synth_models: dict[str, dict] = {}
+
+    lines.append(_h("2. SCORE TRAJECTORY (best-so-far at trial checkpoints)"))
+    checkpoints = [10, 25, 50, 100, 150, 200, 300]
+    for mn in models_order:
+        study = _studies.get(mn)
+        if study is None:
+            continue
+        completed = sorted(
+            [t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE],
+            key=lambda t: t.number,
+        )
+        if not completed:
+            lines.append(f"  {mn}: no completed trials")
+            continue
+        values = [t.value for t in completed]
+        best_so_far: list[float] = []
+        cur_best = -float("inf") if maximize else float("inf")
+        for v in values:
+            if (maximize and v > cur_best) or (not maximize and v < cur_best):
+                cur_best = v
+            best_so_far.append(cur_best)
+
+        trajectory_parts: list[str] = []
+        for cp in checkpoints:
+            if cp <= len(best_so_far):
+                trajectory_parts.append(f"t{cp}:{best_so_far[cp - 1]:.6f}")
+        if not trajectory_parts:
+            trajectory_parts.append(f"t{len(best_so_far)}:{best_so_far[-1]:.6f}")
+
+        # Marginal gain: adaptive window = min(50, n_trials // 2), min 10
+        n_comp = len(completed)
+        gain_window = max(10, min(50, n_comp // 2))
+        if n_comp > gain_window:
+            best_excl = best_so_far[-(gain_window + 1)]
+            marginal = best_so_far[-1] - best_excl
+            marginal_str = f"  marginal_gain_last{gain_window}={marginal:+.6f}"
+        else:
+            marginal_str = f"  (<{gain_window * 2} trials, no marginal gain)"
+
+        # "At current rate" estimate: if avg_t known, estimate trials per budget hour
+        rate_str = ""
+        avg_t_trial = res.get("avg_trial_time", 0.0)
+        timed_completed = []
+        if study is not None:
+            timed_completed = [
+                t for t in study.trials
+                if t.state == _optuna.trial.TrialState.COMPLETE
+                and t.datetime_start is not None and t.datetime_complete is not None
+            ]
+        if avg_t_trial == 0.0 and timed_completed:
+            avg_t_trial = sum(
+                (t.datetime_complete - t.datetime_start).total_seconds()
+                for t in timed_completed
+            ) / len(timed_completed)
+        if avg_t_trial > 0:
+            per_hour = 3600.0 / avg_t_trial
+            rate_str = f"  [{per_hour:.0f} trials/h]"
+
+        # Score distribution: Q25 / median / Q75 / worst
+        import numpy as _np_rr
+        dist_str = ""
+        if values:
+            q25, med, q75 = _np_rr.percentile(values, [25, 50, 75])
+            worst = min(values) if maximize else max(values)
+            dist_str = f"\n    score_dist: Q25={q25:.6f}  median={med:.6f}  Q75={q75:.6f}  worst={worst:.6f}"
+
+        # Time-to-best: how long until the best trial was found
+        ttb_str = ""
+        if timed_completed:
+            study_start = min(t.datetime_start for t in timed_completed)
+            completed_sorted_by_num = sorted(
+                timed_completed, key=lambda t: t.number
+            )
+            cur = -float("inf") if maximize else float("inf")
+            best_t_obj = None
+            for t in completed_sorted_by_num:
+                if (maximize and t.value > cur) or (not maximize and t.value < cur):
+                    cur = t.value
+                    best_t_obj = t
+            if best_t_obj and best_t_obj.datetime_complete:
+                secs_to_best = (best_t_obj.datetime_complete - study_start).total_seconds()
+                total_elapsed_ttb = (
+                    max(t.datetime_complete for t in timed_completed) - study_start
+                ).total_seconds()
+                ttb_str = (
+                    f"\n    time_to_best: {_fmt_time(secs_to_best)}"
+                    f" of {_fmt_time(total_elapsed_ttb)} total"
+                    f" (trial#{best_t_obj.number})"
+                )
+
+        # Estimated ceiling: gain_rate = last_window_gain / prev_window_gain
+        ceiling_str = ""
+        if n_comp > gain_window * 2:
+            prev_excl = best_so_far[-(gain_window * 2 + 1)]
+            prev_gain = best_so_far[-(gain_window + 1)] - prev_excl
+            last_gain = best_so_far[-1] - best_so_far[-(gain_window + 1)]
+            if prev_gain > 1e-9:
+                gain_rate = last_gain / prev_gain
+                if gain_rate < 0.15:
+                    status = "SATURATED"
+                elif gain_rate < 0.40:
+                    status = "slowing"
+                else:
+                    status = "still improving"
+                ceiling_str = f"\n    ceiling: gain_rate={gain_rate:.2f} ({status})"
+
+        lines.append(
+            f"  {mn}: {', '.join(trajectory_parts)}{marginal_str}{rate_str}"
+            f"{dist_str}{ttb_str}{ceiling_str}"
+        )
+
+        # Accumulate for Section 12 synthesis
+        _synth_gain_rate: float | None = None
+        _synth_status: str = "unknown"
+        if n_comp > gain_window * 2:
+            _prev_excl = best_so_far[-(gain_window * 2 + 1)]
+            _prev_g = best_so_far[-(gain_window + 1)] - _prev_excl
+            _last_g = best_so_far[-1] - best_so_far[-(gain_window + 1)]
+            if _prev_g > 1e-9:
+                _synth_gain_rate = _last_g / _prev_g
+                if _synth_gain_rate < 0.15:
+                    _synth_status = "SATURATED"
+                elif _synth_gain_rate < 0.40:
+                    _synth_status = "slowing"
+                else:
+                    _synth_status = "improving"
+        elif n_comp < 30:
+            _synth_status = "few_trials"
+        _synth_models[mn] = {
+            "best": best_so_far[-1] if best_so_far else None,
+            "n_trials": n_comp,
+            "gain_rate": _synth_gain_rate,
+            "status": _synth_status,
+            "marginal": marginal if n_comp > gain_window else None,
+        }
+
+    # ------------------------------------------------------------------
+    # Section 3: Pruning Analysis
+    # ------------------------------------------------------------------
+    lines.append(_h("3. PRUNING ANALYSIS"))
+    for mn in models_order:
+        study = _studies.get(mn)
+        if study is None:
+            continue
+        pruned = [t for t in study.trials if t.state == _optuna.trial.TrialState.PRUNED]
+        n_total = len(study.trials)
+        n_pruned = len(pruned)
+        if n_total == 0:
+            continue
+        pct = 100.0 * n_pruned / n_total
+
+        # Infer cause: has intermediate_values → got through ≥1 fold → MedianPruner
+        #              no intermediate_values → pruned on fold 0 (fold_timeout or step 0)
+        n_median = sum(1 for t in pruned if t.intermediate_values)
+        n_timeout = n_pruned - n_median
+
+        # Sub study
+        sub_study = _sub_studies.get(mn)
+        sub_info = ""
+        if sub_study:
+            sub_pruned = sum(1 for t in sub_study.trials if t.state == _optuna.trial.TrialState.PRUNED)
+            sub_total = len(sub_study.trials)
+            sub_info = f"  sub: {sub_pruned}/{sub_total} pruned"
+
+        lines.append(
+            f"  {mn:<14}: {n_pruned}/{n_total} pruned ({pct:.0f}%)"
+            f"  [median_pruner={n_median}, fold_timeout/fold0={n_timeout}]{sub_info}"
+        )
+
+    # ------------------------------------------------------------------
+    # Section 4: HP Convergence
+    # ------------------------------------------------------------------
+    lines.append(_h("4. HYPERPARAMETER CONVERGENCE (top-20% vs full explored range)"))
+    for mn in models_order:
+        study = _studies.get(mn)
+        if study is None:
+            continue
+        completed = [t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE]
+        if len(completed) < 3:
+            lines.append(f"  {mn}: insufficient trials for convergence analysis")
+            continue
+        completed_sorted = sorted(
+            completed, key=lambda t: t.value, reverse=maximize
+        )
+        n_top = max(5, len(completed) // 5)
+        top_trials = completed_sorted[:n_top]
+        best_trial = completed_sorted[0]
+
+        hp_imp = model_results.get(mn, {}).get("hp_importance", {})
+
+        lines.append(f"\n  {mn} ({len(completed)} trials, top-20%={n_top}):")
+        all_param_names = sorted(
+            {k for t in completed for k in t.params},
+            key=lambda k: -hp_imp.get(k, 0),
+        )
+        for param in all_param_names:
+            all_vals = [t.params[param] for t in completed if param in t.params]
+            top_vals = [t.params[param] for t in top_trials if param in t.params]
+            if not all_vals or not top_vals:
+                continue
+            best_val = best_trial.params.get(param, "n/a")
+            imp_str = f" imp={hp_imp[param]:.3f}" if param in hp_imp else ""
+            if isinstance(all_vals[0], (int, float)):
+                lo, hi = min(all_vals), max(all_vals)
+                t_lo, t_hi = min(top_vals), max(top_vals)
+                full_range = hi - lo
+                if full_range > 1e-10:
+                    top_range = t_hi - t_lo
+                    frac = top_range / full_range
+                    conf = "HIGH" if frac < 0.30 else ("MED" if frac < 0.60 else "LOW")
+                    # Search space utilization: what % of trials explored upper 25% of range
+                    upper_thresh = lo + 0.75 * full_range
+                    n_upper = sum(1 for v in all_vals if v >= upper_thresh)
+                    util_pct = 100.0 * n_upper / len(all_vals)
+                    util_str = f"  util_upper25%={util_pct:.0f}%"
+                else:
+                    conf = "HIGH"  # all same value
+                    util_str = ""
+                lines.append(
+                    f"    {param:<30} all=[{lo:.4g},{hi:.4g}]  top=[{t_lo:.4g},{t_hi:.4g}]"
+                    f"  {conf}  best={best_val:.4g}{imp_str}{util_str}"
+                )
+            else:
+                # Categorical — show utilization as fraction of choices tried
+                from collections import Counter
+                all_counts = Counter(all_vals)
+                top_counts = Counter(top_vals)
+                most_common = top_counts.most_common(2)
+                mc_str = ", ".join(f"{v}:{c}" for v, c in most_common)
+                all_str = ", ".join(f"{v}:{c}" for v, c in all_counts.most_common())
+                lines.append(
+                    f"    {param:<30} top-20%: [{mc_str}]  all: [{all_str}]  best={best_val}{imp_str}"
+                )
+
+        # Top-5 HP values table (AI can infer interactions)
+        top5 = completed_sorted[:5]
+        if top5:
+            # Select params that actually vary across top-5
+            varying = [
+                p for p in all_param_names
+                if len({t.params.get(p) for t in top5 if p in t.params}) > 1
+                   or len(top5) == 1
+            ][:8]  # at most 8 cols to keep readable
+            if varying:
+                lines.append(f"\n    top-5 trials (AI: infer HP interactions):")
+                # header
+                header = f"    {'score':>9}" + "".join(f"  {p[:10]:>10}" for p in varying)
+                lines.append(header)
+                for t in top5:
+                    vals = "".join(
+                        f"  {str(t.params.get(p, '?'))[:10]:>10}" for p in varying
+                    )
+                    lines.append(f"    {t.value:>9.6f}{vals}")
+
+            # HP Landscape Roughness: std of top-5 scores / best_score → smooth vs rough
+            top5_scores = [t.value for t in top5]
+            if len(top5_scores) >= 3:
+                roughness = float(np.std(top5_scores))
+                if roughness < 0.0001:
+                    r_label = "smooth  (converged — hard to improve further)"
+                elif roughness < 0.001:
+                    r_label = "moderate (some unexplored regions possible)"
+                else:
+                    r_label = "rough   (high variance — promising regions likely remain)"
+                lines.append(f"\n    landscape_roughness: top5_score_std={roughness:.6f}  {r_label}")
+
+            # Score-Weighted HP Importance: mean separation top-5% vs top-20%
+            # High separation = this HP distinguishes champions from the pack
+            n5pct = max(3, n_comp // 20)
+            n20pct = max(5, n_comp // 5)
+            if n_comp >= 20 and n5pct < n20pct:
+                top5pct = completed_sorted[:n5pct]
+                top20pct = completed_sorted[:n20pct]
+                sep_items: list[tuple[float, str, float, float]] = []
+                for param in all_param_names:
+                    v5 = [t.params[param] for t in top5pct if param in t.params
+                          and isinstance(t.params[param], (int, float))]
+                    v20 = [t.params[param] for t in top20pct if param in t.params
+                           and isinstance(t.params[param], (int, float))]
+                    if len(v5) < 2 or len(v20) < 2:
+                        continue
+                    r = max(v20) - min(v20)
+                    if r < 1e-10:
+                        continue
+                    sep = abs(float(np.mean(v5)) - float(np.mean(v20))) / r
+                    sep_items.append((sep, param, float(np.mean(v5)), float(np.mean(v20))))
+                sep_items.sort(reverse=True)
+                if sep_items[:3]:
+                    lines.append(
+                        f"    top{n5pct}/top{n20pct} HP separation "
+                        f"(high=critical for last-mile improvement):"
+                    )
+                    for sep, param, m5, m20 in sep_items[:3]:
+                        lines.append(
+                            f"      {param:<30} sep={sep:.3f}"
+                            f"  top{n5pct}%_mean={m5:.4g}"
+                            f"  top{n20pct}%_mean={m20:.4g}"
+                        )
+
+    # ------------------------------------------------------------------
+    # Section 5: Fold-Level Score Matrix
+    # ------------------------------------------------------------------
+    fold_score_data: dict[str, list[float]] = {}
+    for mn in models_order:
+        fs = model_results.get(mn, {}).get("best_fold_scores", [])
+        if fs:
+            fold_score_data[mn] = fs
+
+    if fold_score_data:
+        lines.append(_h("5. FOLD-LEVEL SCORE MATRIX (best composite per model)"))
+        n_folds = max(len(v) for v in fold_score_data.values())
+        col_w = 8
+        hdr_parts = [f"{'model':<16}"] + [f"f{i:>5}" for i in range(n_folds)] + [f"{'mean':>7}"]
+        lines.append("  " + "".join(hdr_parts))
+        lines.append("  " + "-" * (16 + (n_folds + 1) * col_w))
+        all_fold_scores: list[list[float]] = []
+        for mn, scores in fold_score_data.items():
+            mean_s = sum(scores) / len(scores) if scores else 0.0
+            row = f"  {mn:<16}" + "".join(f"{s:>7.4f} " for s in scores) + f"{mean_s:>7.4f}"
+            lines.append(row)
+            all_fold_scores.append(scores)
+        # Per-fold mean (hard fold detection)
+        if all_fold_scores and len(set(len(s) for s in all_fold_scores)) == 1:
+            col_means = [
+                sum(row[i] for row in all_fold_scores) / len(all_fold_scores)
+                for i in range(n_folds)
+            ]
+            overall_mean = sum(col_means) / len(col_means)
+            row = f"  {'(fold_mean)':<16}" + "".join(f"{v:>7.4f} " for v in col_means) + f"{overall_mean:>7.4f}"
+            lines.append(row)
+    else:
+        lines.append(_h("5. FOLD-LEVEL SCORE MATRIX"))
+        lines.append("  (not available — global selection mode or no data)")
+
+    # ------------------------------------------------------------------
+    # Section 6: Assembly Diagnostics
+    # ------------------------------------------------------------------
+    lines.append(_h("6. ASSEMBLY DIAGNOSTICS"))
+    for mn in models_order:
+        res = model_results.get(mn)
+        if res is None:
+            lines.append(f"  {mn:<14}: (no data — standalone mode)")
+            continue
+        mode = res.get("selection_mode", "global")
+        n_final = len(res.get("oof_preds", []))
+        if mode == "fold_coverage":
+            n_committed = res.get("n_committed")
+            committed_str = f"committed={n_committed}" if n_committed is not None else "committed=?"
+            lines.append(f"  {mn:<14}: fold_coverage  {committed_str}  selected={n_final}")
+        elif mode == "per_fold":
+            n_raw = res.get("n_composites_raw")
+            raw_str = f"raw={n_raw}→dedup={n_final}" if n_raw is not None else f"final={n_final}"
+            lines.append(f"  {mn:<14}: per_fold  composites {raw_str}")
+        else:
+            n_configs = len(res.get("top_configs", []))
+            lines.append(f"  {mn:<14}: global  top_configs={n_configs}  prediction_arrays={n_final}")
+
+    # ------------------------------------------------------------------
+    # Section 7: Substudy → Main Transfer
+    # ------------------------------------------------------------------
+    lines.append(_h("7. SUBSTUDY → MAIN TRANSFER EFFICIENCY"))
+    if not _sub_studies:
+        lines.append("  (no substudy DBs found)")
+    for mn, sub_study in _sub_studies.items():
+            main_study = _studies.get(mn)
+            sub_completed = [
+                t for t in sub_study.trials if t.state == _optuna.trial.TrialState.COMPLETE
+            ]
+            if not sub_completed:
+                lines.append(f"  {mn}: substudy has no completed trials")
+                continue
+            sub_best = sorted(sub_completed, key=lambda t: t.value, reverse=maximize)[0]
+            sub_val = sub_best.value
+            sub_params = {k: v for k, v in sub_best.params.items() if k != "scaler"}
+
+            match_val = None
+            if main_study:
+                for t in main_study.trials:
+                    if t.state != _optuna.trial.TrialState.COMPLETE:
+                        continue
+                    main_params = {k: v for k, v in t.params.items() if k != "scaler"}
+                    if main_params == sub_params:
+                        match_val = t.value
+                        break
+
+            if match_val is not None:
+                delta = match_val - sub_val
+                quality = "✓ good" if abs(delta) < 0.005 else ("↑ improved" if delta > 0 else "↓ degraded")
+                lines.append(
+                    f"  {mn}: sub_best={sub_val:.6f} (trial#{sub_best.number})"
+                    f"  →  main={match_val:.6f}  delta={delta:+.4f}  {quality}"
+                )
+            else:
+                lines.append(
+                    f"  {mn}: sub_best={sub_val:.6f} (trial#{sub_best.number})"
+                    f"  →  config not yet evaluated in main study"
+                )
+
+    # ------------------------------------------------------------------
+    # Section 8: Cross-Model Diversity
+    # ------------------------------------------------------------------
+    _synth_div: dict[str, float] = {}  # model → avg Spearman corr with others (for Section 12)
+    if all_oof and model_labels:
+        lines.append(_h("8. CROSS-MODEL DIVERSITY (tuned OOF Spearman correlations)"))
+        # Build per-model average OOF
+        model_avg_oof: dict[str, list[np.ndarray]] = {}
+        for arr, label in zip(all_oof, model_labels):
+            mn_key = label.rsplit("_", 1)[0] if "_" in label else label
+            model_avg_oof.setdefault(mn_key, []).append(arr)
+        avg_labels = list(model_avg_oof.keys())
+        avg_arrays = [np.mean(arrs, axis=0) for arrs in model_avg_oof.values()]
+        if len(avg_arrays) > 1:
+            corr_mat = compute_correlation_matrix(avg_arrays)
+            lw = max(len(lb) for lb in avg_labels) + 2
+            hdr_line = " " * lw + "".join(f"{lb:>10s}" for lb in avg_labels)
+            lines.append("  " + hdr_line)
+            lines.append("  " + "-" * len(hdr_line))
+            for i, rl in enumerate(avg_labels):
+                row_str = f"  {rl:<{lw}}" + "".join(f"{corr_mat[i, j]:>10.3f}" for j in range(len(avg_labels)))
+                lines.append(row_str)
+            from src.ensemble.diversity import effective_ensemble_size
+            n_eff = effective_ensemble_size(corr_mat)
+            lines.append(f"\n  N_eff = {n_eff:.3f} / {len(avg_labels)}")
+            # Most/least correlated pairs
+            max_corr, min_corr = -float("inf"), float("inf")
+            max_pair, min_pair = ("", ""), ("", "")
+            for i in range(len(avg_labels)):
+                for j in range(i + 1, len(avg_labels)):
+                    c = corr_mat[i, j]
+                    if c > max_corr:
+                        max_corr, max_pair = c, (avg_labels[i], avg_labels[j])
+                    if c < min_corr:
+                        min_corr, min_pair = c, (avg_labels[i], avg_labels[j])
+            lines.append(f"  Most correlated : {max_pair[0]} — {max_pair[1]} ({max_corr:.3f})")
+            lines.append(f"  Least correlated: {min_pair[0]} — {min_pair[1]} ({min_corr:.3f})")
+            # Capture per-model avg correlation with others (for Section 12)
+            _synth_div: dict[str, float] = {}
+            for i, lbl in enumerate(avg_labels):
+                others = [corr_mat[i, j] for j in range(len(avg_labels)) if j != i]
+                _synth_div[lbl] = float(np.mean(others)) if others else 1.0
+    else:
+        lines.append(_h("8. CROSS-MODEL DIVERSITY"))
+        lines.append("  (not available — standalone mode or single model)")
+
+    # ------------------------------------------------------------------
+    # Section 9: Ensemble Result + NSGA-II Weights
+    # ------------------------------------------------------------------
+    _synth_ensemble: dict = {}  # populated below, used in Section 12
+    lines.append(_h("9. ENSEMBLE RESULT"))
+    if ensemble_score is not None and chosen_strategy is not None:
+        metric_display = metric.replace("neg_", "")
+        lines.append(f"  Strategy : {chosen_strategy}")
+        lines.append(f"  OOF {metric_display:<8}: {ensemble_score:.6f}")
+    else:
+        lines.append("  (not available — standalone mode)")
+
+    if nsga2_info is not None and model_labels:
+        sel = nsga2_info.get("selected_models", [])
+        wts = nsga2_info.get("weights", [])
+        blend_score = nsga2_info.get("blend_score")
+        meta_scores = nsga2_info.get("meta_scores", {})
+        best_meta_name = nsga2_info.get("best_meta_name", "blend")
+        n_sel = nsga2_info.get("n_selected", len(sel))
+        n_tot = nsga2_info.get("n_total", len(model_labels))
+        ens_neff = nsga2_info.get("effective_size")
+
+        # Meta-model comparison
+        if blend_score is not None or meta_scores:
+            lines.append(f"  Meta-model comparison ({n_sel}/{n_tot} arrays → meta stage):")
+            if blend_score is not None:
+                lines.append(f"    {'blend':<10}: {blend_score:.6f}  (baseline)")
+            for mn_m, ms in sorted(meta_scores.items(), key=lambda kv: -kv[1]):
+                delta = ms - (blend_score or ms)
+                winner = "  ← winner" if mn_m == best_meta_name and mn_m != "blend" else ""
+                lines.append(f"    {mn_m:<10}: {ms:.6f}  ({delta:+.6f}){winner}")
+
+        # Per-model array counts
+        model_counts: dict[str, list[int]] = {}  # [selected, total]
+        for label in model_labels:
+            mn_k = label.rsplit("_", 1)[0] if "_" in label else label
+            if mn_k not in model_counts:
+                model_counts[mn_k] = [0, 0]
+            model_counts[mn_k][1] += 1
+        model_weight_sum: dict[str, float] = {}
+        for idx, w in zip(sel, wts):
+            if idx < len(model_labels):
+                mn_k = model_labels[idx].rsplit("_", 1)[0] if "_" in model_labels[idx] else model_labels[idx]
+                model_weight_sum[mn_k] = model_weight_sum.get(mn_k, 0.0) + w
+                model_counts[mn_k][0] += 1
+
+        neff_str = f"  N_eff={ens_neff:.3f}" if ens_neff else ""
+        lines.append(f"  NSGA-II weights:{neff_str}")
+        all_model_names = sorted(model_counts.keys(),
+                                 key=lambda m: -model_weight_sum.get(m, 0.0))
+        for mn_k in all_model_names:
+            w = model_weight_sum.get(mn_k, 0.0)
+            s_n, t_n = model_counts[mn_k]
+            bar = "█" * max(1, round(w * 20)) if w > 1e-4 else ""
+            excl = "  ← EXCLUDED" if s_n == 0 else ""
+            lines.append(f"    {mn_k:<16}: {w:.4f}  {bar:<12}  ({s_n}/{t_n} arrays){excl}")
+
+        _synth_ensemble = {
+            "n_eff": ens_neff,
+            "model_weights": model_weight_sum,
+            "model_counts": model_counts,
+            "blend_score": blend_score,
+            "meta_scores": meta_scores,
+            "best_meta": best_meta_name,
+        }
+
+    # ------------------------------------------------------------------
+    # Section 10: Config Similarity Across GBMs
+    # ------------------------------------------------------------------
+    lines.append(_h("10. CONFIG SIMILARITY ACROSS GBMS"))
+    gbm_names = [mn for mn in ["catboost", "xgboost", "lightgbm"] if mn in _studies]
+    if not gbm_names:
+        lines.append("  (no GBM Optuna DBs found)")
+    if gbm_names:
+        gbm_params = ["depth", "max_depth", "num_leaves", "learning_rate", "n_estimators", "iterations"]
+        header_row = f"  {'model':<14}" + "".join(f"{p:>16}" for p in gbm_params)
+        lines.append(header_row)
+        lines.append("  " + "-" * (14 + 16 * len(gbm_params)))
+        for mn in gbm_names:
+            study = _studies[mn]
+            completed = [t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE]
+            if not completed:
+                continue
+            best = sorted(completed, key=lambda t: t.value, reverse=maximize)[0]
+            row = f"  {mn:<14}"
+            for p in gbm_params:
+                val = best.params.get(p, "-")
+                if isinstance(val, float):
+                    row += f"{val:>16.4g}"
+                else:
+                    row += f"{str(val):>16}"
+            lines.append(row)
+
+        # Qualitative note
+        depths: list[int] = []
+        for mn in gbm_names:
+            study = _studies[mn]
+            completed = [t for t in study.trials if t.state == _optuna.trial.TrialState.COMPLETE]
+            if not completed:
+                continue
+            best = sorted(completed, key=lambda t: t.value, reverse=maximize)[0]
+            for param in ("depth", "max_depth"):
+                if param in best.params:
+                    depths.append(int(best.params[param]))
+                    break
+            if "num_leaves" in best.params:
+                leaves = int(best.params["num_leaves"])
+                # num_leaves ≈ 2^depth for balanced trees
+                import math
+                depths.append(int(math.log2(max(leaves, 1))))
+        if depths:
+            d_min, d_max = min(depths), max(depths)
+            if d_max - d_min <= 2:
+                lines.append(f"\n  → All GBMs converged to similar depth ({d_min}-{d_max})")
+            else:
+                lines.append(f"\n  → GBMs show divergent depth preferences ({d_min}-{d_max})")
+
+    # ------------------------------------------------------------------
+    # Section 11: OOF-LB Gap
+    # ------------------------------------------------------------------
+    lines.append(_h("11. OOF-LB GAP"))
+    lb = pipeline_config.output.lb_score
+    if lb is not None and ensemble_score is not None:
+        gap = ensemble_score - lb
+        lines.append(f"  OOF  : {ensemble_score:.6f}")
+        lines.append(f"  LB   : {lb:.6f}")
+        lines.append(f"  Gap  : {gap:+.4f}  ({'normal' if gap < 0.005 else 'large — possible overfit'})")
+    elif lb is not None:
+        lines.append(f"  LB score set: {lb:.6f}  (no OOF score in standalone mode)")
+    else:
+        lines.append("  Set output.lb_score in pipeline.yaml after submission to enable this section.")
+
+    # ------------------------------------------------------------------
+    # Section 12: Strategy Synthesis
+    # ------------------------------------------------------------------
+    lines.append(_h("12. STRATEGY SYNTHESIS"))
+
+    # Per-model status table
+    mw = _synth_ensemble.get("model_weights", {})
+    mc = _synth_ensemble.get("model_counts", {})
+    if _synth_models:
+        lines.append(
+            "  MODEL STATUS  (gain_rate: SATURATED<0.15 / slowing<0.40 / improving≥0.40):"
+        )
+        lines.append(
+            f"  {'model':<12}  {'status':<12}  {'best':>9}  {'trials':>7}  "
+            f"{'gain_rate':>10}  {'wt%':>6}  {'arrays':>10}"
+        )
+        lines.append("  " + "-" * 75)
+        for mn in models_order:
+            sd = _synth_models.get(mn)
+            if sd is None:
+                continue
+            st = sd.get("status", "unknown")
+            best = sd.get("best")
+            n_t = sd.get("n_trials", 0)
+            gr = sd.get("gain_rate")
+            w = mw.get(mn, 0.0)
+            s_n, t_n = mc.get(mn, [0, 0]) if mc else (0, 0)
+            gr_str = f"{gr:.2f}" if gr is not None else "n/a"
+            best_str = f"{best:.6f}" if best is not None else "n/a"
+            arr_str = f"{s_n}/{t_n}" if mc else "n/a"
+            excl = " EXCLUDED" if s_n == 0 and t_n > 0 else ""
+            lines.append(
+                f"  {mn:<12}  [{st:<10}]  {best_str}  {n_t:>7}  "
+                f"{gr_str:>10}  {w*100:>5.1f}%  {arr_str:>10}{excl}"
+            )
+
+    # Ensemble health
+    lines.append("")
+    lines.append("  ENSEMBLE HEALTH:")
+    if _synth_ensemble:
+        n_eff = _synth_ensemble.get("n_eff")
+        n_models = len(mw) if mw else len(models_order)
+        if n_eff is not None:
+            if n_eff < 1.1:
+                neff_label = "severe dominance"
+            elif n_eff < 1.5:
+                neff_label = "low diversity"
+            elif n_eff < 2.5:
+                neff_label = "moderate diversity"
+            else:
+                neff_label = "good diversity"
+            dom_model = max(mw.items(), key=lambda kv: kv[1])[0] if mw else "?"
+            dom_w = mw.get(dom_model, 0.0)
+            lines.append(
+                f"    N_eff={n_eff:.3f}/{n_models} — {neff_label} "
+                f"({dom_model} {dom_w*100:.0f}% weight)"
+            )
+        if _synth_div:
+            best_mn = max(_synth_models.keys(), key=lambda m: _synth_models[m].get("best") or 0.0)
+            for mn in sorted(_synth_div.keys(), key=lambda m: _synth_div[m]):
+                if mn == best_mn:
+                    continue
+                corr = _synth_div.get(mn, 1.0)
+                lines.append(
+                    f"    {mn}: avg_corr_with_others={corr:.3f}"
+                    + (" (lowest corr = highest diversity value)" if corr == min(_synth_div.values()) else "")
+                )
+        excluded = [mn for mn, (sn, tn) in mc.items() if sn == 0 and tn > 0] if mc else []
+        if excluded:
+            lines.append(f"    EXCLUDED: {', '.join(excluded)} — contributed 0 arrays to ensemble")
+        meta_scores = _synth_ensemble.get("meta_scores", {})
+        blend_s = _synth_ensemble.get("blend_score")
+        best_meta = _synth_ensemble.get("best_meta", "blend")
+        if meta_scores and blend_s is not None:
+            best_meta_s = max(meta_scores.values()) if meta_scores else blend_s
+            delta = best_meta_s - blend_s
+            if best_meta == "blend":
+                lines.append(f"    Meta-stacking: no improvement over blend")
+            else:
+                lines.append(
+                    f"    Meta-stacking ({best_meta}): {delta:+.6f} over blend "
+                    f"({'marginal' if delta < 0.0002 else 'meaningful'})"
+                )
+    else:
+        lines.append("    (not available — standalone mode)")
+
+    # Recommended budget
+    lines.append("")
+    lines.append("  RECOMMENDED BUDGET FOR NEXT ROUND:")
+    for mn in models_order:
+        sd = _synth_models.get(mn)
+        if sd is None:
+            continue
+        st = sd.get("status", "unknown")
+        s_n, t_n = mc.get(mn, [0, 0]) if mc else (0, 0)
+        excluded_flag = (s_n == 0 and t_n > 0)
+        if excluded_flag and st == "SATURATED":
+            rec = "DROP (SATURATED + excluded from ensemble)"
+        elif excluded_flag:
+            rec = "20min token budget (excluded from ensemble)"
+        elif st == "SATURATED":
+            rec = "20min token budget (saturated)"
+        elif st == "slowing":
+            rec = "reduce budget (slowing convergence)"
+        elif st == "improving":
+            rec = "keep/increase budget (still improving)"
+        elif st == "few_trials":
+            rec = "keep full budget (needs more exploration)"
+        else:
+            rec = "reassess after more trials"
+        lines.append(f"    {mn:<12} → {rec}")
+
+    lines.append("\n" + _sep())
+    report = "\n".join(lines)
+
+    if output_path is not None:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report, encoding="utf-8")
+        _logging.getLogger("maestro").info(f"Round report saved: {out}")
+
+    return report
+
+
 def main(pipeline_yaml_path: str | Path) -> None:
     """Run the complete Maestro pipeline from config to submission.
 
@@ -567,6 +1426,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
     chosen_strategy = ensemble_strategy
     final_oof: np.ndarray
     final_test_preds: np.ndarray
+    _nsga2_info: dict | None = None
 
     if ensemble_strategy == "blend":
         weights = optimize_blend_weights(
@@ -638,6 +1498,7 @@ def main(pipeline_yaml_path: str | Path) -> None:
             labels=model_labels,
             diversity_metric=ensemble_cfg.diversity_metric,
         )
+        _nsga2_info = first_info
         sel = first_info["selected_models"]
         wts = first_info["weights"]
         nsga2_blend_oof = apply_blend([all_oof[i] for i in sel], wts)
@@ -665,6 +1526,11 @@ def main(pipeline_yaml_path: str | Path) -> None:
         best_meta_test = nsga2_blend_test
         best_meta_name = "blend"
         logger.info(f"  NSGA-II linear blend: {metric}={blend_score:.6f}")
+        # Populate nsga2_info with meta-comparison data for round report
+        _nsga2_info["blend_score"] = blend_score
+        _nsga2_info["meta_scores"] = {}
+        _nsga2_info["n_selected"] = len(sel)
+        _nsga2_info["n_total"] = len(all_oof)
 
         # Try each configured meta-model (auto-disable xgboost on small data)
         meta_models = ensemble_cfg.meta_models
@@ -723,9 +1589,11 @@ def main(pipeline_yaml_path: str | Path) -> None:
                     best_meta_oof = m_oof
                     best_meta_test = m_test
                     best_meta_name = meta_name
+                _nsga2_info["meta_scores"][meta_name] = m_score
             except Exception as exc:
                 logger.warning(f"  Meta-model '{meta_name}' failed: {exc}")
 
+        _nsga2_info["best_meta_name"] = best_meta_name
         final_oof = best_meta_oof
         final_test_preds = best_meta_test
         if best_meta_name == "blend":
@@ -851,20 +1719,20 @@ def main(pipeline_yaml_path: str | Path) -> None:
         f"n_predictions={len(all_oof)}"
     )
 
-    # Diversity report (show only top-level per-model averages to keep it readable)
-    if len(all_oof) > 1:
-        # Average per model for a cleaner diversity report
-        model_avg_oof: list[np.ndarray] = []
-        model_avg_labels: list[str] = []
-        for model_name, res in model_results.items():
-            if res["oof_preds"]:
-                avg = np.mean(res["oof_preds"], axis=0)
-                model_avg_oof.append(avg)
-                model_avg_labels.append(model_name[:15])
-        if len(model_avg_oof) > 1:
-            corr_mat = compute_correlation_matrix(model_avg_oof)
-            diversity_report_path = Path(pipeline_config.output.results_dir) / "diversity_report.txt"
-            print_diversity_report(corr_mat, model_avg_labels, output_path=diversity_report_path)
+    # Round report (replaces diversity_report — includes diversity + run history + HP convergence)
+    round_report_path = results_dir / f"round_report_{pipeline_config.run_name}_{_ts}.txt"
+    _generate_round_report(
+        model_results=model_results,
+        pipeline_config=pipeline_config,
+        all_oof=all_oof,
+        model_labels=model_labels,
+        y_true=y_true,
+        metric=metric,
+        ensemble_score=ensemble_score,
+        chosen_strategy=chosen_strategy,
+        nsga2_info=_nsga2_info,
+        output_path=round_report_path,
+    )
 
     # -------------------------------------------------------------------------
     # Step 8: Output

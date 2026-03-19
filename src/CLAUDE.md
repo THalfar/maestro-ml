@@ -24,7 +24,7 @@ utils/io.py
 | `features/engineer.py` | `build_features` | — |
 | `models/registry.py` | `ModelRegistry.get_model`, `.get_search_space` | `ModelRegistry` |
 | `models/trainer.py` | `run_optuna_study`, `train_with_config`, `run_all_studies` | — |
-| `ensemble/blender.py` | `optimize_blend_weights`, `rank_average`, `train_meta_model` | — |
+| `ensemble/blender.py` | `optimize_blend_weights`, `apply_blend`, `rank_average`, `train_meta_model`, `optimize_meta_C`, `optimize_meta_xgb`, `train_meta_model_xgb`, `pick_best_strategy` | — |
 | `ensemble/diversity.py` | `effective_ensemble_size`, `run_nsga2_ensemble` | — |
 | `strategy/llm_strategist.py` | `generate_strategy` | — |
 
@@ -65,7 +65,7 @@ for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
 ## Per-Module Gotchas
 
 ### `models/registry.py`
-- GPU detection uses a micro-trial: fit a 100-row synthetic dataset with GPU params. If it raises, fall back to CPU params. No crashes.
+- GPU detection uses a micro-trial: fit a 20-row synthetic dataset with GPU params. If it raises, fall back to CPU params. No crashes.
 - Registry auto-loads all YAMLs from `configs/models/` — no registration code needed.
 
 ### `models/trainer.py`
@@ -83,8 +83,8 @@ for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
 
 ### `strategy/llm_strategist.py`
 - **API mode**: calls Anthropic/OpenAI API, parses YAML from response.
-- **Manual mode**: prints prompt to console, waits for user to paste strategy YAML, reads from file path in config.
-- Strategy YAML must have keys: `features`, `models`, `overrides`, `reasoning`.
+- **Manual mode**: if the strategy file already exists (agent-mode shortcut), loads it directly without prompting. Otherwise prints the EDA report, waits for the user to paste a strategy YAML, then reads from the file path in config.
+- Strategy YAML required keys: `features`, `models`, `reasoning`. `overrides` is optional.
 
 ## CatBoost-Specific Rules
 

@@ -33,6 +33,7 @@ C_API='\033[1;33m'
 C_PERF='\033[0;33m'
 C_STYLE='\033[2;37m'
 C_TODO='\033[0;36m'
+C_DOCS='\033[1;36m'
 NC='\033[0m'
 
 # --- Aika-apurit ---
@@ -65,6 +66,8 @@ print_colored_reviews() {
             echo -e "  ${C_LEAK}${line}${NC}"
         elif [[ "$line" == *"REVIEW:API"* ]]; then
             echo -e "  ${C_API}${line}${NC}"
+        elif [[ "$line" == *"REVIEW:DOCS"* ]]; then
+            echo -e "  ${C_DOCS}${line}${NC}"
         elif [[ "$line" == *"REVIEW:PERF"* ]]; then
             echo -e "  ${C_PERF}${line}${NC}"
         elif [[ "$line" == *"REVIEW:STYLE"* ]]; then
@@ -192,12 +195,16 @@ Review this file: ${FILE}" \
             STYLE_N=${STYLE_N:-0}
             TODO_N=$(grep -c "REVIEW:TODO" "$FILE" 2>/dev/null)
             TODO_N=${TODO_N:-0}
+            DOCS_N=$(grep -c "REVIEW:DOCS" "$FILE" 2>/dev/null)
+            DOCS_N=${DOCS_N:-0}
 
+        REVIEW_COUNT=$((BUG_N + LEAK_N + API_N + TODO_N + DOCS_N + PERF_N + STYLE_N))
         echo ""
         echo -e "  ${WHITE}${BOLD}${REVIEW_COUNT} kommenttia:${NC}"
         [ "$BUG_N" -gt 0 ]   && echo -e "    ${C_BUG}● BUG:   ${BUG_N}${NC}"
         [ "$LEAK_N" -gt 0 ]  && echo -e "    ${C_LEAK}● LEAK:  ${LEAK_N}${NC}"
         [ "$API_N" -gt 0 ]   && echo -e "    ${C_API}● API:   ${API_N}${NC}"
+        [ "$DOCS_N" -gt 0 ]  && echo -e "    ${C_DOCS}● DOCS:  ${DOCS_N}${NC}"
         [ "$TODO_N" -gt 0 ]  && echo -e "    ${C_TODO}● TODO:  ${TODO_N}${NC}"
         [ "$PERF_N" -gt 0 ]  && echo -e "    ${C_PERF}● PERF:  ${PERF_N}${NC}"
         [ "$STYLE_N" -gt 0 ] && echo -e "    ${C_STYLE}● STYLE: ${STYLE_N}${NC}"

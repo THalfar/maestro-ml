@@ -305,14 +305,18 @@ def optimize_meta_C(
         Tuple of (meta_oof_preds, meta_test_preds, best_C).
     """
     t0 = time.time()
+    best_cache: dict = {"oof": None, "test": None, "score": -np.inf}
 
     def objective(trial: optuna.Trial) -> float:
         C = trial.suggest_float("C", 0.001, 100.0, log=True)
-        meta_oof, _ = train_meta_model(
+        meta_oof, meta_test = train_meta_model(
             oof_list, test_list, y,
             n_folds=n_folds, seed=seed, C=C, task_type=task_type,
         )
-        return _score(y, meta_oof, metric)
+        score = _score(y, meta_oof, metric)
+        if score > best_cache["score"]:
+            best_cache.update({"oof": meta_oof, "test": meta_test, "score": score})
+        return score
 
     study = optuna.create_study(
         direction="maximize",
@@ -328,10 +332,8 @@ def optimize_meta_C(
         f"({n_trials} trials, {n_folds}-fold CV, {elapsed:.1f}s)"
     )
 
-    meta_oof, meta_test = train_meta_model(
-        oof_list, test_list, y,
-        n_folds=n_folds, seed=seed, C=best_C, task_type=task_type,
-    )
+    meta_oof = best_cache["oof"]
+    meta_test = best_cache["test"]
     return meta_oof, meta_test, best_C
 
 
@@ -397,8 +399,7 @@ def train_meta_model_xgb(
             meta_test += model.predict(X_test_meta) / n_folds
         else:
             model = XGBClassifier(
-                random_state=seed, verbosity=0, device=device,
-                eval_metric="logloss", **params,
+                random_state=seed, verbosity=0, device=device, **params,
             )
             model.fit(X_tr, y_tr)
             meta_oof[val_idx] = model.predict_proba(X_val)[:, 1]
@@ -438,6 +439,7 @@ def optimize_meta_xgb(
         Tuple of (meta_oof_preds, meta_test_preds, best_params).
     """
     t0 = time.time()
+    best_cache: dict = {"oof": None, "test": None, "score": -np.inf}
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -450,12 +452,15 @@ def optimize_meta_xgb(
             "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
         }
-        meta_oof, _ = train_meta_model_xgb(
+        meta_oof, meta_test = train_meta_model_xgb(
             oof_list, test_list, y,
             n_folds=n_folds, seed=seed, task_type=task_type,
             xgb_params=params, gpu=gpu,
         )
-        return _score(y, meta_oof, metric)
+        score = _score(y, meta_oof, metric)
+        if score > best_cache["score"]:
+            best_cache.update({"oof": meta_oof, "test": meta_test, "score": score})
+        return score
 
     study = optuna.create_study(
         direction="maximize",
@@ -473,11 +478,8 @@ def optimize_meta_xgb(
         f"{n_trials} trials, {n_folds}-fold CV, {elapsed:.1f}s)"
     )
 
-    meta_oof, meta_test = train_meta_model_xgb(
-        oof_list, test_list, y,
-        n_folds=n_folds, seed=seed, task_type=task_type,
-        xgb_params=best_params, gpu=gpu,
-    )
+    meta_oof = best_cache["oof"]
+    meta_test = best_cache["test"]
     return meta_oof, meta_test, best_params
 
 

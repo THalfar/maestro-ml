@@ -1991,6 +1991,30 @@ class TestTargetEncodingPreview:
         result = _compute_target_encoding_preview(df, target, col_analysis)
         assert result == {}
 
+    def test_no_target_leakage_in_te_preview(self):
+        """OOF TE must use only train-fold stats — val rows must NOT see their own target.
+
+        Construct a 1:1 mapping (category uniquely determines target). If there were
+        leakage, encoded values would perfectly equal the target giving AUC=1.0.
+        With proper OOF encoding, the encoded values should use smoothing from a
+        different fold and be somewhat noisy (AUC < 1.0 or corr < 1.0).
+        """
+        rng = np.random.default_rng(99)
+        n = 100
+        # Target perfectly determined by category, but OOF TE should smooth it
+        cats = np.array(["pos"] * 50 + ["neg"] * 50)
+        rng.shuffle(cats)
+        target_vals = np.where(cats == "pos", 1, 0)
+        df = pd.DataFrame({"cat": cats})
+        target = pd.Series(target_vals)
+        col_analysis = {"cat": {"detected_type": "low_cardinality_categorical", "cardinality": 2}}
+        result = _compute_target_encoding_preview(df, target, col_analysis, n_folds=5, alpha=10.0)
+        # With alpha=10 smoothing and OOF, encoded values cannot be exactly 0 or 1
+        # If leakage existed, corr would be 1.0. With proper OOF + smoothing, corr < 1.0.
+        assert result["cat"]["encoded_corr"] < 1.0
+        # Should still be positively correlated (it IS informative)
+        assert result["cat"]["encoded_corr"] > 0.5
+
 
 # ---------------------------------------------------------------------------
 # Quick model importance and baseline tests

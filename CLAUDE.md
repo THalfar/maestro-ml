@@ -77,6 +77,7 @@ Implement in this order (each module depends on the ones above it):
 - **Positional list resolution**: `run_optuna_study()` and `run_all_studies()` convert the dict to a positional `list[int]` aligned to `feature_cols`, then to `tuple()` for the model constructor.
 - **Format**: XGBoost sklearn API requires `tuple(monotone_constraints)`, NOT `list` — calling `.keys()` on a list causes `AttributeError`. Always convert to tuple.
 - **CatBoost GPU limitation**: `monotone_constraints` is NOT supported on CatBoost GPU. The trainer auto-skips constraints with a warning when `model_name == "catboost" and gpu == True`. Constraints work fine on CatBoost CPU.
+- **Per-model override**: Add `monotone_constraints: {}` under `overrides.<model>` in strategy YAML to disable constraints for a specific model only (empty dict = no constraints). Other models still use the global constraints. Useful when one model (e.g. XGBoost) underperforms with constraints while another (LightGBM) benefits from them. The override is popped from model_overrides_raw in `run_optuna_study()` before hyperparameter merging.
 - **Supported models**: CatBoost (CPU only), XGBoost, LightGBM. Other models ignore constraints.
 
 ## Per-Fold Selection (RealMLP)
@@ -115,7 +116,7 @@ Empirically, per-fold stitching of different trials can create calibration error
   - **Round 2** (mean-best): adds top `n_mean_best` trials by mean CV score, skipping already selected ones.
 - **No retraining, no rank-norm needed**: Each composite is one trial's complete OOF — no scale mismatch.
 - **Diversity pruning does NOT activate** with fold_coverage (requires `per_fold_tracker` which is None). All trials run full n_folds.
-- **Disable Optuna pruner with fold_coverage**: MedianPruner prunes after 1 fold by default. Pruned trials are never committed to `TrialOOFStore` → few complete OOF arrays. Set `pruner: {type: none}` in strategy YAML for fold_coverage models.
+- **Pruner and fold_coverage**: Pruned trials are never committed to `TrialOOFStore` — only trials completing all folds are stored. A pruner can still be used: surviving trials are committed normally. The tradeoff is per-fold diversity: MedianPruner prunes on global fold-1 score, so a trial that is mediocre globally but best on a specific fold gets pruned before reaching that fold → round-robin fold-best selection loses those candidates. For datasets with low fold-score variance (NNs on strong-signal data) this matters little and a pruner is fine. `pruner: {type: none}` is the safe default when maximising fold diversity is the priority.
 - **Config** (`optuna.assembly` in strategy YAML):
   ```yaml
   optuna:
@@ -123,6 +124,7 @@ Empirically, per-fold stitching of different trials can create calibration error
     assembly:
       n_fold_best: 10    # round-robin fold-best trials
       n_mean_best: 5     # additional top-mean trials
+      min_quality_percentile: 25.0  # optional quality gate: fold-champion must score ≥ p25 overall (0.0 = disabled)
   ```
 - **`run_optuna_study()` returns 3-tuple**: `(study, PerFoldTracker | None, TrialOOFStore | None)`. All callers must unpack 3 values.
 
@@ -328,14 +330,16 @@ Custom TPE gamma function is the **project default** for all models. Controls th
 - One DB per model: `{storage_dir}/{run_name}__{model_name}.db`
 - Substudy gets its own DB: `{storage_dir}/{run_name}__{model_name}__sub.db`
 - `load_if_exists=True` — interrupted runs resume automatically from existing DB.
-- Study name format: `{run_name}__{model_name}` (e.g. `ps-s6e3-r1__realmlp`)
-- Cross-round trial transfer: load old study with `optuna.load_study(storage=...)`, copy completed trials to new study with `study.add_trial()` — TPE inherits full history with narrowed search space.
+- Study name format: `{run_name}__{model_name}` (e.g. `ps-s6e3__realmlp`)
+- **`run_name` is permanent per competition** — keep it fixed (e.g. `"ps-s6e3"`). Optuna DBs grow across runs via `load_if_exists=True`. TPE automatically inherits all previous trial history on every run. No cross-round copying needed.
 
 ```yaml
-run_name: "ps-s6e3-r1"
+run_name: "ps-s6e3"          # permanent — never increment
 optuna:
   storage_dir: "competitions/ps-s6e3/results/optuna"
 ```
+
+- To start completely fresh: delete the `.db` files in `storage_dir` manually.
 
 ### Tracker Persistence (per_fold & fold_coverage modes)
 - Set `optuna.persist_trackers: true` in pipeline YAML to save OOF predictions to disk.
@@ -354,11 +358,49 @@ optuna:
   persist_trackers: true   # Save OOF predictions between interrupted runs
 ```
 
+### test_combine (per_fold assembly — Claude selects after each run)
+Controls how per-fold test predictions are combined within `PerFoldTracker.assemble()` and `assemble_nsga2()`. Set in strategy YAML under `overrides.<model>.optuna.assembly.test_combine`:
+- `"arithmetic"` (default) — uniform average: `test_p / n_folds` across all folds
+- `"score_weighted"` — weight each fold's test predictions by that fold's validation score; folds where the model performed better contribute more
+- `"geomean"` — geometric mean `exp(mean(log(p)))` across folds; better calibrated near 0/1 for binary classification; falls back to arithmetic for multiclass
+
+Implemented via `_combine_fold_test_preds()` helper in `trainer.py`. Read from `assembly_cfg` and passed to both `assemble()` and `assemble_nsga2()`.
+
+**Agent mode workflow**: After each overnight run, Claude compares per-fold assembly quality. If fold scores vary significantly (some folds much stronger), `score_weighted` may outperform arithmetic. Set in strategy YAML for the next round.
+
 ### File Logging
 - `setup_logging(verbose, log_file)` adds a `FileHandler` in addition to console output.
-- Log file path: `{results_dir}/logs/{run_name}.log` — created automatically by `run.py`.
+- Log file path: `{results_dir}/logs/{run_name}_{timestamp}.log` — created automatically by `run.py`.
+- Multiple runs with same run_name get separate timestamped log files.
 - All console output is mirrored to the log file for post-run analysis.
-- Log file persists between rounds (new run_name → new log file).
+
+### Round Report (post-run strategy aid)
+- Generated automatically at end of every `run.py` execution: `{results_dir}/round_report_{run_name}_{ts}.txt`
+- **Replaces** the old `diversity_report_*.txt`. Contains 11 sections:
+  1. Run History — trial counts, best score, timing per model (from Optuna DB)
+  2. Score Trajectory — best-so-far at trial checkpoints (10/25/50/100/150/200) + marginal gain last 50
+  3. Pruning Analysis — pruned count + inferred cause (MedianPruner vs fold_timeout)
+  4. HP Convergence — top-20% trial ranges vs full range per hyperparameter + fANOVA importances
+  5. Fold-Level Score Matrix — per-fold scores of best composite per model (hard fold detection)
+  6. Assembly Diagnostics — selection mode, committed/selected counts, composites before/after dedup
+  7. Substudy→Main Transfer — substudy best config score vs matching config in main study
+  8. Cross-Model Diversity — OOF correlation matrix + N_eff + most/least correlated pair
+  9. Ensemble Result — strategy, OOF score, NSGA-II weights per model
+  10. Config Similarity Across GBMs — depth/leaves/lr convergence across CatBoost/XGB/LGB
+  11. OOF-LB Gap — OOF vs LB score (requires `output.lb_score` in pipeline YAML)
+- **Standalone generation** (without running the pipeline):
+  ```bash
+  conda run -n maestro python scripts/make_round_report.py --config competitions/ps-s6e3/pipeline.yaml
+  ```
+  Sections 5, 6, 8, 9 are shown as "standalone mode" (require in-memory data). All DB-derived sections work.
+- **LB score tracking**: Set `output.lb_score: 0.91345` in pipeline YAML after submitting to enable section 11.
+  ```yaml
+  output:
+    submission_path: "..."
+    results_dir: "..."
+    save_oof: true
+    lb_score: 0.91345   # Fill after submission
+  ```
 
 ## CV and OOF Predictions
 

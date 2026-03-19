@@ -9,22 +9,26 @@
 # Features: tenure, MonthlyCharges, TotalCharges (continuous)
 #           + 6 binary + 10 low-cardinality categoricals
 #
-# Round 2 — 15h budget (FTT removed: too slow, ~45min/trial on full data)
-# R1 results: RealMLP 0.9153, TabM 0.9145, FTT 0.9138 (only 3 trials)
-# R1 issues: TabM fold_timeout=120s too tight (47% pruned), CatBoost crashed
+# Round 4 — FINAL RUN — 14h budget (after round_report_ps-s6e3_20260319_191655.txt)
+# DB state: CatBoost 162 trials (0.9162), XGBoost 236 (0.9134), LightGBM 47 DROPPED
+#           TabM 38 main (0.9149), RealMLP 115 main (0.9147)  [run_name permanent]
 #
-# 15h budget allocation (sequential):
-# - RealMLP  2h:  substudy 1h (full data, 2-fold, QMC) → main 2h pure TPE
-# - TabM     3h:  substudy 1h (full data, 2-fold, QMC) → main 3h pure TPE
-# - CatBoost 3h:  GPU, QMC=15
-# - XGBoost  3h:  GPU, QMC=15
-# - LightGBM 3h:  GPU, QMC=15
-# Substudies run first (sequential), not counted in model_timeouts below.
-# Total worst-case: (1+2) + (1+3) + 3+3+3 = 16h. In practice GBMs finish
-# before their timeout due to early stopping → expect ~14-15h.
+# Key findings from round_report:
+#   CatBoost: ALL 8 HPs locked, landscape_roughness=0.000007, no gain trials 113-162 → 20min
+#   XGBoost:  constraint removal +0.002 confirmed, ALL HPs LOW (flat space) → 1.5h
+#   LightGBM: SATURATED + 0/10 arrays in R3 ensemble → DROPPED
+#   RealMLP:  best at #115 (last!), gain_rate=0.77, fix act=selu+p_drop_sched=flat_cos
+#   TabM:     best at #39 (last!), fix n_blocks=2, add min_quality_percentile=25
+#
+# 14h budget allocation (sequential):
+# - RealMLP  5h:  substudy 1h → main 4h  (fix 2 converged categoricals)
+# - TabM     6h:  substudy 1h → main 5h  (fix n_blocks=2, quality gate)
+# - XGBoost  1.5h: constraint-free, flat space — diversity source
+# - CatBoost 20min: token budget only — at ceiling
+# Total: 5 + 6 + 1.5 + 0.33 = 12.83h
 # =============================================================================
 
-run_name: "ps-s6e3-r2"                         # study names: ps-s6e3-r2__realmlp etc.
+run_name: "ps-s6e3"                             # permanent — Optuna DBs grow across runs
 
 data:
   train_path: "competitions/ps-s6e3/train.csv"
@@ -32,6 +36,16 @@ data:
   target_column: "Churn"
   id_column: "id"
   task_type: "binary_classification"
+
+extra_data:
+  - path: "competitions/ps-s6e3/WA_Fn-UseC_-Telco-Customer-Churn.csv"
+    target_column: "Churn"          # Yes/No string — same format as train, auto-mapped
+    column_mapping:
+      customerID: id                # rename ID col to match pipeline id_column
+    sample_weight: 5.0              # 7k real rows vs 594k synthetic — upweight for signal
+    # Notes:
+    # - TotalCharges is str in original (11 empty rows → NaN) — auto-coerced by _concat_extra_data
+    # - All 19 feature columns match train exactly (no drop_columns needed)
 
 cv:
   n_folds: 10
@@ -54,7 +68,7 @@ models:
   - tabm
   - catboost
   - xgboost
-  - lightgbm
+  # lightgbm: DROPPED — saturated (gain_rate=0.00), excluded from R3 ensemble (0/10 arrays)
 
 features:
   interactions: []
@@ -79,14 +93,14 @@ ensemble:
 optuna:
   global_seed: 42
   global_timeout: null
-  storage_dir: "competitions/ps-s6e3/results/optuna"   # SQLite per model
+  storage_dir: "competitions/ps-s6e3/results/optuna"   # SQLite per model; load_if_exists=True
   persist_trackers: true                               # save OOF predictions → interrupt-safe
+  reset_trackers: true                                 # R4: extra_data changed train size → start OOF fresh
   model_timeouts:
-    realmlp: "2h"                        # main study after substudy; substudy has own 1h timeout
-    tabm: "3h"                           # main study after substudy; substudy has own 1h timeout
-    catboost: "3h"                       # GPU, full exploration (crashed in R1)
-    xgboost: "3h"                        # GPU, full exploration
-    lightgbm: "3h"                       # GPU, full exploration
+    realmlp: "4h"                        # main study after substudy; substudy has own 1h timeout
+    tabm: "5h"                           # main study after substudy; 5h = ~25 new trials (only 38 total so far)
+    catboost: "20min"                    # TOKEN BUDGET — ceiling reached, ALL HPs locked, no gain since trial#112
+    xgboost: "1h30min"                   # constraint removal +0.002 confirmed; flat space, 1.5h for diversity
 
 runtime:
   gpu_check: true
@@ -98,3 +112,4 @@ output:
   submission_path: "competitions/ps-s6e3/results/submission.csv"
   results_dir: "competitions/ps-s6e3/results/"
   save_oof: true
+  lb_score: 0.91345             # R3 LB score — enables Section 11 (OOF-LB gap) in round report

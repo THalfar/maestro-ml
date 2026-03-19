@@ -611,13 +611,18 @@ class TestRunManualMode:
     def test_custom_eda_output_path(self, tmp_path, monkeypatch):
         """When eda_output_path is given, EDA report is saved there."""
         strategy_yaml = tmp_path / "strategy.yaml"
-        strategy_yaml.write_text(
-            "features: {}\nmodels: []\nreasoning: custom path\n",
-            encoding="utf-8",
-        )
+        # Don't pre-create file — agent-mode shortcut (line 535) would skip EDA writing.
+        # Instead, create it inside the input() mock so it exists when checked at line 579.
         eda_out = tmp_path / "custom" / "my_eda.txt"
 
-        monkeypatch.setattr("builtins.input", lambda _: "")
+        def fake_input(_):
+            strategy_yaml.write_text(
+                "features: {}\nmodels: []\nreasoning: custom path\n",
+                encoding="utf-8",
+            )
+            return ""
+
+        monkeypatch.setattr("builtins.input", fake_input)
         with patch("src.strategy.llm_strategist.Path") as MockPath:
             real_path = Path
             def path_side_effect(arg):
@@ -643,12 +648,16 @@ class TestRunManualMode:
         subdir = tmp_path / "results"
         subdir.mkdir()
         strategy_yaml = subdir / "strategy.yaml"
-        strategy_yaml.write_text(
-            "features: {}\nmodels: []\nreasoning: default eda path\n",
-            encoding="utf-8",
-        )
+        # Don't pre-create — create inside input() mock to avoid agent-mode shortcut.
 
-        monkeypatch.setattr("builtins.input", lambda _: "")
+        def fake_input(_):
+            strategy_yaml.write_text(
+                "features: {}\nmodels: []\nreasoning: default eda path\n",
+                encoding="utf-8",
+            )
+            return ""
+
+        monkeypatch.setattr("builtins.input", fake_input)
         with patch("src.strategy.llm_strategist.Path") as MockPath:
             real_path = Path
             def path_side_effect(arg):

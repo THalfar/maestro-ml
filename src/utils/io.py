@@ -102,6 +102,7 @@ class OutputConfig:
     submission_path: str = "results/submission.csv"
     results_dir: str = "results/"
     save_oof: bool = True
+    lb_score: Optional[float] = None  # Fill after submission to enable OOF-LB gap tracking
 
 
 @dataclass
@@ -157,7 +158,7 @@ class OptunaModelConfig:
     })
     n_top_trials: int = 5
     n_seeds: int = 3
-    selection_mode: str = "global"  # "global" | "per_fold"
+    selection_mode: str = "global"  # "global" | "per_fold" | "fold_coverage"
     fold_timeout: Optional[int] = None  # per-fold training timeout in seconds
     assembly: dict[str, Any] = field(default_factory=lambda: {
         "mode": "rank",  # "rank" | "nsga2"
@@ -370,6 +371,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         submission_path=output_raw.get("submission_path", "results/submission.csv"),
         results_dir=output_raw.get("results_dir", "results/"),
         save_oof=output_raw.get("save_oof", True),
+        lb_score=output_raw.get("lb_score", None),
     )
 
     target_mapping_raw = data.get("target_mapping")

@@ -2153,7 +2153,7 @@ class TestNanImputation:
                 "qmc_warmup_trials": 1,
                 "timeout": None,
                 "pruner": {"type": "none"},
-                "n_top_trials": 2,
+                "n_top_trials": 3,  # must be >= n_trials to avoid evicting best_trial on ties
                 "n_seeds": 1,
             },
         }
@@ -2527,10 +2527,17 @@ class TestScalerOptuna:
         assert "scaler" in completed[0].params
 
     def test_strategy_constrains_scaler_choices(
-        self, ridge_configs_dir_scaling, scaling_binary_data, scaling_pipeline
+        self, ridge_configs_dir_scaling, scaling_pipeline
     ):
-        """Strategy with single scaler should pre-scale (no per-fold scaling)."""
-        train, test = scaling_binary_data
+        """Strategy with single scaler should pre-scale (no per-fold scaling) for large N."""
+        # Pre-scaling only activates when n_train >= 1000 (leakage is negligible at large N).
+        rng = np.random.default_rng(42)
+        n_train, n_test = 1200, 100
+        X = rng.normal(0, 1, (n_train, 3))
+        y = (X[:, 0] + X[:, 1] > 0).astype(int)
+        train = pd.DataFrame(X, columns=["f1", "f2", "f3"])
+        train["target"] = y
+        test = pd.DataFrame(rng.normal(0, 1, (n_test, 3)), columns=["f1", "f2", "f3"])
         registry = ModelRegistry(ridge_configs_dir_scaling)
         strategy = {
             "preprocessing": {
@@ -5461,3 +5468,147 @@ class TestTrialOOFStoreSaveLoad:
         for c in composites:
             assert c["oof_preds"].shape == (20,)
             assert c["test_preds"].shape == (8,)
+
+
+# ---------------------------------------------------------------------------
+# Tracker persistence ordering bug (objective created before tracker loading)
+# ---------------------------------------------------------------------------
+
+class TestTrackerPersistenceOrdering:
+    """Verify that objective and persist_callback reference the SAME tracker object.
+
+    BUG: In run_optuna_study(), the objective is created at ~L1805 with the
+    fresh tracker, but tracker loading from disk happens at ~L1862 which
+    REASSIGNS the local `tracker` variable.  The objective still holds the
+    old (empty) tracker, so new trial data never reaches the loaded tracker.
+
+    This test checks the symptom: after a save→reload cycle in per_fold mode,
+    the returned tracker from run_optuna_study should contain data from the
+    new run (not just stale loaded data).
+    """
+
+    def test_per_fold_tracker_updated_after_reload(self, tmp_path):
+        """After save→reload, new trials should appear in the returned tracker."""
+        from src.models.trainer import run_optuna_study, PerFoldTracker
+        from src.utils.io import PipelineConfig, CVConfig, OptunaGlobalConfig, OutputConfig
+
+        # Minimal pipeline config
+        configs_dir = tmp_path / "configs" / "models"
+        configs_dir.mkdir(parents=True, exist_ok=True)
+        yaml_content = {
+            "name": "Ridge",
+            "class_path": {
+                "binary_classification": "sklearn.linear_model.LogisticRegression",
+                "regression": "sklearn.linear_model.Ridge",
+            },
+            "task_types": ["binary_classification", "regression"],
+            "gpu": {"supported": False, "params": {}, "fallback": {}},
+            "fixed_params": {
+                "binary_classification": {"max_iter": 200, "solver": "lbfgs"},
+                "regression": {},
+            },
+            "hyperparameters": {
+                "C": {"type": "float", "low": 0.01, "high": 10.0, "log": True},
+            },
+            "optuna": {
+                "n_trials": 3,
+                "n_top_trials": 5,
+                "n_seeds": 1,
+                "qmc_warmup_trials": 2,
+                "selection_mode": "per_fold",
+                "fold_timeout": None,
+                "pruner": {"type": "none"},
+            },
+            "training": {
+                "needs_eval_set": False,
+                "early_stopping": False,
+                "eval_metric_param": None,
+            },
+            "feature_requirements": {
+                "needs_scaling": False,
+            },
+        }
+        import yaml
+        with open(configs_dir / "ridge.yaml", "w") as f:
+            yaml.dump(yaml_content, f)
+
+        registry = ModelRegistry(str(configs_dir))
+
+        rng = np.random.default_rng(42)
+        n = 40
+        train = pd.DataFrame({
+            "f1": rng.standard_normal(n),
+            "f2": rng.standard_normal(n),
+            "target": rng.integers(0, 2, size=n),
+        })
+        test = pd.DataFrame({
+            "f1": rng.standard_normal(15),
+            "f2": rng.standard_normal(15),
+        })
+
+        storage_dir = tmp_path / "optuna_storage"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        results_dir = tmp_path / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build a pipeline config with persist_trackers=True
+        pipeline_config = PipelineConfig(
+            task_type="binary_classification",
+            target_column="target",
+            models=["ridge"],
+            cv=CVConfig(n_folds=2, seed=42, stratified=True),
+            optuna=OptunaGlobalConfig(
+                global_seed=42,
+                model_timeouts={},
+                storage_dir=str(storage_dir),
+                persist_trackers=True,
+            ),
+            output=OutputConfig(
+                submission_path=str(tmp_path / "sub.csv"),
+                results_dir=str(results_dir),
+            ),
+            run_name="test_persist",
+        )
+
+        # Run 1: creates tracker and saves to disk
+        study1, tracker1, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+            test=test,
+        )
+        # tracker1 should have entries
+        n_entries_run1 = sum(len(v) for v in tracker1.fold_data.values())
+        assert n_entries_run1 > 0, "Run 1 should populate tracker"
+
+        # Verify pkl was saved
+        pkl_path = storage_dir / "test_persist__ridge__tracker.pkl"
+        assert pkl_path.exists(), "Tracker pkl should exist after run 1"
+
+        # Run 2: should load from disk AND add new trial data
+        study2, tracker2, _ = run_optuna_study(
+            model_name="ridge",
+            train=train,
+            feature_cols=["f1", "f2"],
+            target_col="target",
+            registry=registry,
+            pipeline_config=pipeline_config,
+            strategy={},
+            gpu=False,
+            test=test,
+        )
+
+        n_entries_run2 = sum(len(v) for v in tracker2.fold_data.values())
+        # The returned tracker should contain BOTH loaded + new trial data.
+        # If the bug is present, it will only contain stale loaded data
+        # (n_entries_run2 == n_entries_run1, no growth from new trials).
+        assert n_entries_run2 > n_entries_run1, (
+            f"Run 2 tracker should grow beyond run 1 ({n_entries_run2} entries "
+            f"vs run 1's {n_entries_run1}). If equal, the objective wrote to "
+            f"an orphaned tracker and the loaded one was returned unchanged."
+        )

@@ -946,3 +946,197 @@ class TestSaveEdaReportNpBool:
         loaded = json.loads(path.read_text(encoding="utf-8"))
         assert loaded["flag"] is True
         assert loaded["nested"]["active"] is False
+
+
+class TestLbScoreOutputConfig:
+    def test_lb_score_default_none(self):
+        cfg = OutputConfig()
+        assert cfg.lb_score is None
+
+    def test_lb_score_parsed_from_yaml(self, tmp_dir: Path):
+        content = {
+            "output": {
+                "submission_path": "sub.csv",
+                "results_dir": "results/",
+                "save_oof": True,
+                "lb_score": 0.91345,
+            },
+        }
+        path = tmp_dir / "pipe_lb.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.output.lb_score == pytest.approx(0.91345)
+
+    def test_lb_score_absent_from_yaml_is_none(self, tmp_dir: Path):
+        content = {"output": {"submission_path": "sub.csv"}}
+        path = tmp_dir / "pipe_no_lb.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.output.lb_score is None
+
+
+# ---------------------------------------------------------------------------
+# setup_logging — file handler
+# ---------------------------------------------------------------------------
+
+class TestSetupLoggingFileHandler:
+    def test_log_file_creates_file_handler(self, tmp_dir: Path):
+        """setup_logging with log_file should add a FileHandler."""
+        logger = logging.getLogger("maestro")
+        logger.handlers.clear()
+
+        log_path = tmp_dir / "test.log"
+        setup_logging(1, log_file=str(log_path))
+
+        file_handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
+        assert len(file_handlers) == 1
+        assert file_handlers[0].baseFilename == str(log_path)
+
+        # Clean up
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                logger.removeHandler(h)
+
+    def test_log_file_writes_messages(self, tmp_dir: Path):
+        """Messages logged should appear in the log file."""
+        logger = logging.getLogger("maestro")
+        logger.handlers.clear()
+
+        log_path = tmp_dir / "write_test.log"
+        setup_logging(1, log_file=str(log_path))
+
+        logger.info("test message 42")
+
+        # Flush handlers
+        for h in logger.handlers:
+            h.flush()
+
+        content = log_path.read_text(encoding="utf-8")
+        assert "test message 42" in content
+
+        # Clean up
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                logger.removeHandler(h)
+
+    def test_no_duplicate_file_handlers(self, tmp_dir: Path):
+        """Calling setup_logging twice with log_file should not add duplicate FileHandlers."""
+        logger = logging.getLogger("maestro")
+        logger.handlers.clear()
+
+        log_path = tmp_dir / "dup_test.log"
+        setup_logging(1, log_file=str(log_path))
+        setup_logging(1, log_file=str(log_path))
+
+        file_handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
+        assert len(file_handlers) == 1
+
+        # Clean up
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                logger.removeHandler(h)
+
+    def test_optuna_logger_gets_file_handler(self, tmp_dir: Path):
+        """Optuna logger should receive the same FileHandler."""
+        maestro_logger = logging.getLogger("maestro")
+        maestro_logger.handlers.clear()
+        optuna_logger = logging.getLogger("optuna")
+        optuna_file_handlers_before = [
+            h for h in optuna_logger.handlers if isinstance(h, logging.FileHandler)
+        ]
+        for h in optuna_file_handlers_before:
+            h.close()
+            optuna_logger.removeHandler(h)
+
+        log_path = tmp_dir / "optuna_test.log"
+        setup_logging(1, log_file=str(log_path))
+
+        optuna_file_handlers = [
+            h for h in optuna_logger.handlers if isinstance(h, logging.FileHandler)
+        ]
+        assert len(optuna_file_handlers) >= 1
+
+        # Clean up
+        for h in list(maestro_logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                maestro_logger.removeHandler(h)
+        for h in list(optuna_logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                h.close()
+                optuna_logger.removeHandler(h)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline config: run_name, storage_dir, persist_trackers
+# ---------------------------------------------------------------------------
+
+class TestPipelineConfigOptunaPersistence:
+    def test_run_name_parsed(self, tmp_dir: Path):
+        content = {
+            "run_name": "ps-s6e3-r2",
+            "data": {"train_path": "t.csv"},
+        }
+        path = tmp_dir / "rn.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.run_name == "ps-s6e3-r2"
+
+    def test_run_name_default(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "no_rn.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.run_name == "run"
+
+    def test_storage_dir_parsed(self, tmp_dir: Path):
+        content = {
+            "data": {"train_path": "t.csv"},
+            "optuna": {"storage_dir": "results/optuna"},
+        }
+        path = tmp_dir / "sd.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.optuna.storage_dir == "results/optuna"
+
+    def test_storage_dir_default_none(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "no_sd.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.optuna.storage_dir is None
+
+    def test_persist_trackers_parsed(self, tmp_dir: Path):
+        content = {
+            "data": {"train_path": "t.csv"},
+            "optuna": {"persist_trackers": True},
+        }
+        path = tmp_dir / "pt.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.optuna.persist_trackers is True
+
+    def test_persist_trackers_default_false(self, tmp_dir: Path):
+        content = {"data": {"train_path": "t.csv"}}
+        path = tmp_dir / "no_pt.yaml"
+        path.write_text(yaml.dump(content), encoding="utf-8")
+        cfg = load_pipeline_config(path)
+        assert cfg.optuna.persist_trackers is False
+
+
+# ---------------------------------------------------------------------------
+# save_eda_report — tuple handling
+# ---------------------------------------------------------------------------
+
+class TestSaveEdaReportTuples:
+    def test_tuple_in_report(self, tmp_dir: Path):
+        """Tuples should serialize to JSON arrays (json.dump handles natively)."""
+        report = {"coords": (1, 2, 3), "nested": {"pair": (4.0, 5.0)}}
+        path = tmp_dir / "tuple_report.json"
+        save_eda_report(report, path)
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded["coords"] == [1, 2, 3]
+        assert loaded["nested"]["pair"] == [4.0, 5.0]

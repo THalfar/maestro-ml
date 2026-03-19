@@ -114,6 +114,62 @@ def _rank_norm_1d(arr: np.ndarray) -> np.ndarray:
     return rankdata(arr) / len(arr)
 
 
+def _combine_fold_test_preds(
+    fold_test_preds: list[np.ndarray],
+    fold_scores: list[float],
+    test_combine: str,
+    n_test: int,
+    is_multiclass: bool = False,
+    maximize: bool = True,
+) -> np.ndarray:
+    """Combine per-fold test predictions into a single array.
+
+    Args:
+        fold_test_preds: List of test prediction arrays, one per fold.
+        fold_scores: Validation score for each fold (used by score_weighted).
+        test_combine: Combination method:
+            ``"arithmetic"`` — uniform average (1/n_folds each).
+            ``"score_weighted"`` — weight by fold validation score.
+            ``"geomean"`` — geometric mean ``exp(mean(log(p)))``; better
+            calibrated near 0/1 for binary classification.
+        n_test: Number of test samples (for fallback initialization).
+        is_multiclass: If True, skip geomean (not defined for prob vectors).
+        maximize: If True, higher fold_scores are better (classification).
+            If False (regression), fold_scores are errors — they are inverted
+            (1/s) before weighting so better-scoring (lower-error) folds get
+            more weight.
+
+    Returns:
+        Combined test prediction array of shape ``(n_test,)`` or
+        ``(n_test, n_classes)`` for multiclass.
+    """
+    n = len(fold_test_preds)
+    if n == 0:
+        return np.zeros(n_test)
+
+    if test_combine == "score_weighted":
+        # For regression (maximize=False) fold_scores are errors (lower=better).
+        # Invert so lower-error folds receive higher weight.
+        if not maximize:
+            weights = [1.0 / (s + 1e-9) for s in fold_scores]
+        else:
+            weights = list(fold_scores)
+        total = float(sum(weights))
+        if total > 0:
+            return sum(w / total * p for w, p in zip(weights, fold_test_preds))
+        # Fallback: all weights zero → uniform
+        return sum(p for p in fold_test_preds) / n
+
+    if test_combine == "geomean" and not is_multiclass:
+        _eps = 1e-7
+        return np.exp(
+            np.mean([np.log(np.clip(p, _eps, 1.0 - _eps)) for p in fold_test_preds], axis=0)
+        )
+
+    # Default: arithmetic mean
+    return sum(p for p in fold_test_preds) / n
+
+
 def _deduplicate_composites(
     composites: list[dict[str, Any]],
     corr_threshold: float = 0.9999,
@@ -645,12 +701,13 @@ class PerFoldTracker:
         n_test: int,
         task_type: str = "binary_classification",
         rank_normalize: bool = True,
+        test_combine: str = "arithmetic",
     ) -> list[dict[str, Any]]:
         """Build composite OOF + test arrays from per-fold bests.
 
         For the k-th composite:
         - OOF: ``oof[val_idx] = k-th best trial's val_preds`` for each fold.
-        - Test: average of per-fold test predictions (``+= fold_test / n_folds``).
+        - Test: combine per-fold test predictions according to ``test_combine``.
 
         When ``rank_normalize=True`` (default), per-fold predictions are
         rank-normalized to (0, 1] before stitching.  This removes scale
@@ -664,6 +721,12 @@ class PerFoldTracker:
             task_type: Task type string.
             rank_normalize: If True, rank-normalize per-fold predictions to
                 (0, 1] before stitching (binary/regression only).
+            test_combine: How to combine per-fold test predictions.
+                ``"arithmetic"`` — uniform average (``+= test_p / n_folds``).
+                ``"score_weighted"`` — weight each fold's test predictions by
+                that fold's validation score (higher score = more weight).
+                ``"geomean"`` — geometric mean ``exp(mean(log(p)))`` across
+                folds; better calibrated near 0/1 for binary classification.
 
         Returns:
             List of dicts, each with keys: ``oof_preds``, ``test_preds``,
@@ -680,17 +743,15 @@ class PerFoldTracker:
         results: list[dict[str, Any]] = []
         for k in range(n_composites):
             if is_multiclass:
-                # Infer n_classes from stored predictions
                 sample_preds = self.fold_data[0][k].val_preds
                 n_classes = sample_preds.shape[1] if sample_preds.ndim > 1 else 1
                 oof = np.zeros((n_samples, n_classes))
-                test_preds = np.zeros((n_test, n_classes))
             else:
                 oof = np.zeros(n_samples)
-                test_preds = np.zeros(n_test)
 
             fold_trials: list[int] = []
             fold_scores: list[float] = []
+            fold_test_preds: list[np.ndarray] = []
 
             for fold_idx in range(self.n_folds):
                 entry = self.fold_data[fold_idx][k]
@@ -700,9 +761,15 @@ class PerFoldTracker:
                     val_p = _rank_norm_1d(val_p)
                     test_p = _rank_norm_1d(test_p)
                 oof[entry.val_idx] = val_p
-                test_preds += test_p / self.n_folds
                 fold_trials.append(entry.trial_number)
                 fold_scores.append(entry.score)
+                fold_test_preds.append(test_p)
+
+            test_preds = _combine_fold_test_preds(
+                fold_test_preds, fold_scores, test_combine, n_test,
+                is_multiclass=is_multiclass,
+                maximize=self.maximize,
+            )
 
             results.append({
                 "oof_preds": oof,
@@ -727,6 +794,7 @@ class PerFoldTracker:
         diversity_weight: float = 0.3,
         seed: int = 42,
         rank_normalize: bool = True,
+        test_combine: str = "arithmetic",
     ) -> list[dict[str, Any]]:
         """Build composite arrays via NSGA-II fold-level optimization.
 
@@ -792,13 +860,12 @@ class PerFoldTracker:
                 sample_preds = self.fold_data[0][0].val_preds
                 n_classes = sample_preds.shape[1] if sample_preds.ndim > 1 else 1
                 oof = np.zeros((n_samples, n_classes))
-                test_preds = np.zeros((n_test, n_classes))
             else:
                 oof = np.zeros(n_samples)
-                test_preds = np.zeros(n_test)
 
             fold_trials: list[int] = []
             fold_scores: list[float] = []
+            fold_test_preds: list[np.ndarray] = []
 
             for fold_idx in range(self.n_folds):
                 entry = self.fold_data[fold_idx][indices[fold_idx]]
@@ -808,10 +875,15 @@ class PerFoldTracker:
                     val_p = _rank_norm_1d(val_p)
                     test_p = _rank_norm_1d(test_p)
                 oof[entry.val_idx] = val_p
-                test_preds += test_p / self.n_folds
                 fold_trials.append(entry.trial_number)
                 fold_scores.append(entry.score)
+                fold_test_preds.append(test_p)
 
+            test_preds = _combine_fold_test_preds(
+                fold_test_preds, fold_scores, test_combine, n_test,
+                is_multiclass=is_multiclass,
+                maximize=self.maximize,
+            )
             return oof, test_preds, fold_trials, fold_scores
 
         # --- pymoo problem: each individual = n_folds continuous vars mapped to int indices ---
@@ -881,7 +953,7 @@ class PerFoldTracker:
 
         if result.F is None or len(result.F) == 0:
             logger.warning("Fold-NSGA-II produced no solutions, falling back to rank assembly")
-            return self.assemble(n_samples, n_test, task_type)
+            return self.assemble(n_samples, n_test, task_type, rank_normalize, test_combine)
 
         # Extract Pareto front solutions
         pareto_F = result.F  # (n_pareto, 2)
@@ -1031,7 +1103,13 @@ class PerFoldTracker:
 
     @classmethod
     def load(cls, path: str | Path) -> "PerFoldTracker":
-        """Load a previously saved tracker from disk."""
+        """Load a previously saved tracker from disk.
+
+        Warning:
+            Uses ``pickle.load`` — only load files written by this process
+            in a trusted ``storage_dir``.  Do not load tracker files from
+            untrusted or externally-supplied sources.
+        """
         import pickle
         with open(path, "rb") as f:
             data = pickle.load(f)
@@ -1142,6 +1220,7 @@ def _run_substudy(
     monotone_constraints: list[int] | None = None,
     run_name: str = "run",
     storage_dir: str | None = None,
+    existing_main_params: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run a substudy on a stratified data subset to find good starting configs.
 
@@ -1166,6 +1245,11 @@ def _run_substudy(
         scaler_choices: Scaler choices (None if no scaling needed).
         global_seed: Seed for reproducibility.
         monotone_constraints: Optional monotone constraints list.
+        existing_main_params: Set of ``str(sorted(params.items()))`` keys for
+            trials already completed in the main study.  When provided, the
+            top-N guarantee selects the top-N configs that are *not* yet known
+            to the main study — sliding past already-known entries so the main
+            study always receives genuinely new configs.
 
     Returns:
         Tuple of:
@@ -1330,21 +1414,42 @@ def _run_substudy(
     except Exception:
         pass  # Not enough completed trials or other issue
 
-    # Top-N: always include the best trials unconditionally
-    actual_top_n = min(top_n, n_completed)
-    top_indices: set[int] = set(range(actual_top_n))
+    # Top-N: pick the best N trials that are NOT already known to the main study.
+    # If existing_main_params is provided (transfer_from scenario), we slide past
+    # already-known entries so the main study always gets genuinely new configs.
+    # Example: top-3 are all from r2 → take indices 3, 4, 5 instead.
+    top_indices: set[int] = set()
+    for i in range(n_completed):
+        if len(top_indices) >= top_n:
+            break
+        params_key = str(sorted(
+            {k: v for k, v in completed[i].params.items() if k != "scaler"}.items()
+        ))
+        if existing_main_params and params_key in existing_main_params:
+            continue  # already known → slide to next best
+        top_indices.add(i)
+    actual_top_n = len(top_indices)
 
-    # Rank-weighted importance sampling for remaining slots
+    # Rank-weighted importance sampling for remaining slots.
+    # Candidates: all non-top-N trials that are also not already known.
     n_remaining = n_enqueue - actual_top_n
-    effective_n_enqueue = min(n_remaining, n_completed // 3)
+    novel_candidates = [
+        i for i in range(n_completed)
+        if i not in top_indices and (
+            not existing_main_params or str(sorted(
+                {k: v for k, v in completed[i].params.items() if k != "scaler"}.items()
+            )) not in existing_main_params
+        )
+    ]
+    effective_n_enqueue = min(n_remaining, max(len(novel_candidates) // 3, 1))
     if effective_n_enqueue < 1:
-        effective_n_enqueue = min(n_remaining, n_completed)
+        effective_n_enqueue = min(n_remaining, len(novel_candidates))
     effective_n_enqueue = max(effective_n_enqueue, 0)
 
     sampled_indices: list[int] = []
     if effective_n_enqueue > 0:
-        # Build weights over non-top-N candidates only
-        candidate_indices = [i for i in range(n_completed) if i not in top_indices]
+        # Build weights over novel (non-top-N, non-already-known) candidates only
+        candidate_indices = novel_candidates
         if candidate_indices:
             n_candidates = len(candidate_indices)
             rng = np.random.default_rng(global_seed)
@@ -1363,10 +1468,17 @@ def _run_substudy(
         params.pop("scaler", None)  # Scaler handled separately
         enqueue_params.append(params)
 
+    n_already_known = sum(
+        1 for i in range(n_completed)
+        if existing_main_params and str(sorted(
+            {k: v for k, v in completed[i].params.items() if k != "scaler"}.items()
+        )) in existing_main_params
+    ) if existing_main_params else 0
     logger.info(
         f"[{model_name}] Substudy sampled {len(enqueue_params)} trials "
-        f"(top_n={actual_top_n} guaranteed + {len(sampled_indices)} rank-weighted, "
-        f"temperature={temperature}, from {n_completed} completed)"
+        f"(top_n={actual_top_n} novel-guaranteed + {len(sampled_indices)} rank-weighted"
+        + (f", {n_already_known} skipped (already in main study)" if n_already_known else "")
+        + f", temperature={temperature}, from {n_completed} completed)"
     )
 
     # Determine best scaler
@@ -1463,6 +1575,12 @@ def run_optuna_study(
     optuna_overrides = model_overrides_raw.pop("optuna", None)
     if optuna_overrides:
         _deep_merge(optuna_cfg, optuna_overrides)
+
+    # Per-model monotone_constraints override.  An empty dict {} means "disable
+    # constraints for this model" — useful when a model (e.g. XGBoost) underperforms
+    # with global constraints but siblings (LightGBM) should keep them.
+    # None means "use global strategy['monotone_constraints']" (default).
+    mc_per_model = model_overrides_raw.pop("monotone_constraints", None)
 
     # Separate hyperparameters key if present (explicit hyperparameter overrides)
     hp_overrides = model_overrides_raw.pop("hyperparameters", None)
@@ -1564,23 +1682,33 @@ def run_optuna_study(
         # train+test ONCE upfront instead of per-fold × per-trial.
         # With 595k rows × 10 folds × 100+ trials this saves thousands of scaler fits.
         # Slight leakage (fit on full train, not 90%) is negligible at large N.
+        # Guard: skip pre-scaling on small datasets (<1000 rows) where val fold is
+        # 10-20% of train and scaler statistics leak would be meaningful.
         if len(scaler_choices) == 1 and scaler_choices[0] != "none":
-            prescaled_scaler = scaler_choices[0]
-            train, test, was_scaled = _apply_prescaling(
-                train, test, feature_cols, prescaled_scaler, model_name,
-            )
-            if was_scaled:
-                scaler_choices = None  # Don't pass to objective — already scaled
+            if len(train) >= 1000:
+                prescaled_scaler = scaler_choices[0]
+                train, test, was_scaled = _apply_prescaling(
+                    train, test, feature_cols, prescaled_scaler, model_name,
+                )
+                if was_scaled:
+                    scaler_choices = None  # Don't pass to objective — already scaled
+                else:
+                    prescaled_scaler = None
             else:
-                prescaled_scaler = None
+                logger.info(
+                    f"[{model_name}] Pre-scaling skipped (n_train={len(train)} < 1000) "
+                    f"— using per-fold scaler fit to avoid leakage"
+                )
         else:
             logger.info(f"[{model_name}] Scaler search: {scaler_choices}")
 
     # Resolve monotone constraints from strategy (feature_name → direction)
     # into a positional list matching feature_cols order.
     # NOTE: moved before substudy block so constraints are available there too.
+    # Per-model override (mc_per_model) takes precedence over global constraints.
+    # An empty dict {} from the override means "disable constraints for this model".
     monotone_constraints_list: list[int] | None = None
-    mc_dict = strategy.get("monotone_constraints", {}) or {}
+    mc_dict = mc_per_model if mc_per_model is not None else (strategy.get("monotone_constraints", {}) or {})
     if mc_dict and model_name in ("catboost", "xgboost", "lightgbm"):
         monotone_constraints_list = [
             int(mc_dict.get(col, 0)) for col in feature_cols
@@ -1604,6 +1732,31 @@ def run_optuna_study(
     substudy_cfg = optuna_cfg.get("substudy")
     substudy_ran = False
     if substudy_cfg and substudy_cfg.get("enabled", False):
+        # Build existing_main_params so substudy can skip already-known configs
+        # in its top-N guarantee (slides past them to find genuinely new ones).
+        # Note: study_name is defined later; construct it here directly.
+        existing_main_params: set[str] | None = None
+        _main_storage = pipeline_config.optuna.storage_dir
+        _main_study_name = f"{pipeline_config.run_name}__{model_name}"
+        if _main_storage:
+            _main_db = Path(_main_storage) / f"{_main_study_name}.db"
+            if _main_db.exists():
+                try:
+                    _tmp = optuna.load_study(
+                        study_name=_main_study_name,
+                        storage=f"sqlite:///{_main_db}",
+                    )
+                    existing_main_params = {
+                        str(sorted(
+                            {k: v for k, v in t.params.items() if k != "scaler"}.items()
+                        ))
+                        for t in _tmp.trials
+                        if t.state == optuna.trial.TrialState.COMPLETE
+                    }
+                    del _tmp
+                except Exception:
+                    pass  # DB exists but study not yet created — will be empty
+
         substudy_enqueue, substudy_scaler = _run_substudy(
             model_name=model_name,
             train=train,
@@ -1620,6 +1773,7 @@ def run_optuna_study(
             monotone_constraints=monotone_constraints_list,
             run_name=pipeline_config.run_name,
             storage_dir=pipeline_config.optuna.storage_dir,
+            existing_main_params=existing_main_params,
         )
 
         # Scaler lock: replace scaler_choices with single winner
@@ -1648,28 +1802,6 @@ def run_optuna_study(
     # Diversity pruning config (only meaningful with per-fold tracker)
     dp_cfg = optuna_cfg.get("diversity_pruning") if selection_mode == "per_fold" else None
 
-    objective = _create_objective(
-        model_name=model_name,
-        train=train,
-        feature_cols=feature_cols,
-        target_col=target_col,
-        cv=cv,
-        search_space=search_space,
-        registry=registry,
-        task_type=task_type,
-        gpu=gpu,
-        results_dir=results_dir,
-        test=test,
-        per_fold_tracker=tracker,
-        trial_oof_store=trial_oof_store,
-        fold_timeout=fold_timeout,
-        n_top_trials=optuna_cfg["n_top_trials"],
-        scaler_choices=scaler_choices,
-        prescaled_scaler=prescaled_scaler,
-        monotone_constraints=monotone_constraints_list,
-        diversity_pruning=dp_cfg,
-    )
-
     # Configure pruner
     pruner_cfg = optuna_cfg.get("pruner", {}) or {}
     pruner = _build_pruner(pruner_cfg)
@@ -1695,45 +1827,121 @@ def run_optuna_study(
 
     # Tracker/OOF-store persistence: load from disk if available
     persist = pipeline_config.optuna.persist_trackers and bool(storage_dir)
+    reset_trackers = optuna_cfg.get("reset_trackers", False)
     tracker_pkl: Path | None = None
     oof_store_pkl: Path | None = None
     if persist:
         tracker_pkl = Path(storage_dir) / f"{study_name}__tracker.pkl"
         oof_store_pkl = Path(storage_dir) / f"{study_name}__oof_store.pkl"
-        if tracker is not None and tracker_pkl.exists():
+        if reset_trackers:
+            logger.info(
+                f"[{model_name}] reset_trackers=true — skipping OOF pkl load, starting fresh"
+            )
+        if tracker is not None and tracker_pkl.exists() and not reset_trackers:
             try:
                 tracker = PerFoldTracker.load(tracker_pkl)
-                n_entries = sum(len(v) for v in tracker.fold_data.values())
-                logger.info(
-                    f"[{model_name}] Loaded PerFoldTracker from {tracker_pkl} "
-                    f"({n_entries} fold entries)"
-                )
+                # Shape check: invalidate if n_folds changed (e.g. config edited between runs)
+                if tracker.n_folds != cv_cfg.n_folds:
+                    logger.warning(
+                        f"[{model_name}] Loaded PerFoldTracker n_folds mismatch "
+                        f"(stored={tracker.n_folds}, current={cv_cfg.n_folds}) "
+                        f"— discarding stale cache, starting fresh"
+                    )
+                    tracker = PerFoldTracker(
+                        n_top=optuna_cfg["n_top_trials"],
+                        n_folds=cv_cfg.n_folds,
+                        maximize=maximize,
+                        diversity_mode=diversity_mode,
+                        tier1_size=tier1_size,
+                        tier2_corr_threshold=tier2_corr_threshold,
+                    )
+                else:
+                    n_entries = sum(len(v) for v in tracker.fold_data.values())
+                    logger.info(
+                        f"[{model_name}] Loaded PerFoldTracker from {tracker_pkl} "
+                        f"({n_entries} fold entries)"
+                    )
             except Exception as exc:
                 logger.warning(
                     f"[{model_name}] Failed to load tracker from {tracker_pkl}: {exc}"
                 )
-        if trial_oof_store is not None and oof_store_pkl.exists():
+        if trial_oof_store is not None and oof_store_pkl.exists() and not reset_trackers:
             try:
                 trial_oof_store = TrialOOFStore.load(oof_store_pkl)
                 logger.info(
                     f"[{model_name}] Loaded TrialOOFStore from {oof_store_pkl} "
                     f"({len(trial_oof_store._oof)} committed trials)"
                 )
+                # Shape check: invalidate if training set size changed (e.g. extra_data added)
+                if trial_oof_store.n_samples != len(train):
+                    logger.warning(
+                        f"[{model_name}] TrialOOFStore n_samples mismatch "
+                        f"(stored={trial_oof_store.n_samples}, current={len(train)}) "
+                        f"— discarding stale cache, starting fresh"
+                    )
+                    trial_oof_store = TrialOOFStore(
+                        n_samples=len(train),
+                        n_test=n_test_rows,
+                        n_folds=cv_cfg.n_folds,
+                        maximize=maximize,
+                    )
             except Exception as exc:
                 logger.warning(
                     f"[{model_name}] Failed to load oof_store from {oof_store_pkl}: {exc}"
                 )
 
-    # Enqueue pre-specified trials (e.g., known good configs from previous runs
-    # or LLM-suggested starting points). These run first, before QMC/TPE.
+    # Objective must be created AFTER tracker loading so it holds the
+    # up-to-date tracker/trial_oof_store (possibly loaded from disk above).
+    objective = _create_objective(
+        model_name=model_name,
+        train=train,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        cv=cv,
+        search_space=search_space,
+        registry=registry,
+        task_type=task_type,
+        gpu=gpu,
+        results_dir=results_dir,
+        test=test,
+        per_fold_tracker=tracker,
+        trial_oof_store=trial_oof_store,
+        fold_timeout=fold_timeout,
+        n_top_trials=optuna_cfg["n_top_trials"],
+        scaler_choices=scaler_choices,
+        prescaled_scaler=prescaled_scaler,
+        monotone_constraints=monotone_constraints_list,
+        diversity_pruning=dp_cfg,
+    )
+
+    # Enqueue pre-specified trials (e.g., substudy warm-start, LLM-suggested configs).
+    # Skip any params that exactly match an already-completed trial — avoids re-running
+    # configs transferred from a previous round via transfer_from or substudy overlap.
     enqueue_trials = optuna_cfg.get("enqueue_trials", []) or []
     if enqueue_trials:
+        existing_params_set: set[str] = {
+            str(sorted(t.params.items()))
+            for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        }
+        n_skipped = 0
         for trial_params in enqueue_trials:
-            study.enqueue_trial(dict(trial_params))
-        logger.info(
-            f"[{model_name}] Enqueued {len(enqueue_trials)} trial(s) "
-            f"(run before QMC/TPE)"
-        )
+            key = str(sorted(dict(trial_params).items()))
+            if key in existing_params_set:
+                n_skipped += 1
+            else:
+                study.enqueue_trial(dict(trial_params))
+        n_queued = len(enqueue_trials) - n_skipped
+        if n_queued > 0:
+            logger.info(
+                f"[{model_name}] Enqueued {n_queued} trial(s) "
+                f"(run before QMC/TPE)"
+                + (f", skipped {n_skipped} duplicate(s)" if n_skipped else "")
+            )
+        elif n_skipped:
+            logger.info(
+                f"[{model_name}] All {n_skipped} enqueue_trials already in study — skipped"
+            )
 
     # Pipeline-level timeout override takes precedence over model YAML timeout
     effective_timeout = timeout_override if timeout_override is not None else optuna_cfg.get("timeout")
@@ -1881,17 +2089,6 @@ class TrialOOFStore:
         self._partial_test[trial_num] += test_preds / self.n_folds
         self._partial_fold_scores[trial_num][fold_idx] = fold_score
 
-        # Update per-fold best (using only committed trials would require
-        # a second pass; tracking here is a negligible overestimate that is
-        # corrected in select() by checking self._oof membership)
-        better = (
-            fold_idx not in self._fold_best
-            or (self.maximize and fold_score > self._fold_best[fold_idx][1])
-            or (not self.maximize and fold_score < self._fold_best[fold_idx][1])
-        )
-        if better:
-            self._fold_best[fold_idx] = (trial_num, fold_score)
-
     def commit_trial(self, trial_num: int) -> None:
         """Finalise a completed (non-pruned) trial. Must be called once after
         all folds finish, just before the objective returns its score."""
@@ -1903,31 +2100,69 @@ class TrialOOFStore:
         self._test[trial_num] = self._partial_test.pop(trial_num)
         self._fold_scores[trial_num] = fold_scores
         self._mean_scores[trial_num] = float(np.mean(fold_scores))
+        # Update fold_best only for committed (non-pruned) trials so that
+        # _fold_best never points to a pruned trial's number.
+        for fold_idx, fold_score in scores_dict.items():
+            better = (
+                fold_idx not in self._fold_best
+                or (self.maximize and fold_score > self._fold_best[fold_idx][1])
+                or (not self.maximize and fold_score < self._fold_best[fold_idx][1])
+            )
+            if better:
+                self._fold_best[fold_idx] = (trial_num, fold_score)
 
     def select(
         self,
         n_fold_best: int = 10,
         n_mean_best: int = 5,
+        min_quality_percentile: float = 0.0,
     ) -> list[dict[str, Any]]:
         """Fold-coverage selection → composites in PerFoldTracker.assemble() format.
 
         Returns list of dicts with keys: ``oof_preds``, ``test_preds``,
         ``fold_trials``, ``fold_scores``, ``avg_score``.
+
+        Args:
+            n_fold_best: Max trials to select via round-robin fold-best (Round 1).
+            n_mean_best: Additional trials to add by mean CV score (Round 2).
+            min_quality_percentile: Quality gate — a trial is eligible only if its
+                mean CV score is at or above this percentile across all committed
+                trials (0.0 = no gate, 50.0 = must be above median, 25.0 = top 75%).
+                Prevents catastrophically weak fold-champions from entering the pool
+                solely due to fold specialization. Applies to both rounds.
         """
         if not self._oof:
             return []
 
+        # Quality gate: compute threshold from all committed trials' mean scores
+        eligible: set[int] = set(self._oof.keys())
+        if min_quality_percentile > 0.0 and len(self._mean_scores) > 1:
+            all_scores = list(self._mean_scores.values())
+            threshold = float(np.percentile(all_scores, min_quality_percentile))
+            if self.maximize:
+                eligible = {t for t in eligible if self._mean_scores[t] >= threshold}
+            else:
+                eligible = {t for t in eligible if self._mean_scores[t] <= threshold}
+            n_filtered = len(self._oof) - len(eligible)
+            if n_filtered > 0:
+                import logging as _log
+                _log.getLogger(__name__).info(
+                    f"[fold_coverage] Quality gate (p{min_quality_percentile:.0f}): "
+                    f"filtered {n_filtered}/{len(self._oof)} trials below threshold "
+                    f"{threshold:.6f}"
+                )
+
         selected: list[int] = []
         selected_set: set[int] = set()
 
-        # Round 1: per-fold best — round-robin, deduplicated
+        # Round 1: per-fold best — round-robin, deduplicated, quality-gated
         for fold_idx in range(self.n_folds):
             if len(selected) >= n_fold_best:
                 break
-            # Find best COMMITTED trial for this fold
+            # Find best COMMITTED eligible trial for this fold
             fold_candidates = [
                 (t, self._fold_scores[t][fold_idx])
-                for t in self._oof
+                for t in eligible
                 if fold_idx < len(self._fold_scores.get(t, []))
             ]
             if not fold_candidates:
@@ -1939,9 +2174,10 @@ class TrialOOFStore:
                     selected_set.add(t)
                     break
 
-        # Round 2: top by mean CV score, skip already selected
+        # Round 2: top by mean CV score, skip already selected, quality-gated
         remaining = sorted(
-            [(t, s) for t, s in self._mean_scores.items() if t not in selected_set],
+            [(t, s) for t, s in self._mean_scores.items()
+             if t not in selected_set and t in eligible],
             key=lambda x: x[1],
             reverse=self.maximize,
         )
@@ -2002,7 +2238,13 @@ class TrialOOFStore:
 
     @classmethod
     def load(cls, path: str | Path) -> "TrialOOFStore":
-        """Load a previously saved store from disk."""
+        """Load a previously saved store from disk.
+
+        Warning:
+            Uses ``pickle.load`` — only load files written by this process
+            in a trusted ``storage_dir``.  Do not load store files from
+            untrusted or externally-supplied sources.
+        """
         import pickle
         with open(path, "rb") as f:
             data = pickle.load(f)
@@ -2167,6 +2409,9 @@ def _create_objective(
     # is not JSON-serializable with SQLite backend).  Top-N bounding is
     # applied inside the objective so memory stays bounded.
     _oof_store: dict[int, np.ndarray] = {}
+    # Parallel score cache so top-N admission/eviction runs in O(n_top_trials)
+    # instead of O(n_all_trials) by avoiding iteration of study.trials.
+    _score_cache: dict[int, float] = {}
 
     def objective(trial: optuna.Trial) -> float:
         # Scaler selection (Optuna parameter when model needs scaling)
@@ -2364,6 +2609,7 @@ def _create_objective(
             # Per-fold tracking: predict test and update leaderboard.
             # Runs BEFORE prune check so pruned trials still contribute.
             # Use X_test_fold (scaled with this fold's scaler) for predictions.
+            test_fold_preds: np.ndarray | None = None
             if per_fold_tracker is not None and X_test_fold is not None:
                 if task_type == "binary_classification":
                     test_fold_preds = model.predict_proba(X_test_fold)[:, 1]
@@ -2382,14 +2628,17 @@ def _create_objective(
                 )
 
             # Fold-coverage store: accumulate full OOF per trial.
-            # Runs whether or not per_fold_tracker is active.
+            # Reuses test_fold_preds from per_fold_tracker block if already computed.
             if trial_oof_store is not None and X_test_fold is not None:
-                if task_type == "binary_classification":
-                    test_fold_preds_fc = model.predict_proba(X_test_fold)[:, 1]
-                elif task_type == "multiclass":
-                    test_fold_preds_fc = model.predict_proba(X_test_fold)
+                if test_fold_preds is None:
+                    if task_type == "binary_classification":
+                        test_fold_preds_fc = model.predict_proba(X_test_fold)[:, 1]
+                    elif task_type == "multiclass":
+                        test_fold_preds_fc = model.predict_proba(X_test_fold)
+                    else:
+                        test_fold_preds_fc = model.predict(X_test_fold)
                 else:
-                    test_fold_preds_fc = model.predict(X_test_fold)
+                    test_fold_preds_fc = test_fold_preds
                 trial_oof_store.update(
                     trial_num=trial.number,
                     fold_idx=fold_idx,
@@ -2419,23 +2668,25 @@ def _create_objective(
                             corr = 1.0
                         max_corr = max(max_corr, corr)
 
-                    # Check score gate: never diversity-prune if best score
+                    # Check score gate: never diversity-prune if best score.
+                    # Compare fold_metric against the best fold-level score from the
+                    # tracker for this specific fold (apples-to-apples comparison).
                     is_best_so_far = True
                     try:
-                        best_val = trial.study.best_value
-                        if per_fold_tracker.maximize:
-                            is_best_so_far = fold_metric > best_val * (1 + dp_score_tolerance)
-                        else:
-                            is_best_so_far = fold_metric < best_val * (1 - dp_score_tolerance)
-                    except ValueError:
-                        is_best_so_far = True  # no completed trials yet
+                        if tracker_entries:
+                            best_fold_score = tracker_entries[0].score  # sorted best-first
+                            if per_fold_tracker.maximize:
+                                is_best_so_far = fold_metric > best_fold_score * (1 + dp_score_tolerance)
+                            else:
+                                is_best_so_far = fold_metric < best_fold_score * (1 - dp_score_tolerance)
+                    except Exception:
+                        is_best_so_far = True  # no entries yet or other issue
 
                     if max_corr >= dp_corr_threshold and not is_best_so_far:
-                        if not hasattr(trial, "_diversity_flag_count"):
-                            trial._diversity_flag_count = 0  # type: ignore[attr-defined]
-                        trial._diversity_flag_count += 1  # type: ignore[attr-defined]
+                        count = trial.user_attrs.get("_div_flag_count", 0) + 1
+                        trial.set_user_attr("_div_flag_count", count)
 
-                        if trial._diversity_flag_count >= dp_n_consecutive:  # type: ignore[attr-defined]
+                        if count >= dp_n_consecutive:
                             logger.info(
                                 f"[{model_name}] Trial #{trial.number} diversity-pruned at fold "
                                 f"{fold_idx} (max |corr|={max_corr:.4f} >= {dp_corr_threshold})"
@@ -2444,7 +2695,7 @@ def _create_objective(
                             raise optuna.exceptions.TrialPruned()
                     else:
                         # Reset counter — must be consecutive
-                        trial._diversity_flag_count = 0  # type: ignore[attr-defined]
+                        trial.set_user_attr("_div_flag_count", 0)
 
             # Fold timeout: if this fold took too long, prune to skip
             # remaining folds.  Completed fold's predictions are already saved.
@@ -2464,16 +2715,25 @@ def _create_objective(
         # Uses an in-memory dict (not Optuna user_attrs) to avoid JSON
         # serialization issues with SQLite storage backend.
         maximize = task_type != "regression"
-        prior_values = [
-            t.value for t in trial.study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-        ]
-        if len(prior_values) < n_top_trials:
+        # Admission/eviction using _score_cache — O(n_top_trials) per trial,
+        # not O(n_all_trials).  _score_cache mirrors _oof_store: both always
+        # contain the same set of trial numbers (the current top-N).
+        # Tiebreaker: on equal cutoff score, evict the newest trial (highest
+        # number) so earlier (often better) trials are retained.
+        if len(_oof_store) < n_top_trials:
             _oof_store[trial.number] = oof.copy()
+            _score_cache[trial.number] = overall_metric
         else:
-            cutoff = sorted(prior_values, reverse=maximize)[n_top_trials - 1]
+            worst_num = min(
+                _score_cache,
+                key=lambda k: (_score_cache[k] if maximize else -_score_cache[k], -k),
+            )
+            cutoff = _score_cache[worst_num]
             if (maximize and overall_metric >= cutoff) or (not maximize and overall_metric <= cutoff):
                 _oof_store[trial.number] = oof.copy()
+                _score_cache[trial.number] = overall_metric
+                del _oof_store[worst_num]
+                del _score_cache[worst_num]
 
         # Fold-coverage: commit completed trial (must come after all folds finish)
         if trial_oof_store is not None:
@@ -3041,9 +3301,11 @@ def run_all_studies(
             )
 
             # Hyperparameter importance (fANOVA)
+            hp_importance: dict = {}
             try:
                 importances = optuna.importance.get_param_importances(study)
                 if importances:
+                    hp_importance = dict(importances)
                     imp_lines = [
                         f"  {name}: {val:.3f}" for name, val in importances.items()
                     ]
@@ -3055,14 +3317,11 @@ def run_all_studies(
                 pass  # Not enough completed trials or other issue
 
             optuna_cfg = registry.get_optuna_config(model_name)
-            # Apply strategy overrides (same merge as run_optuna_study uses)
+            # Same deep merge as run_optuna_study — recurses into nested dicts so
+            # doubly-nested keys like assembly.nsga2.* are merged, not replaced.
             strategy_overrides = strategy.get("overrides", {}).get(model_name, {}) or {}
             optuna_overrides = strategy_overrides.get("optuna", {}) or {}
-            for k, v in optuna_overrides.items():
-                if isinstance(v, dict) and isinstance(optuna_cfg.get(k), dict):
-                    optuna_cfg[k] = {**optuna_cfg[k], **v}
-                else:
-                    optuna_cfg[k] = v
+            _deep_merge(optuna_cfg, optuna_overrides)
 
             n_top = optuna_cfg["n_top_trials"]
             n_seeds = optuna_cfg["n_seeds"]
@@ -3073,17 +3332,21 @@ def run_all_studies(
             all_test: list[np.ndarray] = []
             labels: np.ndarray | None = None
             retrain_elapsed = 0.0
+            n_composites_raw: int | None = None
+            best_fold_scores: list[float] = []
 
             if selection_mode == "fold_coverage" and oof_store is not None:
                 # --- Fold-coverage path: complete OOF per trial, no retraining ---
                 assembly_cfg = optuna_cfg.get("assembly", {}) or {}
                 n_fold_best = assembly_cfg.get("n_fold_best", pipeline_config.cv.n_folds)
                 n_mean_best = assembly_cfg.get("n_mean_best", 5)
+                min_quality_percentile = assembly_cfg.get("min_quality_percentile", 0.0)
 
                 oof_store.log_summary(model_name)
                 composites = oof_store.select(
                     n_fold_best=n_fold_best,
                     n_mean_best=n_mean_best,
+                    min_quality_percentile=min_quality_percentile,
                 )
 
                 if not composites:
@@ -3092,6 +3355,7 @@ def run_all_studies(
                         f"skipping model"
                     )
                 else:
+                    best_fold_scores = composites[0]["fold_scores"]
                     all_oof = [c["oof_preds"] for c in composites]
                     all_test = [c["test_preds"] for c in composites]
                     labels = train[pipeline_config.target_column].values
@@ -3114,6 +3378,7 @@ def run_all_studies(
                 assembly_mode = assembly_cfg.get("mode", "rank")
 
                 rank_normalize = assembly_cfg.get("rank_normalize", True)
+                test_combine = assembly_cfg.get("test_combine", "arithmetic")
 
                 if assembly_mode == "nsga2":
                     composites = tracker.assemble_nsga2(
@@ -3127,6 +3392,7 @@ def run_all_studies(
                         diversity_weight=assembly_cfg.get("diversity_weight", 0.3),
                         seed=global_seed,
                         rank_normalize=rank_normalize,
+                        test_combine=test_combine,
                     )
                 else:
                     composites = tracker.assemble(
@@ -3134,15 +3400,19 @@ def run_all_studies(
                         n_test=len(test),
                         task_type=task_type,
                         rank_normalize=rank_normalize,
+                        test_combine=test_combine,
                     )
                 tracker.log_summary(model_name)
 
                 # Deduplicate near-identical composites (corr ≥ 0.9999)
+                n_composites_raw = len(composites)
                 composites = _deduplicate_composites(
                     composites,
                     corr_threshold=0.9999,
                     maximize=(task_type != "regression"),
                 )
+                if composites:
+                    best_fold_scores = composites[0]["fold_scores"]
 
                 all_oof = [c["oof_preds"] for c in composites]
                 all_test = [c["test_preds"] for c in composites]
@@ -3187,8 +3457,15 @@ def run_all_studies(
                     f"{total_retrain_fits} fits"
                 )
 
-                # Resolve monotone constraints for retraining
-                mc_dict = strategy.get("monotone_constraints", {}) or {}
+                # Resolve monotone constraints for retraining.
+                # Per-model override in strategy["overrides"][model]["monotone_constraints"]
+                # takes precedence over global strategy["monotone_constraints"].
+                # An empty dict {} from the override disables constraints for this model.
+                _model_ov = (strategy.get("overrides") or {}).get(model_name) or {}
+                if "monotone_constraints" in _model_ov:
+                    mc_dict = _model_ov["monotone_constraints"] or {}
+                else:
+                    mc_dict = strategy.get("monotone_constraints", {}) or {}
                 mc_list: list[int] | None = None
                 if mc_dict and model_name in ("catboost", "xgboost", "lightgbm"):
                     if model_name == "catboost" and gpu:
@@ -3251,6 +3528,11 @@ def run_all_studies(
                 "retrain_elapsed": retrain_elapsed,
                 "n_trials": len(study.trials),
                 "avg_trial_time": avg_trial_time,
+                "selection_mode": selection_mode,
+                "n_committed": len(oof_store._oof) if oof_store is not None else None,
+                "n_composites_raw": n_composites_raw,
+                "best_fold_scores": best_fold_scores,
+                "hp_importance": hp_importance,
             }
             logger.info(
                 f"[{model_idx}/{n_models}] {model_name} done: "

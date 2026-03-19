@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -85,7 +85,7 @@ def _detect_sentinels(
 
     A sentinel is a value that is far from the rest of the distribution and
     appears frequently — likely a masked missing value. Detection criteria:
-    - Value is at least 3 IQR below Q1 (or is exactly -1, -999, -9999, 9999)
+    - Value is at least 3 IQR below Q1 (or is exactly -1, -999, -9999, or >= 9999)
     - Value accounts for >= 1% of the column
 
     Args:
@@ -94,7 +94,7 @@ def _detect_sentinels(
             numeric column. Non-numeric columns get an empty list.
         feature_df: Feature DataFrame.
     """
-    common_sentinels = {-1, -1.0, -999, -999.0, -9999, -9999.0, 9999, 9999.0, 99, 99.0, 999, 999.0}
+    common_sentinels = {-1, -999, -9999, 9999}
 
     for col_name, col_info in columns_analysis.items():
         col_info["sentinels"] = []
@@ -1142,15 +1142,16 @@ def _compute_target_encoding_preview(
             # unseen-category fallback and smoothing prior.
             global_mean = float(np.nanmean(y[train_idx]))
             # Smoothed target encoding on train fold
-            cat_stats: dict[Any, tuple[float, int]] = {}
-            for i in train_idx:
-                cat = series[i]
-                if pd.isna(cat):
-                    continue
-                if cat not in cat_stats:
-                    cat_stats[cat] = (0.0, 0)
-                s, c = cat_stats[cat]
-                cat_stats[cat] = (s + y[i], c + 1)
+            agg = (
+                pd.DataFrame({"cat": series[train_idx], "y": y[train_idx]})
+                .dropna(subset=["cat"])
+                .groupby("cat")["y"]
+                .agg(["sum", "count"])
+            )
+            cat_stats: dict[Any, tuple[float, int]] = {
+                cat: (float(row["sum"]), int(row["count"]))
+                for cat, row in agg.iterrows()
+            }
 
             for idx in val_idx:
                 cat = series[idx]
@@ -1631,7 +1632,7 @@ def _classify_data_personality(
         parts.append(f"Linear gap: {linear_gap:.4f}.")
     if nn_gap is not None:
         parts.append(f"NN gap vs trees: {nn_gap:+.4f}.")
-    elif nn_scores == []:
+    elif not nn_scores:
         parts.append("NNs not tested (pytabkit not available or no GPU).")
 
     return personality, " ".join(parts)
@@ -1785,6 +1786,7 @@ def _compute_multi_baseline(
             )
         except Exception as exc:
             logger.warning("Baseline %s failed: %s", name, exc)
+            logger.debug("Baseline %s traceback:", name, exc_info=True)
 
     # Collect LightGBM fitted models for interaction orchestra (refit one for tree dump)
     if "lightgbm" in results:
@@ -2049,8 +2051,6 @@ def _extract_lgbm_interaction_pairs(
     Returns:
         List of dicts with ``feature_a``, ``feature_b``, ``interaction_strength``.
     """
-    from collections import Counter
-
     try:
         dump = lgbm_model.booster_.dump_model()
     except Exception:
@@ -2065,7 +2065,7 @@ def _extract_lgbm_interaction_pairs(
         else:
             name_map[fn] = fn
 
-    pair_gains: Counter[tuple[str, str], float] = Counter()
+    pair_gains: dict[tuple[str, str], float] = Counter()
 
     def _walk_tree(node: dict) -> str | None:
         """Walk tree recursively, return split feature name of this node."""
@@ -2205,9 +2205,7 @@ def _compute_ghost_features(
         # Get importance values (0 for missing features)
         values = np.array([imp_dict.get(f, 0.0) for f in all_features])
         # Rank: higher importance → lower rank number (1 = best)
-        from scipy.stats import rankdata
-
-        ranks = n_features + 1 - rankdata(values, method="average")
+        ranks = n_features + 1 - scipy_stats.rankdata(values, method="average")
         model_ranks[model_name] = {f: int(r) for f, r in zip(all_features, ranks)}
         model_arrays[model_name] = values
 
@@ -2245,15 +2243,13 @@ def _compute_ghost_features(
     ghost_features.sort(key=lambda x: (0 if x["severity"] == "high" else 1, min(x["ranks"].values())))
 
     # Pairwise Spearman rank correlations
-    from scipy.stats import spearmanr
-
     rank_correlations: dict[str, float] = {}
     model_names = list(all_importances.keys())
     for i, ma in enumerate(model_names):
         for mb in model_names[i + 1:]:
             arr_a = model_arrays[ma]
             arr_b = model_arrays[mb]
-            corr, _ = spearmanr(arr_a, arr_b)
+            corr, _ = scipy_stats.spearmanr(arr_a, arr_b)
             if np.isnan(corr):
                 corr = 0.0
             rank_correlations[f"{ma}_vs_{mb}"] = round(float(corr), 4)

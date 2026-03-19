@@ -353,7 +353,7 @@ Tests cover all modules: YAML loading, EDA profiling (including duplicate detect
 | `ensemble` | `strategy`, `meta_models` (`[logreg, xgboost]`), `meta_trials` (int or dict), `diversity_weight`, `diversity_metric` | Ensemble selection. `meta_models` configures which meta-learners to try; `meta_trials` sets Optuna budget per meta-model |
 | `optuna` | `global_seed`, `global_timeout`, `storage_dir`, `model_timeouts`, `persist_trackers` | Global Optuna settings. `storage_dir`: path to persist SQLite DBs per model — enables resume and cross-round trial transfer. `persist_trackers: true`: also saves `PerFoldTracker`/`TrialOOFStore` OOF predictions to disk (same dir) — allows safe interruption for per_fold and fold_coverage models |
 | `runtime` | `gpu_check`, `gpu_fallback`, `n_jobs`, `verbose` | Runtime environment. `verbose`: 0=WARNING, 1=INFO (progress + timing), 2=DEBUG (per-fold details) |
-| `output` | `submission_path`, `results_dir`, `save_oof` | Output paths. Logs written to `{results_dir}/logs/{run_name}.log` automatically |
+| `output` | `submission_path`, `results_dir`, `save_oof`, `lb_score` | Output paths. `lb_score`: fill with Kaggle LB score after submitting to enable OOF-LB gap tracking in round report. Logs: `{results_dir}/logs/{run_name}_{ts}.log`. Round report: `{results_dir}/round_report_{run_name}_{ts}.txt` |
 
 ### Model YAML
 
@@ -363,7 +363,7 @@ Each model config in `configs/models/` defines:
 - `fixed_params` — Always-on parameters (can be task-type-keyed)
 - `gpu` — GPU params and CPU fallback
 - `training` — Early stopping, eval metric, seed parameter name
-- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings, `selection_mode` (`global`/`per_fold`/`fold_coverage`), `fold_timeout`, `assembly` (mode for per_fold or n_fold_best/n_mean_best for fold_coverage), `tracker` (vanilla/tiered), `diversity_pruning` (per_fold only), `substudy` (QMC warm-start, two-tier enqueue with top_n), `tpe` (custom gamma function)
+- `optuna` — Per-model trial budget, QMC warmup trials, pruner settings, `selection_mode` (`global`/`per_fold`/`fold_coverage`), `fold_timeout`, `assembly` (mode for per_fold or n_fold_best/n_mean_best/min_quality_percentile for fold_coverage), `tracker` (vanilla/tiered), `diversity_pruning` (per_fold only), `substudy` (QMC warm-start, two-tier enqueue with top_n), `tpe` (custom gamma function)
 
 ---
 
