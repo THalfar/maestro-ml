@@ -252,7 +252,7 @@ preprocessing:
 
 - **`enqueue_trials`** in model YAML or strategy YAML `overrides.<model>.optuna.enqueue_trials`: List of hyperparameter dicts to evaluate before QMC/TPE search begins.
 - Partial params OK — unspecified params are sampled from the active sampler.
-- Enqueued trials are "free" comparison points — they don't reduce the n_trials budget.
+- Enqueued trials are "free" comparison points — they don't reduce the trial budget.
 - Use cases: known-good configs from previous runs, LLM-suggested starting points, baseline configs.
 - The LLM strategist can add these in the strategy YAML to seed Optuna with educated guesses.
 - Example:
@@ -282,32 +282,111 @@ Neural network models (RealMLP, TabM) are slow on large datasets (~8-10 min/tria
       enabled: true              # opt-in, default disabled
       sample_fraction: 0.10      # fraction of train data (stratified)
       n_folds: 3                 # lighter CV than main study
-      timeout: "15m"             # own time budget (parse_timeout format)
-      n_trials: 100              # pure QMC trials
+      timeout: "15m"             # own time budget (parse_timeout format) — primary stopping criterion
       n_enqueue: 20              # total configs for main study warm-start
       top_n: 3                   # always include top-N best unconditionally
       temperature: 0.3           # rank-weighted sampling sharpness (0.1=top-heavy, 1.0=uniform)
       lock_scaler: true          # lock main study to best scaler found
+      # n_trials: omit for unlimited (timeout controls); set explicitly only to hard-cap
   ```
 - **Expected speedup**: ~10x per trial (10% data + CV=3 vs CV=5). A 15 min substudy covers as much hyperparameter space as 2.5h of full-data search.
 
 ## TPE Configuration
 
-Custom TPE gamma function is the **project default** for all models. Controls the "good vs bad" trial split in TPE's surrogate model.
+TPE gamma is a **fixed integer** set per model by the AI via strategy YAML. Controls how many trials TPE classifies as "good" in its surrogate model.
 
-- **Default values** (applied automatically in `_run_two_phase_study()`):
-  - `gamma_ratio=0.15` — 15% of completed trials classified as "good"
-  - `gamma_min=5` — minimum floor for small histories
-  - `n_startup_trials=0` — 0 for Phase 2 since QMC already explored
-- **Per-model override** via model YAML or strategy YAML:
+- **Default**: `gamma=25` — reasonable for 100-300 trial studies.
+- **`n_startup_trials=0`** — 0 for Phase 2 since QMC/substudy already explored.
+- **Per-model override** via strategy YAML `overrides.<model>.optuna.tpe`:
   ```yaml
   optuna:
     tpe:
-      gamma_ratio: 0.15          # fraction of good trials
-      gamma_min: 5               # minimum good trials floor
+      gamma: 25                  # fixed "good" trials count (AI sets per model)
       n_startup_trials: 0        # 0 when QMC/substudy explored
+      multivariate: true         # project default: always consider HP correlations
+      n_ei_candidates: 24        # expected improvement candidates
   ```
+- **Pass-through params**: Any `TPESampler` kwarg can be set via `tpe.*` in strategy YAML: `n_ei_candidates`, `prior_weight`, `consider_prior`, `consider_magic_clip`, `consider_endpoints`, `multivariate`, `group`, `constant_liar`.
+- **Gamma tuning guide**: Increase to 30-50 if TPE collapsed (round report Section 4b). Decrease to 10-15 for smooth landscapes near ceiling.
 - When substudy is active, `n_startup_trials` defaults to 0 (substudy already explored). When substudy is not active, these settings still apply to the TPE phase.
+
+## TPE Collapse Detection
+
+Long Optuna runs (>200 trials) can suffer from TPE collapse — the sampler converges to a narrow region and wastes budget on near-identical configs. Two complementary features address this:
+
+### Round Report Section 4b: TPE HEALTH
+- Detects collapse by computing the mean normalised parameter std across the last 20 trials vs full history.
+- `param_std_ratio = mean(std(last_window) / range(all_trials))` per numeric HP.
+- If ratio < 0.05 → `COLLAPSED`. Finds onset trial and estimates wasted trials/time.
+- Works in standalone mode (reads from Optuna DB only).
+- Output: `xgboost: COLLAPSED at trial ~252 (param_std_ratio=0.02, ~134 trials wasted, ~46min lost)`
+
+### Runtime Collapse Restart (`collapse_restart` in strategy YAML)
+- Optuna callback that detects collapse during `study.optimize()` and injects restart trials.
+- **With substudy**: Samples from substudy DB history using rank-weighted exponential distribution (same as substudy enqueue: `top_n` guaranteed best + remaining via `exp(-temperature * rank / n)`).
+- **Without substudy**: Samples uniformly from search space bounds.
+- **Score-gate**: Never restarts when the current trial is a new best score.
+- **Deduplication**: All injected trials are checked against main study history.
+- **Cooldown**: Prevents over-restarting (configurable, default 10 trials between events).
+- **Config** (opt-in, off by default):
+  ```yaml
+  optuna:
+    collapse_restart:
+      window: 20          # last N trials to check
+      threshold: 0.05     # param_std_ratio threshold
+      n_restart: 5        # trials to inject per event
+      cooldown: 10        # min trials between restarts
+      top_n: 2            # guaranteed best from substudy
+      temperature: 0.3    # exp sampling sharpness (substudy mode)
+  ```
+
+### Post-Run Strategy Prompt
+- `prompts/post_run_strategy.md` — template for AI agent to update strategy after each run.
+- Input: EDA report + round report + current strategy YAML → updated strategy YAML.
+- Includes decision framework (COLLAPSED/SATURATED/IMPROVING/HEALTHY), gamma tuning guide, HP fixing rules, and all configurable Optuna/TPE settings.
+
+## Multivariate TPE & Targeted Enqueue
+
+`multivariate=True` (project default) lets TPE model HP correlations (e.g. lr×batch_size). However, it requires **identical search space across all trials**. On persistent DBs, narrowing HP ranges between rounds creates a "dynamic search space" → Optuna silently falls back to RandomSampler per affected param, defeating multivariate.
+
+**Rule**: With `multivariate: true` on persistent DBs, AI must NOT narrow ranges. Instead use:
+
+1. **Scalar fix** (already supported): Fix fully converged HPs as scalar overrides. Removes the param from the search space entirely — no mismatch.
+   ```yaml
+   overrides:
+     tabm:
+       d_embedding: 12          # scalar → {type: fixed, value: 12}
+   ```
+
+2. **Targeted enqueue** (`optuna.targeted_enqueue`): Generate exploration trials for specific HP values, paired with top trial configs (exp-distribution sampling). The search space stays unchanged → multivariate works.
+   ```yaml
+   optuna:
+     targeted_enqueue:
+       - param: lr
+         range: [0.00008, 0.0003]    # auto-generate log-spaced points
+         n_points: 5
+         log: true
+         n_base: 3                    # top trials to pair with
+         temperature: 0.2             # low = prefer best trials
+       - param: colsample_bytree
+         values: [0.4, 0.5, 0.6, 0.7]  # explicit values
+         n_base: 2
+   ```
+   - `generate_targeted_enqueue()` in `trainer.py`: for each target value × each base trial → candidate config
+   - Generates `len(values) × n_base` candidates (minus dedup against existing study)
+   - AI should target 1-2 HPs per round to avoid combinatorial explosion
+
+3. **Substudy reset** (`optuna.substudy.reset: true`): Delete old substudy DB and re-run with new ranges. Main study stays intact.
+   ```yaml
+   optuna:
+     substudy:
+       enabled: true
+       reset: true                   # delete old substudy DB, start fresh
+   ```
+   - Use when the AI needs a full range change that targeted enqueue can't cover
+   - Substudies are cheap (~15min) so resetting is low-cost
+
+4. **Disable multivariate** (last resort): Set `tpe.multivariate: false` per model if range changes are unavoidable.
 
 ## Pipeline YAML Key Features
 
@@ -350,6 +429,8 @@ optuna:
 - Only finalized (committed, non-pruned) trial data is pickled. In-progress partial data is always in RAM.
 - Off by default (`persist_trackers: false`) — backward-compatible.
 - Typical sizes: ~60 MB (PerFoldTracker, 595k rows) and ~240 MB (TrialOOFStore, 100 trials, 595k rows).
+- **`reset_trackers: true`** in pipeline YAML `optuna` section: skips loading existing pkl files, starts OOF fresh. Use when train set changes (e.g. `extra_data` added) or to force a clean OOF rebuild. Optuna DB history is unaffected — TPE still inherits all prior trials.
+- **Shape mismatch auto-detection**: if loaded TrialOOFStore has different `n_samples` than current train, it is automatically discarded with a warning (fallback to fresh store).
 
 ```yaml
 run_name: "ps-s6e3-r2"
@@ -376,11 +457,12 @@ Implemented via `_combine_fold_test_preds()` helper in `trainer.py`. Read from `
 
 ### Round Report (post-run strategy aid)
 - Generated automatically at end of every `run.py` execution: `{results_dir}/round_report_{run_name}_{ts}.txt`
-- **Replaces** the old `diversity_report_*.txt`. Contains 11 sections:
+- **Replaces** the old `diversity_report_*.txt`. Contains 12 sections:
   1. Run History — trial counts, best score, timing per model (from Optuna DB)
   2. Score Trajectory — best-so-far at trial checkpoints (10/25/50/100/150/200) + marginal gain last 50
   3. Pruning Analysis — pruned count + inferred cause (MedianPruner vs fold_timeout)
   4. HP Convergence — top-20% trial ranges vs full range per hyperparameter + fANOVA importances
+  4b. TPE Health — collapse detection per model (param_std_ratio, onset trial, wasted time)
   5. Fold-Level Score Matrix — per-fold scores of best composite per model (hard fold detection)
   6. Assembly Diagnostics — selection mode, committed/selected counts, composites before/after dedup
   7. Substudy→Main Transfer — substudy best config score vs matching config in main study
@@ -477,11 +559,11 @@ src/utils/io.py          — load_yaml, load_pipeline_config, load_model_config,
 src/eda/profiler.py      — run_eda, format_eda_for_llm, multi-baseline probe, interaction orchestra, ghost detector
 src/features/engineer.py — build_features, target encoding, interactions, ratios
 src/models/registry.py   — ModelRegistry class (register, get_model, get_search_space)
-src/models/trainer.py    — PerFoldTracker, run_optuna_study, train_with_config, run_all_studies, reassemble_int_lists
+src/models/trainer.py    — PerFoldTracker, run_optuna_study, train_with_config, run_all_studies, _reassemble_int_lists
 src/ensemble/blender.py  — optimize_blend_weights, rank_average, train_meta_model, optimize_meta_C, optimize_meta_xgb
 src/ensemble/diversity.py — run_nsga2_ensemble, select_from_pareto, effective_ensemble_size, _compute_diversity
 src/strategy/llm_strategist.py — generate_strategy (API + manual modes)
 run.py                   — main pipeline orchestrator (includes NSGA-II→meta chain logic)
 scripts/                 — Development utilities (check_imports.py, check_realmlp_gpu.py, check_realmlp_params.py)
-prompts/                 — LLM prompt templates (strategy_prompt.md, etc.)
+prompts/                 — LLM prompt templates (strategy_prompt.md, post_run_strategy.md, etc.)
 ```

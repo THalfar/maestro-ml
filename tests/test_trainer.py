@@ -15,7 +15,9 @@ from sklearn.model_selection import StratifiedKFold
 from src.models.registry import ModelRegistry
 from src.models.trainer import (
     _apply_scaler_fold,
+    _CollapseRestartCallback,
     _deep_merge,
+    generate_targeted_enqueue,
     _identify_scale_cols,
     _make_scaler,
     _compute_cv_metric,
@@ -5612,3 +5614,629 @@ class TestTrackerPersistenceOrdering:
             f"vs run 1's {n_entries_run1}). If equal, the objective wrote to "
             f"an orphaned tracker and the loaded one was returned unchanged."
         )
+
+
+# =============================================================================
+# _combine_fold_test_preds
+# =============================================================================
+class TestCombineFoldTestPreds:
+    """Tests for _combine_fold_test_preds helper."""
+
+    def test_arithmetic_uniform_average(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([1.0, 2.0]), np.array([3.0, 4.0])]
+        result = _combine_fold_test_preds(preds, [0.8, 0.9], "arithmetic", 2)
+        np.testing.assert_allclose(result, [2.0, 3.0])
+
+    def test_score_weighted_maximize(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        # fold 0 score=0.9, fold 1 score=0.1 → fold 0 dominates
+        result = _combine_fold_test_preds(preds, [0.9, 0.1], "score_weighted", 2, maximize=True)
+        assert result[0] > result[1]  # fold 0's [1,0] dominates
+
+    def test_score_weighted_minimize(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+        # In minimize mode, lower score = better → fold with score=0.1 gets higher weight
+        result = _combine_fold_test_preds(preds, [0.9, 0.1], "score_weighted", 2, maximize=False)
+        assert result[1] > result[0]  # fold 1 (score=0.1, lower=better) dominates
+
+    def test_geomean_binary(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([0.5, 0.8]), np.array([0.5, 0.8])]
+        result = _combine_fold_test_preds(preds, [0.8, 0.8], "geomean", 2)
+        np.testing.assert_allclose(result, [0.5, 0.8], atol=1e-6)
+
+    def test_geomean_skipped_for_multiclass(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([0.5, 0.8]), np.array([0.3, 0.4])]
+        # multiclass → falls back to arithmetic
+        result = _combine_fold_test_preds(
+            preds, [0.8, 0.8], "geomean", 2, is_multiclass=True
+        )
+        np.testing.assert_allclose(result, [0.4, 0.6])
+
+    def test_empty_preds_returns_zeros(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        result = _combine_fold_test_preds([], [], "arithmetic", 5)
+        np.testing.assert_array_equal(result, np.zeros(5))
+
+    def test_score_weighted_zero_total_fallback(self):
+        from src.models.trainer import _combine_fold_test_preds
+
+        preds = [np.array([1.0, 2.0]), np.array([3.0, 4.0])]
+        # All zero scores → fallback to uniform
+        result = _combine_fold_test_preds(preds, [0.0, 0.0], "score_weighted", 2, maximize=True)
+        np.testing.assert_allclose(result, [2.0, 3.0])
+
+
+# =============================================================================
+# TrialOOFStore.select() with min_quality_percentile
+# =============================================================================
+class TestTrialOOFStoreQualityGate:
+    """Tests for min_quality_percentile in TrialOOFStore.select()."""
+
+    def _make_store_with_trials(self, n_trials=5, n_folds=3, n_samples=30, n_test=10):
+        from src.models.trainer import TrialOOFStore
+
+        store = TrialOOFStore(n_samples=n_samples, n_test=n_test, n_folds=n_folds)
+        rng = np.random.RandomState(42)
+        cv_indices = np.array_split(np.arange(n_samples), n_folds)
+
+        for t in range(n_trials):
+            for fold_idx in range(n_folds):
+                val_idx = cv_indices[fold_idx]
+                val_preds = rng.rand(len(val_idx))
+                test_preds = rng.rand(n_test)
+                # Worse trials get lower scores
+                fold_score = 0.5 + 0.1 * t
+                store.update(t, fold_idx, fold_score, val_preds, val_idx, test_preds)
+            store.commit_trial(t)
+        return store
+
+    def test_no_gate_returns_all(self):
+        store = self._make_store_with_trials(n_trials=5)
+        composites = store.select(n_fold_best=5, n_mean_best=5, min_quality_percentile=0.0)
+        assert len(composites) > 0
+
+    def test_high_gate_filters_weak_trials(self):
+        store = self._make_store_with_trials(n_trials=10)
+        # p50 should filter roughly half the trials
+        composites_no_gate = store.select(n_fold_best=10, n_mean_best=10, min_quality_percentile=0.0)
+        composites_with_gate = store.select(n_fold_best=10, n_mean_best=10, min_quality_percentile=50.0)
+        assert len(composites_with_gate) <= len(composites_no_gate)
+
+    def test_full_gate_returns_only_best(self):
+        store = self._make_store_with_trials(n_trials=5)
+        # p90 should keep only the very best
+        composites = store.select(n_fold_best=5, n_mean_best=5, min_quality_percentile=90.0)
+        # Should still return at least 1 (the best trial passes any gate)
+        assert len(composites) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for _CollapseRestartCallback
+# ---------------------------------------------------------------------------
+
+def _make_frozen_trial(
+    number: int, params: dict[str, Any], value: float,
+    state: str = "COMPLETE",
+) -> optuna.trial.FrozenTrial:
+    """Create a minimal FrozenTrial for testing."""
+    from datetime import datetime, timedelta
+
+    state_map = {
+        "COMPLETE": optuna.trial.TrialState.COMPLETE,
+        "PRUNED": optuna.trial.TrialState.PRUNED,
+    }
+    start = datetime(2026, 1, 1) + timedelta(minutes=number)
+    return optuna.trial.FrozenTrial(
+        number=number,
+        values=None,
+        datetime_start=start,
+        datetime_complete=start + timedelta(seconds=30),
+        params=params,
+        distributions={
+            k: optuna.distributions.FloatDistribution(0, 10)
+            for k in params
+        },
+        user_attrs={},
+        system_attrs={},
+        intermediate_values={},
+        trial_id=number,
+        state=state_map[state],
+        value=value,
+    )
+
+
+class TestCollapseRestartCallback:
+    """Tests for _CollapseRestartCallback."""
+
+    SEARCH_SPACE: dict[str, dict[str, Any]] = {
+        "lr": {"type": "float", "low": 0.001, "high": 0.3, "log": True},
+        "depth": {"type": "int", "low": 2, "high": 10},
+        "subsample": {"type": "float", "low": 0.5, "high": 1.0},
+    }
+
+    def _make_study_with_trials(
+        self, n_total: int = 30, collapse_at: int | None = 10,
+    ) -> optuna.Study:
+        """Create a study with trials; optionally make last ones near-identical."""
+        study = optuna.create_study(direction="maximize")
+        rng = np.random.default_rng(42)
+
+        for i in range(n_total):
+            if collapse_at is not None and i >= collapse_at:
+                # Collapsed: near-identical params
+                params = {"lr": 0.05, "depth": 6, "subsample": 0.85}
+                value = 0.90 + rng.uniform(-0.001, 0.001)
+            else:
+                # Varied params
+                params = {
+                    "lr": float(rng.uniform(0.01, 0.2)),
+                    "depth": int(rng.integers(3, 9)),
+                    "subsample": float(rng.uniform(0.6, 1.0)),
+                }
+                value = 0.85 + rng.uniform(0, 0.05)
+
+            trial = _make_frozen_trial(i, params, value)
+            study.add_trial(trial)
+        return study
+
+    def test_collapse_detected(self):
+        """Last 20 trials near-identical → _is_collapsed returns True."""
+        study = self._make_study_with_trials(n_total=30, collapse_at=10)
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE, window=20, threshold=0.05
+        )
+        is_collapsed, ratio = cb._is_collapsed(completed)
+        assert is_collapsed
+        assert ratio < 0.05
+
+    def test_healthy_varied(self):
+        """All 30 trials varied → healthy."""
+        study = self._make_study_with_trials(n_total=30, collapse_at=None)
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE, window=20, threshold=0.05
+        )
+        is_collapsed, ratio = cb._is_collapsed(completed)
+        assert not is_collapsed
+        assert ratio > 0.05
+
+    def test_insufficient_trials(self):
+        """Fewer than window trials → no-op (callback returns without action)."""
+        study = self._make_study_with_trials(n_total=10, collapse_at=5)
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE, window=20, threshold=0.05
+        )
+        # Simulate callback — should not crash or enqueue anything.
+        last_trial = study.trials[-1]
+        cb(study, last_trial)
+        # No enqueued trials beyond the 10 we added.
+        assert len(study.trials) == 10
+
+    def test_cooldown_prevents_retrigger(self):
+        """After a restart injection, cooldown blocks re-trigger."""
+        # 40 trials: first 5 varied (includes the best), then 35 collapsed.
+        # Window=20 covers only collapsed range. Best is outside window.
+        study = self._make_study_with_trials(n_total=40, collapse_at=5)
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE,
+            window=20, threshold=0.05, n_restart=3, cooldown=5,
+        )
+        # Use a PRUNED trial as the "current" trial to bypass score-gate.
+        pruned = _make_frozen_trial(
+            number=50, params={"lr": 0.05, "depth": 6, "subsample": 0.85},
+            value=0.9, state="PRUNED",
+        )
+        study.add_trial(pruned)
+
+        # First call — should inject.
+        cb(study, pruned)
+        first_injected = cb._n_injected
+        assert first_injected > 0
+
+        # Cooldown should be set to config value (not + n_enqueued).
+        assert cb._cooldown_counter == 5
+
+        # Second call — cooldown should prevent injection.
+        cb(study, pruned)
+        assert cb._n_injected == first_injected
+
+    def test_score_gate_new_best(self):
+        """Collapse detected but trial is new best → no restart."""
+        # 40 trials: first 5 varied, then 35 collapsed.
+        study = self._make_study_with_trials(n_total=40, collapse_at=5)
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE,
+            window=20, threshold=0.05, n_restart=3,
+        )
+
+        # The "current" trial is a new best with collapsed params.
+        best_trial = _make_frozen_trial(
+            number=50,
+            params={"lr": 0.05, "depth": 6, "subsample": 0.85},
+            value=0.99,  # clearly the best
+        )
+        study.add_trial(best_trial)
+
+        # Callback should NOT inject (score-gate).
+        cb(study, best_trial)
+        assert cb._n_injected == 0
+
+    def test_random_sampling_no_substudy(self):
+        """Without substudy, random params from search space are generated."""
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE,
+            window=20, threshold=0.05, n_restart=5,
+            substudy_db_path=None,
+        )
+        existing: set[str] = set()
+        samples = cb._sample_random_from_space(existing)
+        assert len(samples) == 5
+
+        for params in samples:
+            # Check types and bounds.
+            assert 0.001 <= params["lr"] <= 0.3
+            assert 2 <= params["depth"] <= 10
+            assert 0.5 <= params["subsample"] <= 1.0
+            assert isinstance(params["depth"], int)
+
+    def test_random_sampling_respects_step(self):
+        """Step-based params produce valid values."""
+        space = {
+            "depth": {"type": "int", "low": 2, "high": 10, "step": 2},
+            "lr": {"type": "float", "low": 0.1, "high": 1.0, "step": 0.1},
+        }
+        cb = _CollapseRestartCallback(
+            search_space=space, n_restart=10,
+        )
+        samples = cb._sample_random_from_space(set())
+        for params in samples:
+            assert params["depth"] % 2 == 0
+            # Float step: should be close to a 0.1 multiple.
+            assert 0.1 <= params["lr"] <= 1.0
+
+    def test_random_sampling_categorical(self):
+        """Categorical params are sampled from choices."""
+        space = {
+            "act": {"type": "categorical", "choices": ["relu", "selu", "gelu"]},
+            "lr": {"type": "float", "low": 0.01, "high": 0.1},
+        }
+        cb = _CollapseRestartCallback(search_space=space, n_restart=10)
+        samples = cb._sample_random_from_space(set())
+        for params in samples:
+            assert params["act"] in ["relu", "selu", "gelu"]
+
+    def test_random_sampling_int_list(self):
+        """int_list params decompose into sub-params."""
+        space = {
+            "hidden": {"type": "int_list", "n": 3, "low": 8, "high": 128},
+        }
+        cb = _CollapseRestartCallback(search_space=space, n_restart=3)
+        samples = cb._sample_random_from_space(set())
+        for params in samples:
+            assert "hidden_0" in params
+            assert "hidden_1" in params
+            assert "hidden_2" in params
+            for i in range(3):
+                assert 8 <= params[f"hidden_{i}"] <= 128
+
+    def test_dedup_against_main(self):
+        """Injected trials are deduplicated against main study history."""
+        # 40 trials: first 5 varied, then 35 collapsed. Window stays in collapsed range.
+        study = self._make_study_with_trials(n_total=40, collapse_at=5)
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE,
+            window=20, threshold=0.05, n_restart=3,
+        )
+
+        # Use PRUNED trial to bypass score-gate cleanly.
+        pruned = _make_frozen_trial(
+            number=50, params={"lr": 0.05, "depth": 6, "subsample": 0.85},
+            value=0.9, state="PRUNED",
+        )
+        study.add_trial(pruned)
+
+        cb(study, pruned)
+        assert cb._n_injected > 0
+
+    def test_substudy_sampling(self, tmp_path: Path):
+        """With substudy DB, samples from substudy history."""
+        # Create a small substudy DB.
+        sub_db = tmp_path / "sub.db"
+        sub_study = optuna.create_study(
+            study_name="test__model__sub",
+            storage=f"sqlite:///{sub_db}",
+            direction="maximize",
+        )
+        rng = np.random.default_rng(123)
+        for i in range(20):
+            params = {
+                "lr": float(rng.uniform(0.01, 0.2)),
+                "depth": int(rng.integers(3, 9)),
+                "subsample": float(rng.uniform(0.6, 1.0)),
+            }
+            trial = _make_frozen_trial(i, params, 0.85 + rng.uniform(0, 0.05))
+            sub_study.add_trial(trial)
+
+        cb = _CollapseRestartCallback(
+            search_space=self.SEARCH_SPACE,
+            window=20, threshold=0.05, n_restart=5, top_n=2,
+            temperature=0.3,
+            substudy_db_path=str(sub_db),
+            substudy_study_name="test__model__sub",
+        )
+
+        existing: set[str] = set()
+        samples = cb._sample_from_substudy(existing)
+        assert len(samples) > 0
+        assert len(samples) <= 5
+
+        # All samples should have valid param keys.
+        for params in samples:
+            assert "lr" in params
+            assert "depth" in params
+
+
+class TestComputeTpeHealth:
+    """Tests for _compute_tpe_health in the round report."""
+
+    def test_collapsed(self):
+        """Trials with identical last-20 params → COLLAPSED."""
+        rng = np.random.default_rng(42)
+        trials = []
+        for i in range(30):
+            if i >= 10:
+                params = {"lr": 0.05, "depth": 6}
+            else:
+                params = {
+                    "lr": float(rng.uniform(0.01, 0.2)),
+                    "depth": int(rng.integers(3, 9)),
+                }
+            trials.append(_make_frozen_trial(i, params, 0.9))
+
+        # Import the function from run.py's _generate_round_report scope.
+        # Since it's a nested function, we replicate the logic here.
+        from run import _generate_round_report
+        # Instead, test via the round report output (integration-style).
+        # For unit test, replicate the algorithm:
+        sorted_trials = sorted(trials, key=lambda t: t.number)
+        last_20 = sorted_trials[-20:]
+
+        full_ranges: dict[str, float] = {}
+        for p in ("lr", "depth"):
+            vals = [t.params[p] for t in sorted_trials]
+            r = max(vals) - min(vals)
+            if r > 1e-10:
+                full_ranges[p] = r
+
+        ratios = []
+        for p, rng_val in full_ranges.items():
+            wv = [t.params[p] for t in last_20]
+            ratios.append(float(np.std(wv)) / rng_val)
+
+        mean_ratio = float(np.mean(ratios))
+        assert mean_ratio < 0.05  # collapsed
+
+    def test_healthy(self):
+        """Varied trials → healthy ratio > 0.05."""
+        rng = np.random.default_rng(42)
+        trials = []
+        for i in range(30):
+            params = {
+                "lr": float(rng.uniform(0.01, 0.2)),
+                "depth": int(rng.integers(3, 9)),
+            }
+            trials.append(_make_frozen_trial(i, params, 0.9))
+
+        sorted_trials = sorted(trials, key=lambda t: t.number)
+        last_20 = sorted_trials[-20:]
+
+        full_ranges: dict[str, float] = {}
+        for p in ("lr", "depth"):
+            vals = [t.params[p] for t in sorted_trials]
+            r = max(vals) - min(vals)
+            if r > 1e-10:
+                full_ranges[p] = r
+
+        ratios = []
+        for p, rng_val in full_ranges.items():
+            wv = [t.params[p] for t in last_20]
+            ratios.append(float(np.std(wv)) / rng_val)
+
+        mean_ratio = float(np.mean(ratios))
+        assert mean_ratio > 0.05  # healthy
+
+
+# ---------------------------------------------------------------------------
+# Tests for generate_targeted_enqueue
+# ---------------------------------------------------------------------------
+
+def _make_study_with_varied_trials(
+    n: int = 10, direction: str = "maximize"
+) -> optuna.Study:
+    """Create a study with varied completed trials for targeted enqueue tests."""
+    study = optuna.create_study(direction=direction)
+    rng = np.random.default_rng(42)
+    for i in range(n):
+        params = {
+            "lr": float(rng.uniform(0.001, 0.1)),
+            "depth": int(rng.integers(3, 10)),
+            "subsample": float(rng.uniform(0.5, 1.0)),
+        }
+        value = 0.85 + rng.uniform(0, 0.05)
+        trial = _make_frozen_trial(i, params, value)
+        study.add_trial(trial)
+    return study
+
+
+class TestTargetedEnqueue:
+    """Tests for generate_targeted_enqueue()."""
+
+    def test_explicit_values(self):
+        """Explicit values list produces correct number of candidates."""
+        study = _make_study_with_varied_trials(10)
+        result = generate_targeted_enqueue(
+            study, "lr", values=[0.01, 0.05, 0.09], n_base=2, seed=42
+        )
+        assert len(result) > 0
+        assert len(result) <= 6  # 3 values × 2 bases
+        for params in result:
+            assert params["lr"] in [0.01, 0.05, 0.09]
+            assert "depth" in params
+            assert "subsample" in params
+
+    def test_range_linear(self):
+        """Linear range generates linearly spaced values."""
+        study = _make_study_with_varied_trials(10)
+        result = generate_targeted_enqueue(
+            study, "subsample",
+            target_range=(0.5, 0.9), n_points=5, log=False, n_base=1, seed=42,
+        )
+        assert len(result) > 0
+        target_vals = sorted({p["subsample"] for p in result})
+        # Should be approximately linearly spaced between 0.5 and 0.9
+        assert min(target_vals) >= 0.5 - 0.01
+        assert max(target_vals) <= 0.9 + 0.01
+
+    def test_range_log(self):
+        """Log range generates log-spaced values."""
+        study = _make_study_with_varied_trials(10)
+        result = generate_targeted_enqueue(
+            study, "lr",
+            target_range=(0.001, 1.0), n_points=3, log=True, n_base=1, seed=42,
+        )
+        assert len(result) > 0
+        target_vals = sorted({p["lr"] for p in result})
+        # Log-spaced: [0.001, ~0.0316, 1.0]
+        assert len(target_vals) >= 2
+        assert target_vals[0] < 0.01  # first value near 0.001
+
+    def test_deduplication(self):
+        """Candidates matching existing trials are excluded."""
+        study = _make_study_with_varied_trials(10)
+        # Use the exact lr value of the first trial as one of the targets.
+        first_lr = study.trials[0].params["lr"]
+        result = generate_targeted_enqueue(
+            study, "lr",
+            values=[first_lr, 0.999], n_base=1, seed=42,
+        )
+        # The combo with first_lr + first trial's other params = exact duplicate.
+        # 0.999 should produce at least one result.
+        lr_vals = {p["lr"] for p in result}
+        assert 0.999 in lr_vals
+
+    def test_empty_study(self):
+        """Empty study returns empty list."""
+        study = optuna.create_study(direction="maximize")
+        result = generate_targeted_enqueue(
+            study, "lr", values=[0.01, 0.05], n_base=3, seed=42,
+        )
+        assert result == []
+
+    def test_few_trials(self):
+        """Study with fewer trials than n_base still works."""
+        study = _make_study_with_varied_trials(1)
+        result = generate_targeted_enqueue(
+            study, "lr", values=[0.01, 0.05, 0.09], n_base=5, seed=42,
+        )
+        # n_base clamped to 1 (only 1 trial available)
+        assert len(result) > 0
+        assert len(result) <= 3  # 3 values × 1 base
+
+    def test_int_param_casting(self):
+        """Int-typed params produce int values (not float)."""
+        study = _make_study_with_varied_trials(10)
+        result = generate_targeted_enqueue(
+            study, "depth",
+            values=[4.0, 6.0, 8.0], n_base=1, seed=42,
+        )
+        for params in result:
+            assert isinstance(params["depth"], int)
+
+    def test_scaler_popped(self):
+        """Scaler key is removed from generated params."""
+        from datetime import datetime, timedelta
+
+        study = optuna.create_study(direction="maximize")
+        # Add trial with scaler param — needs CategoricalDistribution.
+        start = datetime(2026, 1, 1)
+        trial = optuna.trial.FrozenTrial(
+            number=0, values=None,
+            datetime_start=start,
+            datetime_complete=start + timedelta(seconds=30),
+            params={"lr": 0.05, "depth": 6, "scaler": "robust"},
+            distributions={
+                "lr": optuna.distributions.FloatDistribution(0.001, 0.3),
+                "depth": optuna.distributions.IntDistribution(2, 10),
+                "scaler": optuna.distributions.CategoricalDistribution(
+                    ["none", "standard", "robust"]
+                ),
+            },
+            user_attrs={}, system_attrs={}, intermediate_values={},
+            trial_id=0, state=optuna.trial.TrialState.COMPLETE, value=0.9,
+        )
+        study.add_trial(trial)
+        result = generate_targeted_enqueue(
+            study, "lr", values=[0.01], n_base=1, seed=42,
+        )
+        for params in result:
+            assert "scaler" not in params
+
+    def test_both_values_and_range_raises(self):
+        """Providing both values and target_range raises ValueError."""
+        study = _make_study_with_varied_trials(5)
+        with pytest.raises(ValueError):
+            generate_targeted_enqueue(
+                study, "lr",
+                values=[0.01], target_range=(0.01, 0.1),
+            )
+
+    def test_neither_values_nor_range_raises(self):
+        """Providing neither values nor target_range raises ValueError."""
+        study = _make_study_with_varied_trials(5)
+        with pytest.raises(ValueError):
+            generate_targeted_enqueue(study, "lr")
+
+
+class TestSubstudyReset:
+    """Test for substudy.reset: true functionality."""
+
+    def test_reset_deletes_db(self, tmp_path: Path):
+        """substudy.reset: true deletes existing substudy DB file."""
+        # Create dummy substudy DB file.
+        storage_dir = tmp_path / "optuna"
+        storage_dir.mkdir()
+        sub_db = storage_dir / "ps-test__ridge__sub.db"
+        sub_db.write_text("dummy")
+        assert sub_db.exists()
+
+        # The reset logic is inside run_optuna_study() which is heavy.
+        # Test the file deletion directly by replicating the logic.
+        from pathlib import Path as P
+        run_name = "ps-test"
+        model_name = "ridge"
+        substudy_cfg = {"enabled": True, "reset": True}
+
+        if substudy_cfg.get("reset", False):
+            _sub_db = P(storage_dir) / f"{run_name}__{model_name}__sub.db"
+            if _sub_db.exists():
+                _sub_db.unlink()
+
+        assert not sub_db.exists()

@@ -76,11 +76,18 @@ overrides:                             # OPTIONAL — narrow default ranges
     max_depth:
       low: 3
       high: 8
-    optuna:                              # OPTIONAL — enqueue known-good configs
+    optuna:                              # OPTIONAL — Optuna tuning
+      tpe:
+        gamma: 25                        # fixed "good" trials count (default 25)
       enqueue_trials:
         - max_depth: 6
           learning_rate: 0.03
           n_estimators: 2000
+      collapse_restart:                  # OPTIONAL — runtime collapse detection
+        window: 20
+        threshold: 0.05
+        n_restart: 5
+        temperature: 0.3
 
 reasoning: >
   Explain your choices in 2-5 sentences. Why these features?
@@ -103,6 +110,35 @@ reasoning: >
 | gaussian_nb | `var_smoothing` [1e-12 - 1e-3] (log scale) |
 | mlp | `hidden_layer_sizes` [[128], [128,64], ...], `alpha` [1e-5 - 0.01], `learning_rate_init` [1e-4 - 0.01] |
 | adaboost | `n_estimators` [50-500], `learning_rate` [0.01-1.0] (log scale) |
+
+### TPE and Optuna settings (optional, per model)
+
+You can tune the TPE sampler and enable collapse detection per model under `overrides.<model>.optuna`:
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `tpe.gamma` | Fixed number of "good" trials in TPE surrogate | 25 |
+| `tpe.n_startup_trials` | Random trials before TPE kicks in | 0 |
+| `tpe.multivariate` | Multivariate TPE (considers HP correlations) | true |
+| `tpe.n_ei_candidates` | Expected improvement candidates per step | 24 |
+| `collapse_restart.window` | Last N trials to check for collapse | 20 |
+| `collapse_restart.threshold` | Param std ratio below which collapse is flagged | 0.05 |
+| `collapse_restart.n_restart` | Restart trials to inject per event | 5 |
+| `collapse_restart.temperature` | Exp sampling sharpness for substudy restarts | 0.3 |
+| `targeted_enqueue[].param` | HP name to explore with targeted trials | - |
+| `targeted_enqueue[].values` | Explicit values to try (OR use `range`) | - |
+| `targeted_enqueue[].range` | [low, high] auto-generate points (OR use `values`) | - |
+| `targeted_enqueue[].n_points` | Points to generate from range | 5 |
+| `targeted_enqueue[].log` | Log-spaced points (for log-scale HPs) | false |
+| `targeted_enqueue[].n_base` | Top trials to pair each value with | 3 |
+| `substudy.reset` | Delete old substudy DB before re-running | false |
+
+When to tune:
+- **Raise gamma (30-50)**: If a previous round showed TPE collapse (narrow HP ranges in later trials).
+- **Enable collapse_restart**: For long runs (>200 trials) where TPE may get stuck.
+- **multivariate: true** (default): HP correlations always considered. **NEVER narrow ranges** with multivariate on persistent DBs — use scalar fixes or `targeted_enqueue` instead.
+- **targeted_enqueue**: Guide TPE exploration for specific HPs without changing the search space. Target 1-2 HPs max per round.
+- **substudy.reset: true**: Re-run substudy from scratch when range changes are needed.
 
 ### Enqueue trials (optional)
 

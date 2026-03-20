@@ -97,10 +97,10 @@ optuna:
   persist_trackers: true                               # save OOF predictions → interrupt-safe
   reset_trackers: true                                 # R4: extra_data changed train size → start OOF fresh
   model_timeouts:
-    realmlp: "4h"                        # main study after substudy; substudy has own 1h timeout
-    tabm: "5h"                           # main study after substudy; 5h = ~25 new trials (only 38 total so far)
-    catboost: "20min"                    # TOKEN BUDGET — ceiling reached, ALL HPs locked, no gain since trial#112
-    xgboost: "1h30min"                   # constraint removal +0.002 confirmed; flat space, 1.5h for diversity
+    tabm: "1h30m"                        # R5b TEST: 30min substudy + 1h main (targeted_enqueue test)
+    realmlp: "1h30m"                     # R5b TEST: 30min substudy + 1h main (targeted_enqueue test)
+    # catboost: skipped for R5b test
+    # xgboost: skipped for R5b test
 
 runtime:
   gpu_check: true

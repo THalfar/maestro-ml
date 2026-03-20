@@ -57,6 +57,9 @@ ALL_SCALER_CHOICES: list[str] = ["none", "standard", "robust", "quantile"]
 
 @contextlib.contextmanager
 def _suppress_catboost_gpu_warnings():
+    # DISPUTE: Filtering stderr content to preserve non-CatBoost errors requires fragile regex
+    # on C++ library output and is error-prone. The context manager wraps a single model.fit()
+    # call, so any non-CatBoost stderr within that call is extremely unlikely. Low risk in practice.
     """Suppress CatBoost C++ GPU memory warnings from stderr."""
     old_stderr = sys.stderr
     sys.stderr = io.StringIO()
@@ -1204,6 +1207,126 @@ def _build_pruner(pruner_cfg: dict[str, Any]) -> optuna.pruners.BasePruner:
         return optuna.pruners.NopPruner()
 
 
+def generate_targeted_enqueue(
+    study: optuna.Study,
+    target_param: str,
+    *,
+    values: list[int | float] | None = None,
+    target_range: tuple[float, float] | None = None,
+    n_points: int = 5,
+    log: bool = False,
+    n_base: int = 3,
+    temperature: float = 0.3,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Generate targeted enqueue trials for a specific hyperparameter.
+
+    For each target value, pairs it with other params from the study's
+    top trials (sampled via rank-weighted exponential distribution).
+    This lets the AI guide TPE exploration **without** changing the search
+    space — preserving ``multivariate=True`` compatibility on persistent DBs.
+
+    Args:
+        study: Optuna study with completed trials to sample from.
+        target_param: Name of the hyperparameter to explore.
+        values: Explicit list of values to try.  Mutually exclusive with
+            *target_range*.
+        target_range: ``(low, high)`` tuple — generates *n_points* evenly
+            spaced values (linear or log).  Mutually exclusive with *values*.
+        n_points: Number of points to generate from *target_range*.
+        log: If ``True``, use ``np.geomspace`` (log-spaced).  If ``False``,
+            use ``np.linspace``.  Also affects int rounding.
+        n_base: Number of top trials to use as "base" configs.  Each target
+            value is paired with each base trial → up to
+            ``len(values) × n_base`` candidates.
+        temperature: Exponential sampling sharpness for base trial selection.
+            Lower = prefer best trials, higher = more diverse.
+        seed: Random seed for reproducible sampling.
+
+    Returns:
+        List of param dicts ready for ``study.enqueue_trial()``.
+        Deduplicated against existing completed trials in the study.
+
+    Raises:
+        ValueError: If neither *values* nor *target_range* is provided,
+            or if both are provided.
+    """
+    if (values is None) == (target_range is None):
+        raise ValueError(
+            "Exactly one of 'values' or 'target_range' must be provided"
+        )
+
+    # Completed trials sorted by score (best first).
+    maximize = study.direction == optuna.study.StudyDirection.MAXIMIZE
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    if not completed:
+        return []
+
+    completed.sort(key=lambda t: t.value, reverse=maximize)
+
+    # Resolve target values.
+    if values is not None:
+        target_vals = list(values)
+    else:
+        low, high = target_range  # type: ignore[misc]
+        if log:
+            target_vals = list(np.geomspace(low, high, n_points))
+        else:
+            target_vals = list(np.linspace(low, high, n_points))
+
+    # Detect whether target param is int-typed (cast generated values).
+    existing_target_vals = [
+        t.params[target_param]
+        for t in completed
+        if target_param in t.params
+    ]
+    is_int_param = (
+        existing_target_vals
+        and all(isinstance(v, int) for v in existing_target_vals)
+    )
+
+    # Sample base trials via exp-distribution.
+    effective_n_base = min(n_base, len(completed))
+    rng = np.random.default_rng(seed)
+
+    if effective_n_base < len(completed):
+        n_candidates = len(completed)
+        ranks = np.arange(n_candidates)
+        weights = np.exp(-temperature * ranks / n_candidates)
+        weights /= weights.sum()
+        chosen_idx = rng.choice(
+            n_candidates, size=effective_n_base, replace=False, p=weights
+        )
+    else:
+        chosen_idx = np.arange(effective_n_base)
+
+    base_trials = [completed[i] for i in chosen_idx]
+
+    # Build dedup set from existing completed trials.
+    existing_keys: set[str] = {
+        str(sorted(t.params.items()))
+        for t in completed
+    }
+
+    # Generate candidates: each target value × each base trial.
+    result: list[dict[str, Any]] = []
+    for tv in target_vals:
+        val = int(round(tv)) if is_int_param else tv
+        for bt in base_trials:
+            params = dict(bt.params)
+            params.pop("scaler", None)
+            params[target_param] = val
+            key = str(sorted(params.items()))
+            if key not in existing_keys:
+                result.append(params)
+                existing_keys.add(key)
+
+    return result
+
+
 def _run_substudy(
     model_name: str,
     train: pd.DataFrame,
@@ -1263,7 +1386,7 @@ def _run_substudy(
     n_folds = substudy_cfg.get("n_folds", 3)
     timeout_raw = substudy_cfg.get("timeout", "15m")
     timeout = parse_timeout(timeout_raw)
-    n_trials = substudy_cfg.get("n_trials", 100)
+    n_trials = substudy_cfg.get("n_trials")  # None = unlimited, substudy timeout controls
     n_enqueue = substudy_cfg.get("n_enqueue", 20)
     top_n = substudy_cfg.get("top_n", 3)
     temperature = substudy_cfg.get("temperature", 0.3)
@@ -1732,6 +1855,17 @@ def run_optuna_study(
     substudy_cfg = optuna_cfg.get("substudy")
     substudy_ran = False
     if substudy_cfg and substudy_cfg.get("enabled", False):
+        # Substudy reset: delete existing DB to start fresh (e.g. when AI
+        # needs new substudy with different ranges while keeping main study
+        # intact for multivariate TPE compatibility).
+        if substudy_cfg.get("reset", False):
+            _stor = pipeline_config.optuna.storage_dir
+            if _stor:
+                _sub_db = Path(_stor) / f"{pipeline_config.run_name}__{model_name}__sub.db"
+                if _sub_db.exists():
+                    _sub_db.unlink()
+                    logger.info(f"[{model_name}] Substudy reset: deleted {_sub_db}")
+
         # Build existing_main_params so substudy can skip already-known configs
         # in its top-N guarantee (slides past them to find genuinely new ones).
         # Note: study_name is defined later; construct it here directly.
@@ -1827,7 +1961,7 @@ def run_optuna_study(
 
     # Tracker/OOF-store persistence: load from disk if available
     persist = pipeline_config.optuna.persist_trackers and bool(storage_dir)
-    reset_trackers = optuna_cfg.get("reset_trackers", False)
+    reset_trackers = pipeline_config.optuna.reset_trackers
     tracker_pkl: Path | None = None
     oof_store_pkl: Path | None = None
     if persist:
@@ -1914,6 +2048,40 @@ def run_optuna_study(
         diversity_pruning=dp_cfg,
     )
 
+    # --- Targeted enqueue: AI-guided HP exploration without changing search space ---
+    # Generates trials that explore specific HP values paired with top trial configs.
+    # Preserves multivariate TPE compatibility on persistent DBs.
+    targeted_cfgs = optuna_cfg.get("targeted_enqueue", []) or []
+    if targeted_cfgs:
+        n_complete = sum(
+            1 for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        )
+        if n_complete > 0:
+            for tc in targeted_cfgs:
+                generated = generate_targeted_enqueue(
+                    study=study,
+                    target_param=tc["param"],
+                    values=tc.get("values"),
+                    target_range=tuple(tc["range"]) if "range" in tc else None,
+                    n_points=tc.get("n_points", 5),
+                    log=tc.get("log", False),
+                    n_base=tc.get("n_base", 3),
+                    temperature=tc.get("temperature", 0.3),
+                    seed=pipeline_config.optuna.global_seed,
+                )
+                existing = optuna_cfg.get("enqueue_trials", []) or []
+                optuna_cfg["enqueue_trials"] = list(existing) + generated
+                logger.info(
+                    f"[{model_name}] Targeted enqueue '{tc['param']}': "
+                    f"{len(generated)} trials"
+                )
+        else:
+            logger.info(
+                f"[{model_name}] Targeted enqueue skipped: "
+                f"no completed trials in study"
+            )
+
     # Enqueue pre-specified trials (e.g., substudy warm-start, LLM-suggested configs).
     # Skip any params that exactly match an already-completed trial — avoids re-running
     # configs transferred from a previous round via transfer_from or substudy overlap.
@@ -1970,10 +2138,37 @@ def run_optuna_study(
 
         persist_callbacks = [_persist_callback]
 
+    # Build collapse restart callback if configured (opt-in).
+    collapse_cfg = optuna_cfg.get("collapse_restart")
+    if collapse_cfg:
+        sub_db_path: str | None = None
+        sub_study_name: str | None = None
+        _stor = pipeline_config.optuna.storage_dir
+        if _stor and substudy_cfg and substudy_cfg.get("enabled", False):
+            _sub_db = Path(_stor) / f"{pipeline_config.run_name}__{model_name}__sub.db"
+            if _sub_db.exists():
+                sub_db_path = str(_sub_db)
+                sub_study_name = f"{pipeline_config.run_name}__{model_name}__sub"
+
+        collapse_cb = _CollapseRestartCallback(
+            search_space=search_space,
+            window=collapse_cfg.get("window", 20),
+            threshold=collapse_cfg.get("threshold", 0.05),
+            n_restart=collapse_cfg.get("n_restart", 5),
+            cooldown=collapse_cfg.get("cooldown", 10),
+            top_n=collapse_cfg.get("top_n", 2),
+            temperature=collapse_cfg.get("temperature", 0.3),
+            maximize=(task_type != "regression"),
+            substudy_db_path=sub_db_path,
+            substudy_study_name=sub_study_name,
+            global_seed=pipeline_config.optuna.global_seed,
+        )
+        persist_callbacks.append(collapse_cb)
+
     _run_two_phase_study(
         study=study,
         objective=objective,
-        n_trials=optuna_cfg["n_trials"],
+        n_trials=optuna_cfg.get("n_trials"),  # None = unlimited, timeout controls duration
         qmc_warmup_trials=effective_qmc,
         timeout=effective_timeout,
         global_seed=pipeline_config.optuna.global_seed,
@@ -2758,10 +2953,365 @@ def _duration_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> 
         logger.info(f"  Trial {trial.number} duration: {dur_str}")
 
 
+class _CollapseRestartCallback:
+    """Optuna callback that detects TPE parameter collapse and injects restarts.
+
+    After each trial, checks if the last ``window`` completed trials have
+    low parameter variance (normalised std ratio below ``threshold``).
+    If collapsed **and** the current score is not a new best, enqueues
+    ``n_restart`` trials sampled from one of two sources:
+
+    * **Substudy history** (preferred) — loads the substudy SQLite DB and
+      samples via rank-weighted exponential distribution (same algorithm as
+      substudy enqueue: ``top_n`` guaranteed best + remaining via
+      ``exp(-temperature * rank / n)``).  This reuses the substudy's
+      cheap exploration as a "map" to escape the local minimum.
+    * **Random from search space** (fallback when no substudy exists) —
+      samples uniformly (or log-uniformly for log-scale params) from the
+      search space bounds.
+
+    All injected trials are deduplicated against the main study's completed
+    trial history so the same config is never enqueued twice.
+
+    Attributes:
+        search_space: Model search space dict from registry.
+        window: Number of recent trials to check for collapse.
+        threshold: Param variance ratio below which collapse is flagged.
+        n_restart: Number of restart trials to inject per event.
+        cooldown: Minimum trials between restart injections.
+        top_n: Guaranteed best trials from substudy in each restart batch.
+        temperature: Exponential sampling sharpness for substudy history.
+        maximize: Whether higher scores are better.
+        substudy_db_path: Path to substudy SQLite DB (None if no substudy).
+        substudy_study_name: Optuna study name inside the DB.
+        global_seed: Base seed for reproducible random sampling.
+    """
+
+    def __init__(
+        self,
+        search_space: dict[str, dict[str, Any]],
+        *,
+        window: int = 20,
+        threshold: float = 0.05,
+        n_restart: int = 5,
+        cooldown: int = 10,
+        top_n: int = 2,
+        temperature: float = 0.3,
+        maximize: bool = True,
+        substudy_db_path: str | None = None,
+        substudy_study_name: str | None = None,
+        global_seed: int = 42,
+    ) -> None:
+        self.search_space = search_space
+        self.window = window
+        self.threshold = threshold
+        self.n_restart = n_restart
+        self.cooldown = cooldown
+        self.top_n = top_n
+        self.temperature = temperature
+        self.maximize = maximize
+        self.substudy_db_path = substudy_db_path
+        self.substudy_study_name = substudy_study_name
+        self.global_seed = global_seed
+
+        self._cooldown_counter: int = 0
+        self._n_injected: int = 0
+        self._rng = np.random.default_rng(global_seed)
+
+    # ------------------------------------------------------------------
+    # Public callback interface
+    # ------------------------------------------------------------------
+
+    def __call__(
+        self, study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        # Cooldown — skip if we recently injected.
+        if self._cooldown_counter > 0:
+            self._cooldown_counter -= 1
+            return
+
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if len(completed) < self.window:
+            return
+
+        is_collapsed, ratio = self._is_collapsed(completed)
+        if not is_collapsed:
+            return
+
+        # Score-gate: never restart when the current trial is a new best.
+        best_value = study.best_value
+        if trial.state == optuna.trial.TrialState.COMPLETE:
+            if trial.value == best_value:
+                return
+
+        # Build set of existing param keys for deduplication.
+        existing_keys: set[str] = {
+            str(sorted(t.params.items()))
+            for t in completed
+        }
+
+        # Choose restart source.  Both methods return pre-deduplicated
+        # candidates (they check against existing_keys internally).
+        if self.substudy_db_path is not None:
+            candidates = self._sample_from_substudy(existing_keys)
+            source = "substudy"
+        else:
+            candidates = self._sample_random_from_space(existing_keys)
+            source = "random"
+
+        n_enqueued = 0
+        for params in candidates:
+            study.enqueue_trial(params)
+            n_enqueued += 1
+
+        if n_enqueued > 0:
+            self._n_injected += n_enqueued
+            # Cooldown does NOT include the restart trials themselves.
+            # The restart trials are exploration — we want to re-check
+            # for collapse shortly after they complete, not after a long delay.
+            self._cooldown_counter = self.cooldown
+            logger.warning(
+                f"[collapse_restart] Injected {n_enqueued} restarts from "
+                f"{source} (param_std_ratio={ratio:.3f}, "
+                f"total_injected={self._n_injected})"
+            )
+
+    # ------------------------------------------------------------------
+    # Collapse detection
+    # ------------------------------------------------------------------
+
+    def _is_collapsed(
+        self, completed: list[optuna.trial.FrozenTrial]
+    ) -> tuple[bool, float]:
+        """Check if the last ``window`` trials have collapsed parameter variance.
+
+        Returns:
+            (is_collapsed, param_std_ratio) where param_std_ratio is the mean
+            normalised std across all numeric HPs.
+        """
+        sorted_trials = sorted(completed, key=lambda t: t.number)
+        last_window = sorted_trials[-self.window:]
+
+        ratios: list[float] = []
+        for param_name, spec in self.search_space.items():
+            ptype = spec.get("type", "float")
+            if ptype not in ("int", "float"):
+                continue
+
+            # Collect values from the window and full history.
+            window_vals = [
+                t.params[param_name]
+                for t in last_window
+                if param_name in t.params
+            ]
+            all_vals = [
+                t.params[param_name]
+                for t in sorted_trials
+                if param_name in t.params
+            ]
+            if len(window_vals) < 2 or len(all_vals) < 2:
+                continue
+
+            use_log = spec.get("log", False)
+            if use_log:
+                # Work in log-space for log-scale params.
+                window_vals = [np.log(max(v, 1e-30)) for v in window_vals]
+                all_vals = [np.log(max(v, 1e-30)) for v in all_vals]
+
+            full_range = max(all_vals) - min(all_vals)
+            if full_range < 1e-10:
+                continue
+
+            window_std = float(np.std(window_vals))
+            ratios.append(window_std / full_range)
+
+        if not ratios:
+            return False, 1.0
+
+        mean_ratio = float(np.mean(ratios))
+        return mean_ratio < self.threshold, mean_ratio
+
+    # ------------------------------------------------------------------
+    # Restart trial sampling — substudy history
+    # ------------------------------------------------------------------
+
+    def _sample_from_substudy(
+        self, existing_keys: set[str]
+    ) -> list[dict[str, Any]]:
+        """Sample restart trials from substudy history (exp-distribution).
+
+        Mirrors the two-tier sampling in ``_run_substudy()``:
+        tier-1 = top_n best novel trials (unconditional),
+        tier-2 = remaining slots via rank-weighted exponential sampling.
+        """
+        try:
+            sub_study = optuna.load_study(
+                study_name=self.substudy_study_name,
+                storage=f"sqlite:///{self.substudy_db_path}",
+            )
+        except Exception:
+            logger.debug("[collapse_restart] Could not load substudy DB, falling back to random")
+            return self._sample_random_from_space(existing_keys)
+
+        sub_completed = [
+            t for t in sub_study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if not sub_completed:
+            return self._sample_random_from_space(existing_keys)
+
+        # Sort by score (best first).
+        sub_completed.sort(key=lambda t: t.value, reverse=self.maximize)
+
+        def _params_key(t: optuna.trial.FrozenTrial) -> str:
+            p = {k: v for k, v in t.params.items() if k != "scaler"}
+            return str(sorted(p.items()))
+
+        # Tier 1: top_n novel trials.
+        top_indices: set[int] = set()
+        for i in range(len(sub_completed)):
+            if len(top_indices) >= self.top_n:
+                break
+            if _params_key(sub_completed[i]) not in existing_keys:
+                top_indices.add(i)
+
+        # Tier 2: rank-weighted exponential sampling over remaining novel candidates.
+        n_remaining = self.n_restart - len(top_indices)
+        novel_candidates = [
+            i for i in range(len(sub_completed))
+            if i not in top_indices and _params_key(sub_completed[i]) not in existing_keys
+        ]
+
+        sampled_indices: list[int] = []
+        if n_remaining > 0 and novel_candidates:
+            n_candidates = len(novel_candidates)
+            effective_n = min(n_remaining, max(n_candidates // 3, 1))
+            effective_n = max(effective_n, 0)
+            if effective_n > 0:
+                ranks = np.arange(n_candidates)
+                weights = np.exp(-self.temperature * ranks / n_candidates)
+                weights /= weights.sum()
+                n_sample = min(effective_n, n_candidates)
+                chosen = self._rng.choice(
+                    n_candidates, size=n_sample, replace=False, p=weights
+                )
+                sampled_indices = [novel_candidates[j] for j in chosen]
+
+        all_indices = sorted(top_indices) + sorted(sampled_indices)
+        result: list[dict[str, Any]] = []
+        for i in all_indices:
+            params = dict(sub_completed[i].params)
+            params.pop("scaler", None)
+            result.append(params)
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Restart trial sampling — random from search space
+    # ------------------------------------------------------------------
+
+    def _sample_random_from_space(
+        self, existing_keys: set[str]
+    ) -> list[dict[str, Any]]:
+        """Sample random trials uniformly from search space bounds.
+
+        Used as fallback when no substudy DB is available.
+        """
+        import json
+
+        result: list[dict[str, Any]] = []
+        max_attempts = self.n_restart * 3  # avoid infinite loop on tiny spaces
+        attempts = 0
+        while len(result) < self.n_restart and attempts < max_attempts:
+            attempts += 1
+            params: dict[str, Any] = {}
+            for name, spec in self.search_space.items():
+                ptype = spec.get("type", "float")
+                use_log = spec.get("log", False)
+
+                if ptype == "fixed":
+                    continue  # Optuna fills fixed params automatically
+                elif ptype == "int":
+                    low, high = int(spec["low"]), int(spec["high"])
+                    step = spec.get("step")
+                    if use_log:
+                        val = int(
+                            np.exp(self._rng.uniform(np.log(max(low, 1)), np.log(high)))
+                        )
+                        val = max(low, min(val, high))
+                    elif step:
+                        step = int(step)
+                        choices = list(range(low, high + 1, step))
+                        val = int(self._rng.choice(choices))
+                    else:
+                        val = int(self._rng.integers(low, high + 1))
+                    params[name] = val
+                elif ptype == "float":
+                    low, high = float(spec["low"]), float(spec["high"])
+                    step = spec.get("step")
+                    if use_log:
+                        val = float(
+                            np.exp(self._rng.uniform(np.log(max(low, 1e-30)), np.log(high)))
+                        )
+                    elif step:
+                        step = float(step)
+                        n_steps = int((high - low) / step)
+                        val = low + float(self._rng.integers(0, n_steps + 1)) * step
+                    else:
+                        val = float(self._rng.uniform(low, high))
+                    params[name] = val
+                elif ptype == "categorical":
+                    raw_choices = spec["choices"]
+                    has_complex = any(isinstance(c, (list, tuple)) for c in raw_choices)
+                    if has_complex:
+                        idx = int(self._rng.integers(0, len(raw_choices)))
+                        params[name] = json.dumps(raw_choices[idx])
+                    else:
+                        idx = int(self._rng.integers(0, len(raw_choices)))
+                        params[name] = raw_choices[idx]
+                elif ptype == "int_list":
+                    n_elements = int(spec["n"])
+                    low, high = int(spec["low"]), int(spec["high"])
+                    for i in range(n_elements):
+                        if use_log:
+                            val = int(
+                                np.exp(self._rng.uniform(np.log(max(low, 1)), np.log(high)))
+                            )
+                            val = max(low, min(val, high))
+                        else:
+                            val = int(self._rng.integers(low, high + 1))
+                        params[f"{name}_{i}"] = val
+                elif ptype == "dynamic_int_list":
+                    n_min = int(spec["n_min"])
+                    n_max = int(spec["n_max"])
+                    low, high = int(spec["low"]), int(spec["high"])
+                    n_layers = int(self._rng.integers(n_min, n_max + 1))
+                    params[f"{name}_n"] = n_layers
+                    for i in range(n_layers):
+                        if use_log:
+                            val = int(
+                                np.exp(self._rng.uniform(np.log(max(low, 1)), np.log(high)))
+                            )
+                            val = max(low, min(val, high))
+                        else:
+                            val = int(self._rng.integers(low, high + 1))
+                        params[f"{name}_{i}"] = val
+
+            key = str(sorted(params.items()))
+            if key not in existing_keys:
+                result.append(params)
+                existing_keys.add(key)
+
+        return result
+
+
 def _run_two_phase_study(
     study: optuna.Study,
     objective: Callable[[optuna.Trial], float],
-    n_trials: int,
+    n_trials: int | None,
     qmc_warmup_trials: int,
     timeout: int | None = None,
     global_seed: int = 42,
@@ -2781,17 +3331,21 @@ def _run_two_phase_study(
     Args:
         study: Optuna study object (already created with pruner).
         objective: Objective function to optimize.
-        n_trials: Total number of trials (QMC + TPE combined).
+        n_trials: Total number of trials (QMC + TPE combined). None = unlimited
+            (timeout is the only stopping criterion).
         qmc_warmup_trials: Number of QMC warmup trials. Set to 0 to skip
             QMC entirely (e.g. when substudy provides warm-start).
         timeout: Optional timeout in seconds for the entire study.
         global_seed: Seed for reproducibility.
         tpe_cfg: Optional TPE sampler configuration dict with keys:
-            - ``gamma_ratio`` (float): Fraction of trials classified as
-              "good" (default 0.15).
-            - ``gamma_min`` (int): Minimum good trials floor (default 5).
+            - ``gamma`` (int): Fixed number of trials classified as "good"
+              in TPE's surrogate model (default 25). AI sets per model via
+              strategy YAML based on round report analysis.
             - ``n_startup_trials`` (int): TPE startup random trials
               (default 0 since QMC/substudy already explored).
+            - ``multivariate`` defaults to ``True`` (considers HP correlations).
+            - Any additional ``TPESampler`` kwargs (e.g. ``n_ei_candidates``)
+              are passed through directly.
         extra_callbacks: Optional list of additional Optuna callbacks to
             run after each trial (e.g. a persist callback that saves the
             tracker/oof_store to disk for interrupt recovery).
@@ -2807,10 +3361,14 @@ def _run_two_phase_study(
     """
     if qmc_warmup_trials <= 0:
         n_qmc = 0
-        n_tpe = n_trials
+        n_tpe = n_trials  # None = unlimited
     else:
-        n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
-        n_tpe = n_trials - n_qmc
+        if n_trials is None:
+            n_qmc = qmc_warmup_trials
+            n_tpe = None  # TPE runs until timeout after QMC
+        else:
+            n_qmc = max(1, min(qmc_warmup_trials, n_trials - 1))
+            n_tpe = n_trials - n_qmc
 
     callbacks = [_duration_callback] + (extra_callbacks or [])
 
@@ -2846,32 +3404,40 @@ def _run_two_phase_study(
             logger.info("Phase 1 (QMC): skipped (substudy warm-start)")
 
         # Phase 2: TPE — skipped when all trials were consumed by QMC (e.g. n_trials=1)
-        if n_tpe > 0:
+        if n_tpe is None or n_tpe > 0:
             remaining_timeout = None
             if timeout is not None:
                 remaining_timeout = max(1, timeout - int(qmc_elapsed))
 
-            # Build TPE sampler with custom gamma if configured.
-            # Project defaults: gamma_ratio=0.15, gamma_min=5 — 15% of completed
-            # trials classified as "good", scales dynamically with history size.
+            # Build TPE sampler with fixed gamma from config.
+            # gamma is a fixed integer — AI sets it per model in strategy YAML.
+            # No dynamic scaling; the AI adjusts between rounds based on
+            # the round report's TPE HEALTH section.
             tpe_cfg = tpe_cfg or {}
-            gamma_ratio = tpe_cfg.get("gamma_ratio", 0.15)
-            gamma_min = tpe_cfg.get("gamma_min", 5)
+            gamma = tpe_cfg.get("gamma", 25)
             n_startup = tpe_cfg.get("n_startup_trials", 0)
 
-            import math
             tpe_kwargs: dict[str, Any] = {
                 "seed": global_seed,
                 "n_startup_trials": n_startup,
-                "gamma": lambda x, _gr=gamma_ratio, _gm=gamma_min: max(
-                    int(math.ceil(_gr * x)), _gm
-                ),
+                "gamma": lambda x, _g=gamma: _g,
+                "multivariate": True,  # project default: always consider HP correlations
             }
+
+            # Pass through additional TPE params from config so the AI
+            # can tune any TPESampler knob via strategy YAML.
+            _tpe_passthrough = (
+                "n_ei_candidates", "prior_weight", "consider_prior",
+                "consider_magic_clip", "consider_endpoints",
+                "multivariate", "group", "constant_liar",
+            )
+            for _k in _tpe_passthrough:
+                if _k in tpe_cfg:
+                    tpe_kwargs[_k] = tpe_cfg[_k]
 
             logger.info(
                 f"Phase 2 (TPE): {n_tpe} trials "
-                f"(gamma_ratio={gamma_ratio}, gamma_min={gamma_min}, "
-                f"n_startup={n_startup})"
+                f"(gamma={gamma}, n_startup={n_startup})"
             )
             study.sampler = optuna.samplers.TPESampler(**tpe_kwargs)
             study.optimize(

@@ -22,7 +22,8 @@
       "Bash(do echo:*)",
       "Read(//c/Projektit/maestro-ml/**)",
       "Bash(done)",
-      "Bash(find /c/Projektit/maestro-ml/competitions/ps-s6e3 -type f -name *.txt -o -name *.json -o -name *.pkl)"
+      "Bash(find /c/Projektit/maestro-ml/competitions/ps-s6e3 -type f -name *.txt -o -name *.json -o -name *.pkl)",
+      "Bash(/c/Users/tobia/condamini3/envs/maestro/python.exe -m pytest tests/ -x --tb=short)"
     ]
   }
 }

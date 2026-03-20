@@ -687,6 +687,133 @@ def _generate_round_report(
                         )
 
     # ------------------------------------------------------------------
+    # Section 4b: TPE HEALTH — detect collapsed parameter search
+    # ------------------------------------------------------------------
+    def _compute_tpe_health(
+        completed_trials: list,
+        window: int = 20,
+        threshold: float = 0.05,
+    ) -> dict:
+        """Compute TPE health metrics from completed trials.
+
+        Returns dict with keys: status, param_std_ratio, collapse_onset,
+        wasted_trials, wasted_seconds.
+        """
+        sorted_trials = sorted(completed_trials, key=lambda t: t.number)
+        n = len(sorted_trials)
+        if n < window:
+            return {"status": "insufficient", "param_std_ratio": None,
+                    "collapse_onset": None, "wasted_trials": 0, "wasted_seconds": 0.0}
+
+        # Identify numeric params present across trials.
+        all_param_names: set[str] = set()
+        for t in sorted_trials:
+            for k, v in t.params.items():
+                if isinstance(v, (int, float)):
+                    all_param_names.add(k)
+
+        if not all_param_names:
+            return {"status": "insufficient", "param_std_ratio": None,
+                    "collapse_onset": None, "wasted_trials": 0, "wasted_seconds": 0.0}
+
+        # Pre-compute full-history range per param.
+        full_ranges: dict[str, tuple[float, float]] = {}
+        for p in all_param_names:
+            vals = [t.params[p] for t in sorted_trials if p in t.params
+                    and isinstance(t.params[p], (int, float))]
+            if len(vals) >= 2:
+                r = max(vals) - min(vals)
+                if r > 1e-10:
+                    full_ranges[p] = (min(vals), r)
+
+        if not full_ranges:
+            return {"status": "insufficient", "param_std_ratio": None,
+                    "collapse_onset": None, "wasted_trials": 0, "wasted_seconds": 0.0}
+
+        def _ratio_at(end_idx: int) -> float:
+            """Mean normalised std for window ending at end_idx (exclusive)."""
+            start = end_idx - window
+            if start < 0:
+                return 1.0
+            win = sorted_trials[start:end_idx]
+            ratios_w: list[float] = []
+            for p, (_, rng) in full_ranges.items():
+                wv = [t.params[p] for t in win if p in t.params
+                      and isinstance(t.params[p], (int, float))]
+                if len(wv) < 2:
+                    continue
+                ratios_w.append(float(np.std(wv)) / rng)
+            return float(np.mean(ratios_w)) if ratios_w else 1.0
+
+        # Current ratio (last window).
+        current_ratio = _ratio_at(n)
+
+        if current_ratio >= threshold:
+            return {"status": "healthy", "param_std_ratio": current_ratio,
+                    "collapse_onset": None, "wasted_trials": 0, "wasted_seconds": 0.0}
+
+        # Collapse detected — find onset by scanning backwards.
+        onset_idx = n  # trial index where collapse started
+        for end in range(n - 1, window - 1, -1):
+            r = _ratio_at(end)
+            if r >= threshold:
+                onset_idx = end
+                break
+        else:
+            onset_idx = window  # collapsed from the very start
+
+        onset_trial_num = sorted_trials[onset_idx].number if onset_idx < n else sorted_trials[-1].number
+        wasted = n - onset_idx
+
+        # Estimate wasted time.
+        durations = [
+            (t.datetime_complete - t.datetime_start).total_seconds()
+            for t in sorted_trials
+            if t.datetime_start and t.datetime_complete
+        ]
+        avg_dur = sum(durations) / len(durations) if durations else 0.0
+        wasted_secs = wasted * avg_dur
+
+        return {
+            "status": "COLLAPSED",
+            "param_std_ratio": current_ratio,
+            "collapse_onset": onset_trial_num,
+            "wasted_trials": wasted,
+            "wasted_seconds": wasted_secs,
+        }
+
+    tpe_health_data: list[tuple[str, dict]] = []
+    for mn in models_order:
+        study = _studies.get(mn)
+        if study is None:
+            continue
+        completed = [
+            t for t in study.trials
+            if t.state == _optuna.trial.TrialState.COMPLETE
+        ]
+        health = _compute_tpe_health(completed)
+        tpe_health_data.append((mn, health))
+
+    if tpe_health_data:
+        lines.append(_h("4b. TPE HEALTH"))
+        for mn, h in tpe_health_data:
+            status = h["status"]
+            ratio = h["param_std_ratio"]
+            if status == "insufficient":
+                lines.append(f"  {mn:<14}  insufficient (<20 completed trials)")
+            elif status == "healthy":
+                lines.append(f"  {mn:<14}  healthy (param_std_ratio={ratio:.3f})")
+            elif status == "COLLAPSED":
+                onset = h["collapse_onset"]
+                wasted = h["wasted_trials"]
+                wasted_s = h["wasted_seconds"]
+                lines.append(
+                    f"  {mn:<14}  COLLAPSED at trial ~{onset} "
+                    f"(param_std_ratio={ratio:.3f}, ~{wasted} trials wasted, "
+                    f"~{_fmt_time(wasted_s)} lost)"
+                )
+
+    # ------------------------------------------------------------------
     # Section 5: Fold-Level Score Matrix
     # ------------------------------------------------------------------
     fold_score_data: dict[str, list[float]] = {}
@@ -1049,7 +1176,8 @@ def _generate_round_report(
     else:
         lines.append("    (not available — standalone mode)")
 
-    # Recommended budget
+    # Recommended budget (cross-reference with TPE health)
+    _tpe_health_map: dict[str, dict] = {mn: h for mn, h in tpe_health_data}
     lines.append("")
     lines.append("  RECOMMENDED BUDGET FOR NEXT ROUND:")
     for mn in models_order:
@@ -1073,6 +1201,10 @@ def _generate_round_report(
             rec = "keep full budget (needs more exploration)"
         else:
             rec = "reassess after more trials"
+        # Append collapse_restart hint if TPE collapsed.
+        health = _tpe_health_map.get(mn, {})
+        if health.get("status") == "COLLAPSED":
+            rec += "  *** COLLAPSED — consider enabling collapse_restart + raising tpe.gamma"
         lines.append(f"    {mn:<12} → {rec}")
 
     lines.append("\n" + _sep())

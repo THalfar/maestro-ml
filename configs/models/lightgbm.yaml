@@ -79,7 +79,6 @@ feature_requirements:
   handles_missing: true
 
 optuna:
-  n_trials: 200
   qmc_warmup_trials: 50
   timeout: null
   pruner:

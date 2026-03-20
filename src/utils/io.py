@@ -83,6 +83,7 @@ class OptunaGlobalConfig:
     model_timeouts: dict[str, int] = field(default_factory=dict)
     storage_dir: Optional[str] = None  # If set, persist studies to SQLite per model
     persist_trackers: bool = False  # If True, save/load PerFoldTracker & TrialOOFStore to disk
+    reset_trackers: bool = False  # If True, skip loading existing pkl files (start OOF fresh)
 
 
 @dataclass
@@ -358,6 +359,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         model_timeouts=model_timeouts,
         storage_dir=optuna_raw.get("storage_dir", None),
         persist_trackers=bool(optuna_raw.get("persist_trackers", False)),
+        reset_trackers=bool(optuna_raw.get("reset_trackers", False)),
     )
 
     runtime = RuntimeConfig(

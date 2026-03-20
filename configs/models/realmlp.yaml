@@ -182,7 +182,6 @@ feature_requirements:
   handles_missing: false
 
 optuna:
-  n_trials: 1000                                 # GPU-accelerated, can afford more trials
   qmc_warmup_trials: 10
   timeout: null
   pruner:
